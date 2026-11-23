@@ -29,3 +29,16 @@ is GCC 9, install `g++-10` on each node and configure a fresh build directory
 using `CXX=g++-10 cmake -S . -B build -DLOCK_WITH_RDMA=ON`. The experiment runner automatically prefers `g++-10` when installed. Do not reuse
 a build directory configured with a different compiler. The legacy CTest
 invocation is `(cd build && ctest --output-on-failure)`.
+
+## Smoke startup diagnostics and RDMA memory registration
+
+The runner polls the eight nodes concurrently and reports early `ERROR` lines
+without waiting for the whole watchdog interval. SCP log collection is quiet.
+
+If smoke reports `ibv_reg_mr: errno=12`, check `ulimit -l` on the affected
+node. This is the maximum locked memory in KiB. Clients register 128 MiB and
+servers register 512 MiB; a default limit of 65536 KiB (64 MiB) is insufficient.
+On Ubuntu, configure a higher soft and hard `memlock` limit for the
+experiment user through `/etc/security/limits.d/`, then start a **new login
+session** (including on local controller node 4) and verify `ulimit -l`.
+Other resource constraints may also cause ENOMEM.

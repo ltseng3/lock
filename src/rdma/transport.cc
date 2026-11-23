@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
+#include <sys/resource.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -170,7 +171,24 @@ struct Transport::Impl {
         mr = ibv_reg_mr(pd, mem, cfg.memory_bytes, IBV_ACCESS_LOCAL_WRITE |
                         IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ |
                         IBV_ACCESS_REMOTE_ATOMIC);
-        check(mr != nullptr, "ibv_reg_mr");
+        if (!mr) {
+            const int err = errno;
+            std::string detail = "RDMA: ibv_reg_mr: errno=" + std::to_string(err) +
+                                 " (" + std::strerror(err) + ")" +
+                                 "; registering " + std::to_string(cfg.memory_bytes) +
+                                 " bytes";
+            rlimit limit{};
+            if (getrlimit(RLIMIT_MEMLOCK, &limit) == 0) {
+                auto fmt = [](rlim_t n) {
+                    return n == RLIM_INFINITY ? std::string("unlimited") :
+                           std::to_string(static_cast<unsigned long long>(n));
+                };
+                detail += "; memlock soft=" + fmt(limit.rlim_cur) +
+                          " hard=" + fmt(limit.rlim_max) + " bytes";
+            }
+            throw std::runtime_error(detail +
+                "; check the process memlock limit and available RDMA resources");
+        }
         for (const auto& peer : cfg.peers) {
             if (peer.id == cfg.self) continue;
             auto& conn = connections[peer.id];

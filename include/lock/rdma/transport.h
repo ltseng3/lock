@@ -45,11 +45,15 @@ public:
 
     // All peers must enter connect() during startup. No connection in the measured path.
     void connect();
-    void send(NodeId peer, const Message& m, WorkId work_id = 0);
-    void write(NodeId peer, const void* local, size_t length,
-               size_t remote_offset, WorkId work_id);
+    // Unsignaled SEND/WRITE requests are periodically signaled to retire QP WRs.
+    // WRITE returns whether a CQE was requested; the caller must only track those.
+    void send(NodeId peer, const Message& m, WorkId work_id = 0, bool signal = true);
+    bool write(NodeId peer, const void* local, size_t length,
+               size_t remote_offset, WorkId work_id, bool signal = true);
     void compare_swap(NodeId peer, uint64_t* result, size_t remote_offset,
                       uint64_t expected, uint64_t desired, WorkId work_id);
+    // Reuse the caller's completion storage on the hot path.
+    void poll_into(std::vector<Completion>& out, int batch = 64);
     std::vector<Completion> poll(int batch = 64);
 
     // Offset-addressed memory is registered for LOCAL_WRITE and remote access.

@@ -92,9 +92,36 @@ access, four workers and 16 outstanding requests per worker, then pass
 one-second `LEADER_PROFILE` records, which are also echoed on node 4.
 Each record reports acquire/release receives, log commits, signaled replication
 WRITE completions, send completions, outgoing responses, and maximum pending
-or in-flight log work. `max_inflight=128` indicates the fixed log admission
-window was fully occupied; growing `max_pending` can indicate backlog.
+or in-flight log work. `max_inflight` matching the configured Mu admission window
+(default 512, adjustable with `--mu-inflight-window`) indicates it was full; growing `max_pending` can indicate backlog.
 
 This counter-based diagnostic does not attribute CPU cycles or NIC service
 time and is not, by itself, proof of a specific bottleneck. It adds a small
 amount of instrumentation overhead and is disabled by default.
+
+## Mu throughput hot-path tuning
+
+The Mu leader now uses a larger default replication admission window of **512**
+log entries (formerly 128), configurable via `--mu-inflight-window=N` (1–512).
+The 3-replica log posts a WRITE to both followers, but only requires a
+completion for one follower to establish the leader+follower majority. The
+other WRITE is periodically signaled to retire work requests on its QP;
+the registered log slots are never reused. For 5 replicas, completion from
+two followers establishes the local+2 majority. The transport forces a
+signaled WR at least once per 16 posted WRs on each QP so unacknowledged work
+requests cannot accumulate indefinitely. Mu leader responses similarly
+use selective signaling. The client and leader reuse CQ output buffers
+and use a stack buffer for the standard 64-entry CQ poll.
+
+With your existing single-trial `/tmp/mu-throughput.json` (Mu/uniform,
+4 logical workers/client, 16 outstanding per worker), compare the new code
+against your previous run:
+
+    python3 experiments/run.py --suite=/tmp/mu-throughput.json --profile-leader --mu-inflight-window=512
+
+To isolate the effect of the admission window, pass `--mu-inflight-window=128`
+and compare. This is **not** a multi-case sweep. The leader log remains
+non-recycling (default 512 MiB server MR), so a faster implementation may
+exhaust it on long runs; the 3-second suite is for initial diagnosis, not
+unbounded throughput testing. CI checks compilation and unit tests without
+RDMA hardware and cannot verify the performance or device-level semantics.

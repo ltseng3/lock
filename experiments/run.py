@@ -55,6 +55,8 @@ def process_command(topo: Topology, node, suite: dict, case: dict,
         return ["./build/lock_rdma_smoke", *common]
     if node.role == "replica" and suite.get("profile_leader", False):
         common.append(arg("profile-leader", 1))
+    if node.role == "replica" and case["backend"] == "mu":
+        common.append(arg("mu-inflight-window", suite.get("mu_inflight_window", 512)))
     common += [
         arg("replicas", topo.server_ids()),
         arg("clients", topo.client_ids()),
@@ -241,11 +243,17 @@ def main() -> int:
                     help="Print per-client throughput and latency details")
     ap.add_argument("--profile-leader", action="store_true",
                     help="Print one-second Mu leader diagnostics during the trial")
+    ap.add_argument("--mu-inflight-window", type=int,
+                    help="Mu leader log in-flight limit (1..512; default 512)")
     args = ap.parse_args()
     topo = Topology.load(args.topology)
     suite = json.loads(args.suite.read_text())
     if args.profile_leader:
         suite["profile_leader"] = True
+    if args.mu_inflight_window is not None:
+        suite["mu_inflight_window"] = args.mu_inflight_window
+    if not 1 <= suite.get("mu_inflight_window", 512) <= 512:
+        raise ValueError("mu_inflight_window must be 1..512")
     for key in ("warmup_seconds", "duration_seconds", "repetitions"):
         override = getattr(args, key)
         if override is not None:

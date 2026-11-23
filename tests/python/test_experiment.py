@@ -50,6 +50,16 @@ class TestExperiment(unittest.TestCase):
         self.assertIn("--profile-leader=1", server)
         self.assertNotIn("--profile-leader=1", client)
 
+    def test_mu_window_only_on_server(self):
+        case = dict(next(cases(self.suite)), backend="mu")
+        tuned = dict(self.suite, mu_inflight_window=256)
+        leader = process_command(self.topo, self.topo.by_id(1), tuned, case)
+        client = process_command(self.topo, self.topo.by_id(4), tuned, case)
+        self.assertIn("--mu-inflight-window=256", leader)
+        self.assertNotIn("--mu-inflight-window=256", client)
+        self.assertIn("--mu-inflight-window=512",
+                      process_command(self.topo, self.topo.by_id(1), self.suite, case))
+
     def test_command_has_ips_and_identity(self):
         case = next(cases(self.suite))
         command = process_command(self.topo, self.topo.by_id(8), self.suite, case)

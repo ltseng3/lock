@@ -64,6 +64,28 @@ int main() {
         assert(ready.size() <= kWindow);
     }
     assert(committed == kRequests);
+
+    // With many configured but idle locks, only a committed active lock may
+    // trigger retirement-marker polling.
+    HandoffState sparse(1000, 4);
+    auto sparse_id = make_request_id(4, 321);
+    auto sparse_msg = message(Kind::Acquire, 4, 997, sparse_id);
+    assert(sparse.admit(sparse_msg).append.size() == 1);
+    int probes = 0;
+    auto no_marker = [&](uint64_t) { ++probes; return uint64_t{0}; };
+    assert(sparse.retire(no_marker).actions.empty());
+    assert(probes == 0);
+    sparse.committed({0, sparse_msg});
+    assert(sparse.retire(no_marker).actions.empty());
+    assert(probes == 1);
+    auto done = sparse.retire([&](uint64_t) {
+        ++probes;
+        return sparse_id;
+    });
+    assert(done.actions.size() == 1);
+    assert(sparse.retire(no_marker).actions.empty());
+    assert(probes == 2); // The lock was removed from the active list.
+
     HandoffState corrupted(1,1);
     auto id = make_request_id(4,1);
     auto entry = message(Kind::Acquire,4,0,id);

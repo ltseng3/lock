@@ -5,6 +5,7 @@
 #include <cstddef>
 #include "lock/locks/mu_state.h"
 #include "lock/locks/mu_leader_runtime.h"
+#include "lock/locks/handoff_leader_runtime.h"
 #include <thread>
 #include "lock/locks/replicated_log.h"
 #include "lock/rdma/transport.h"
@@ -45,6 +46,9 @@ int main(int argc, char** argv) {
         const size_t mu_inflight_window = opt.number("mu-inflight-window", 512);
         if (mu_inflight_window < 1 || mu_inflight_window > 512)
             throw std::invalid_argument("mu-inflight-window must be 1..512");
+        const size_t handoff_inflight_window = opt.number("handoff-inflight-window", 512);
+        if (handoff_inflight_window < 1 || handoff_inflight_window > 512)
+            throw std::invalid_argument("handoff-inflight-window must be 1..512");
         const size_t append_window =
             backend == lock::Backend::Mu ? mu_inflight_window : 128;
         if (std::find(replicas.begin(), replicas.end(), cfg.self) == replicas.end())
@@ -52,18 +56,26 @@ int main(int argc, char** argv) {
         if (opt.number("mu-lanes", 1) != 1)
             throw std::invalid_argument("only one replicated log lane supported");
         const bool leader = cfg.self == replicas.front();
-        if (leader && backend == lock::Backend::Mu)
+        if (leader && (backend == lock::Backend::Mu ||
+                       backend == lock::Backend::Handoff))
             cfg.replication_peers = replicas;
         lock::rdma::Transport net(cfg);
         net.connect();
         std::cout << "READY node=" << cfg.self << std::endl;
-        if (backend == lock::Backend::Mu) {
+        if (backend == lock::Backend::Mu || backend == lock::Backend::Handoff) {
             if (leader) {
-                lock::run_mu_leader(net, cfg.self, replicas, clients, lock_count,
-                                    mu_inflight_window, profile_requested);
+                if (backend == lock::Backend::Mu)
+                    lock::run_mu_leader(net, cfg.self, replicas, clients,
+                                        lock_count, mu_inflight_window,
+                                        profile_requested);
+                else
+                    lock::run_handoff_leader(net, cfg.self, replicas, clients,
+                                             lock_count, opt.number("prepared-window", 8),
+                                             handoff_inflight_window,
+                                             profile_requested);
             } else {
-                // Follower NICs accept one-sided log WRITEs autonomously.
-                // No polling or CPU-side application logic in the measured path.
+                // Follower NICs accept one-sided header WRITEs autonomously.
+                // No application-side polling in the measured path.
                 while (true) std::this_thread::sleep_for(std::chrono::hours(24));
             }
             return 0;

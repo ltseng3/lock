@@ -60,6 +60,14 @@ class TestExperiment(unittest.TestCase):
         self.assertIn("--mu-inflight-window=512",
                       process_command(self.topo, self.topo.by_id(1), self.suite, case))
 
+    def test_handoff_window_only_on_server(self):
+        case = dict(next(cases(self.suite)), backend="handoff")
+        tuned = dict(self.suite, handoff_inflight_window=256)
+        leader = process_command(self.topo, self.topo.by_id(1), tuned, case)
+        client = process_command(self.topo, self.topo.by_id(4), tuned, case)
+        self.assertIn("--handoff-inflight-window=256", leader)
+        self.assertNotIn("--handoff-inflight-window=256", client)
+
     def test_command_has_ips_and_identity(self):
         case = next(cases(self.suite))
         command = process_command(self.topo, self.topo.by_id(8), self.suite, case)

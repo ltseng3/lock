@@ -70,15 +70,6 @@ void replication_loop(Shared& s, rdma::Transport& net,
                 ++write_cqe;
             }
 
-            // Commit and emit ORDER/NEXT/START in the global log order.
-            while (auto committed = log.next_committed()) {
-                ++commits;
-                for (const auto& action : state.committed(*committed)) {
-                    submit_action(s, action);
-                    ++emitted;
-                }
-            }
-
             // Only inspect locks with committed, not-yet-retired entries.
             // Retirement evidence is a client one-sided WRITE to the marker
             // sidecar; the leader does not need an RPC for release.
@@ -94,6 +85,19 @@ void replication_loop(Shared& s, rdma::Transport& net,
             }
             for (const auto& cmd : retired.append)
                 append_pending.push_back(cmd);
+
+            // Release verified, already-retired predecessors before
+            // assigning a predecessor to a newly committed acquisition.
+            // In particular, this avoids NEXT to a locally retired client
+            // if its marker is already visible to the leader.
+            // Commit and emit ORDER/NEXT/START in the global log order.
+            while (auto committed = log.next_committed()) {
+                ++commits;
+                for (const auto& action : state.committed(*committed)) {
+                    submit_action(s, action);
+                    ++emitted;
+                }
+            }
 
             Message request{};
             // This thread exclusively owns the per-lock queue and reservation

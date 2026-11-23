@@ -252,6 +252,8 @@ def main() -> int:
                     help="Mu leader log in-flight limit (1..512; default 512)")
     ap.add_argument("--handoff-inflight-window", type=int,
                     help="Handoff leader log in-flight limit (1..512; default 512)")
+    ap.add_argument("--mu-lanes", type=int, choices=range(1, 9),
+                    help="Independent Mu/handoff replication lanes (1..8; default 1)")
     args = ap.parse_args()
     topo = Topology.load(args.topology)
     suite = json.loads(args.suite.read_text())
@@ -263,6 +265,8 @@ def main() -> int:
         raise ValueError("mu_inflight_window must be 1..512")
     if args.handoff_inflight_window is not None:
         suite["handoff_inflight_window"] = args.handoff_inflight_window
+    if args.mu_lanes is not None:
+        suite["mu_lanes"] = args.mu_lanes
     if not 1 <= suite.get("handoff_inflight_window", 512) <= 512:
         raise ValueError("handoff_inflight_window must be 1..512")
     for key in ("warmup_seconds", "duration_seconds", "repetitions"):
@@ -273,8 +277,8 @@ def main() -> int:
         raise ValueError("warmup must be >=0; duration and repetitions must be >=1")
     if suite["replicas"] != len(topo.replicas):
         raise ValueError("suite replica count does not match topology")
-    if suite.get("mu_lanes", 1) != 1:
-        raise ValueError("first implementation supports one Mu lane")
+    if not 1 <= suite.get("mu_lanes", 1) <= 8:
+        raise ValueError("mu_lanes must be 1..8")
     commit = sha()
     remote_dir = args.remote_dir or f"/tmp/lock-{commit[:12]}"
     if not remote_dir.startswith("/tmp/lock-"):

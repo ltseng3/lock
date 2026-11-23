@@ -47,6 +47,7 @@ int main(int argc, char** argv) {
         std::cout << "READY node=" << cfg.self << std::endl;
         bool leader = cfg.self == replicas.front();
         std::set<lock::NodeId> ready;
+        std::set<lock::NodeId> finished;
         bool started = false;
         std::unique_ptr<lock::ReplicatedLog> log;
         std::unique_ptr<lock::MuState> mu;
@@ -81,6 +82,17 @@ int main(int argc, char** argv) {
                         started = true;
                         for (auto peer : clients)
                             net.send(peer, lock::message(lock::Kind::Ready, cfg.self));
+                    }
+                } else if (kind == lock::Kind::Stop && started) {
+                    if (std::find(clients.begin(), clients.end(), event.peer) == clients.end() ||
+                        !finished.insert(event.peer).second)
+                        throw std::runtime_error("invalid or repeated client shutdown");
+                    if (finished.size() == clients.size()) {
+                        // Client Stop is sent only after all its active operations
+                        // and one-sided release writes have finished. The leader
+                        // has already acknowledged every retired position.
+                        for (auto peer : clients)
+                            net.send(peer, lock::message(lock::Kind::Stop, cfg.self));
                     }
                 } else if ((kind == lock::Kind::Acquire || kind == lock::Kind::Release) &&
                            started && backend != lock::Backend::Cas) {

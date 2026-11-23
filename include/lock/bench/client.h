@@ -13,6 +13,7 @@ struct ClientConfig {
     std::vector<NodeId> replicas;
     size_t lock_count = 1000;
     size_t outstanding = 1;
+    size_t workers = 1;
     std::string distribution = "uniform";
     uint64_t seed = 2026;
     uint64_t warmup_seconds = 5;
@@ -57,6 +58,7 @@ private:
         RequestId successor = 0;
         uint64_t successor_position = 0;
         bool sent = false;
+        bool acknowledged = false;
     };
     struct Marker {
         uint64_t* payload = nullptr;
@@ -64,7 +66,7 @@ private:
     };
     rdma::Transport& net_;
     ClientConfig cfg_;
-    LockPicker picker_;
+    std::vector<LockPicker> pickers_;
     std::vector<Operation> ops_;
     std::unordered_map<RequestId, size_t> requests_;
     std::unordered_map<WorkId, Awaited> awaited_;
@@ -77,6 +79,8 @@ private:
     uint64_t handoffs_sent_ = 0;
     uint64_t handoffs_received_ = 0;
     uint64_t late_next_ = 0;
+    bool stop_sent_ = false;
+    bool server_stopped_ = false;
     uint64_t next_sequence_ = 1;
     uint64_t next_work_ = 1;
     Clock::time_point measurement_begin_{}, measurement_end_{};

@@ -23,9 +23,16 @@ uint64_t percentile(std::vector<uint64_t> values, double p) {
 } // namespace
 ClientEngine::ClientEngine(rdma::Transport& net, ClientConfig cfg)
     : net_(net), cfg_(std::move(cfg)),
-      picker_(cfg_.lock_count, cfg_.distribution,
-              cfg_.seed ^ (static_cast<uint64_t>(cfg_.self) << 32)),
-      ops_(cfg_.outstanding) {
+      ops_(cfg_.outstanding * cfg_.workers) {
+    if (cfg_.workers < 1 || cfg_.workers > 16 ||
+        cfg_.outstanding * cfg_.workers > 512)
+        throw std::invalid_argument("workers * outstanding must be 1..512");
+    pickers_.reserve(cfg_.workers);
+    for (size_t worker = 0; worker < cfg_.workers; ++worker) {
+        pickers_.emplace_back(cfg_.lock_count, cfg_.distribution,
+            cfg_.seed ^ (static_cast<uint64_t>(cfg_.self) << 32) ^
+            (worker * 0x9e3779b97f4a7c15ULL));
+    }
     if (cfg_.replicas.size() != 3 && cfg_.replicas.size() != 5)
         throw std::invalid_argument("three or five replicas required");
     if (cfg_.outstanding == 0 || cfg_.outstanding > 512 || cfg_.lock_count == 0 ||
@@ -62,7 +69,7 @@ void ClientEngine::submit(size_t slot) {
     if (op.phase != Phase::Idle) throw std::logic_error("slot not idle");
     ++op.generation;
     op.request = make_request_id(cfg_.self, next_sequence_++);
-    op.lock = picker_.next();
+    op.lock = pickers_.at(slot / cfg_.outstanding).next();
     op.begun = Clock::now();
     op.ordered = false; op.started = false;
     op.predecessor = 0; op.successor = 0;
@@ -261,6 +268,7 @@ void ClientEngine::handle_next(const rdma::Completion& c) {
     ++late_next_;
     deliver_handoff(m.request, it->second);
     it->second.sent = true;
+    if (it->second.acknowledged) retired_.erase(it);
 }
 
 void ClientEngine::handle(const rdma::Completion& c) {
@@ -270,6 +278,12 @@ void ClientEngine::handle(const rdma::Completion& c) {
             throw std::runtime_error("message sender mismatch");
         const Kind kind = message_kind(c.message);
         if (kind == Kind::Ready) return;
+        if (kind == Kind::Stop) {
+            if (c.peer != cfg_.replicas.front() || !stop_sent_ || server_stopped_)
+                throw std::runtime_error("invalid shutdown barrier");
+            server_stopped_ = true;
+            return;
+        }
         if (cfg_.backend == Backend::Handoff) {
             if (kind == Kind::Handoff) {
                 handle_activation(c);
@@ -285,7 +299,12 @@ void ClientEngine::handle(const rdma::Completion& c) {
                 if (it == retired_.end() || it->second.lock != c.message.lock_id ||
                     it->second.position != c.message.position)
                     throw std::runtime_error("invalid retirement ACK");
-                retired_.erase(it);
+                if (it->second.acknowledged)
+                    throw std::runtime_error("duplicate retirement ACK");
+                it->second.acknowledged = true;
+                // If no successor exists yet, keep the retired predecessor
+                // alive for an ORDER/NEXT committed after its release.
+                if (it->second.sent) retired_.erase(it);
                 return;
             }
             throw std::runtime_error("unexpected handoff control message");
@@ -377,7 +396,23 @@ void ClientEngine::run() {
         }
         for (auto& event : net_.poll()) handle(event);
         if (now >= measurement_end_ && requests_.empty() &&
-            retired_.empty() && marker_work_.empty()) break;
+            marker_work_.empty() && !stop_sent_) {
+            bool all_acknowledged = true;
+            for (const auto& [id, retired] : retired_) {
+                if (!retired.acknowledged) {
+                    all_acknowledged = false;
+                    break;
+                }
+            }
+            if (all_acknowledged) {
+                // A client is done issuing work but must keep serving late
+                // NEXT until every client has finished and the leader closes
+                // the shared queue. All marker writes have completed locally.
+                net_.send(leader, message(Kind::Stop, cfg_.self));
+                stop_sent_ = true;
+            }
+        }
+        if (stop_sent_ && server_stopped_) break;
     }
     if (!awaited_.empty()) throw std::runtime_error("outstanding CQEs at completion");
     print_result();
@@ -388,6 +423,8 @@ void ClientEngine::print_result() const {
     std::cout << "RESULT {"
               << "\"node\":" << cfg_.self
               << ",\"backend\":\"" << name << "\""
+              << ",\"workers\":" << cfg_.workers
+              << ",\"outstanding_per_worker\":" << cfg_.outstanding
               << ",\"completed\":" << completed_
               << ",\"measurement_seconds\":" << cfg_.duration_seconds
               << ",\"acquire_p50_ns\":" << percentile(acquire_ns_, 0.50)

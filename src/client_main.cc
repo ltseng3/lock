@@ -32,6 +32,7 @@ int main(int argc, char** argv) {
         cfg.backend = lock::parse_backend(opt.require("backend"));
         cfg.lock_count = opt.number("locks", 1000);
         cfg.outstanding = opt.number("outstanding", 1);
+        cfg.workers = opt.number("workers", 1);
         cfg.distribution = opt.get("distribution", "uniform");
         cfg.seed = opt.number("seed", 2026);
         cfg.warmup_seconds = opt.number("warmup-seconds", 5);

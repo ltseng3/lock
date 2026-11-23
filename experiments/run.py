@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 from cluster import Remote, Topology
 
@@ -85,30 +86,40 @@ def start_node(remote: Remote, node, remote_dir: str,
               f"& echo $! > {shlex.quote(folder + '/pid')}")
     remote.command(node, launch)
 
-def alive_or_matching(remote: Remote, node, folder: str, token: str) -> bool:
-    script = (f"test -f {shlex.quote(folder + '/node.log')} && "
-              f"grep -q {shlex.quote(token)} {shlex.quote(folder + '/node.log')}")
-    return bool(remote.command(node, script, check=False) == "" and
-                remote.command(node,
-                    f"if {script}; then echo YES; else echo NO; fi", check=False).strip() == "YES")
-
 def wait_for(remote: Remote, nodes, folder: str, token: str, timeout: float) -> None:
+    """Poll all nodes concurrently and report early startup failures."""
     deadline = time.monotonic() + timeout
+    log = shlex.quote(folder + "/node.log")
+    pid = shlex.quote(folder + "/pid")
+    match = shlex.quote(token)
+
+    def probe(node):
+        script = (
+            f"if test -f {log}; then "
+            f"if grep -q '^ERROR ' {log}; then grep -m 1 '^ERROR ' {log}; "
+            f"elif grep -Fq -- {match} {log}; then echo READY; "
+            f"elif test -f {pid} && ! kill -0 \"$(cat {pid})\" 2>/dev/null; "
+            f"then echo EXITED; tail -n 3 {log}; "
+            f"else echo PENDING; fi; "
+            f"else echo PENDING; fi"
+        )
+        return node.id, remote.command(node, script, check=False).strip()
+
     while time.monotonic() < deadline:
+        with ThreadPoolExecutor(max_workers=max(1, len(nodes))) as pool:
+            statuses = list(pool.map(probe, nodes))
         pending = []
-        for node in nodes:
-            script = (f"if grep -q {shlex.quote(token)} "
-                      f"{shlex.quote(folder + '/node.log')} 2>/dev/null; "
-                      f"then echo YES; else echo NO; fi")
-            if remote.command(node, script, check=False).strip() != "YES":
-                pending.append(node.id)
-        if not pending:
+        for node_id, status in statuses:
+            if status == "READY":
+                continue
+            if status.startswith("ERROR ") or status.startswith("EXITED"):
+                raise RuntimeError(f"node {node_id}: {status}")
+            pending.append(node_id)
+        if not pending or remote.dry_run:
             return
-        if not remote.dry_run:
-            time.sleep(1)
-        else:
-            return
+        time.sleep(1)
     raise TimeoutError(f"waiting for {token}; pending nodes: {pending}")
+
 
 def kill_node(remote: Remote, node, folder: str) -> None:
     script = (f"if test -f {shlex.quote(folder + '/pid')}; then "

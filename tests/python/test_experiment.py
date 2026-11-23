@@ -8,7 +8,7 @@ sys.path.insert(0, str(ROOT / "experiments"))
 from cluster import Remote, Topology
 from unittest import mock
 import tempfile
-from run import cases, process_command
+from run import cases, process_command, wait_for
 
 class TestExperiment(unittest.TestCase):
     def setUp(self):
@@ -70,6 +70,24 @@ class TestExperiment(unittest.TestCase):
             self.assertNotIn("ssh", " ".join(argv))
             remote.deploy(other, pathlib.Path("/home/tsengle/lock"), "/tmp/lock-test")
             self.assertIn("tsengle@10.10.1.5:/tmp/lock-test/", call.call_args.args[0])
+
+    def test_wait_for_surfaces_early_error(self):
+        remote = mock.Mock()
+        remote.dry_run = False
+        remote.command.side_effect = lambda node, script, check=False: (
+            "ERROR RDMA: ibv_reg_mr: errno=12" if node.id == 1 else "PENDING")
+        with self.assertRaisesRegex(RuntimeError, "node 1: ERROR RDMA: ibv_reg_mr"):
+            wait_for(remote, self.topo.nodes, "/tmp/lock-test/runs/smoke",
+                     "RDMA_SMOKE_OK", 60)
+        self.assertEqual(remote.command.call_count, 8)
+
+    def test_wait_for_parallel_success(self):
+        remote = mock.Mock()
+        remote.dry_run = False
+        remote.command.return_value = "READY"
+        wait_for(remote, self.topo.nodes, "/tmp/lock-test/runs/smoke",
+                 "RDMA_SMOKE_OK", 60)
+        self.assertEqual(remote.command.call_count, 8)
 
     def test_local_log_collection_copies_directly(self):
         remote = Remote("tsengle", local_node_id=4)

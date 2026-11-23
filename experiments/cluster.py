@@ -143,7 +143,7 @@ class Remote:
                 return
             shutil.copy2(remote_file, destination)
             return
-        cmd = ["scp", *self._ssh_options(), f"{self._target(node)}:{remote_file}",
+        cmd = ["scp", "-q", *self._ssh_options(), f"{self._target(node)}:{remote_file}",
                str(destination)]
         if self.dry_run:
             print("DRY RUN:", shlex.join(cmd))

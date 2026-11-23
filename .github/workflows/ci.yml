@@ -1,0 +1,14 @@
+name: build
+on:
+  push:
+  pull_request:
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test core
+        run: |
+          cmake -S . -B build -DLOCK_WITH_RDMA=OFF -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build -j 2
+          ctest --test-dir build --output-on-failure

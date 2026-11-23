@@ -1,5 +1,7 @@
 #include "lock/bench/client.h"
 #include <algorithm>
+#include "lock/locks/replicated_log.h"
+#include <cstddef>
 #include <chrono>
 #include <cmath>
 #include <iomanip>
@@ -35,6 +37,12 @@ ClientEngine::ClientEngine(rdma::Transport& net, ClientConfig cfg)
         op.release_zero = static_cast<uint64_t*>(net_.allocate(sizeof(uint64_t), 8));
         *op.release_zero = 0;
     }
+    if (cfg_.backend == Backend::Handoff) {
+        const size_t count = std::max<size_t>(128, cfg_.outstanding * 4);
+        markers_.resize(count);
+        for (auto& marker : markers_)
+            marker.payload = static_cast<uint64_t*>(net_.allocate(sizeof(uint64_t), 8));
+    }
 }
 WorkId ClientEngine::track(size_t slot, Purpose purpose) {
     WorkId id = next_work_++;
@@ -56,6 +64,9 @@ void ClientEngine::submit(size_t slot) {
     op.request = make_request_id(cfg_.self, next_sequence_++);
     op.lock = picker_.next();
     op.begun = Clock::now();
+    op.ordered = false; op.started = false;
+    op.predecessor = 0; op.successor = 0;
+    op.position = 0; op.successor_position = 0; op.log_slot = 0;
     requests_.emplace(op.request, slot);
     if (cfg_.backend == Backend::Cas) {
         post_cas(slot);
@@ -64,7 +75,9 @@ void ClientEngine::submit(size_t slot) {
         net_.send(cfg_.replicas.front(),
                   message(Kind::Acquire, cfg_.self, op.lock, op.request));
     } else {
-        throw std::runtime_error("handoff backend not enabled in this revision");
+        op.phase = Phase::WaitOrder;
+        net_.send(cfg_.replicas.front(),
+                  message(Kind::Acquire, cfg_.self, op.lock, op.request));
     }
 }
 void ClientEngine::post_data(size_t slot) {
@@ -79,7 +92,9 @@ void ClientEngine::post_data(size_t slot) {
 void ClientEngine::release(size_t slot) {
     auto& op = ops_[slot];
     op.phase = Phase::WaitRelease;
-    if (cfg_.backend == Backend::Mu) {
+    if (cfg_.backend == Backend::Handoff) {
+        publish_retirement(slot);
+    } else if (cfg_.backend == Backend::Mu) {
         net_.send(cfg_.replicas.front(),
                   message(Kind::Release, cfg_.self, op.lock, op.request));
     } else {
@@ -192,7 +207,8 @@ void ClientEngine::run() {
             }
         }
         for (auto& event : net_.poll()) handle(event);
-        if (now >= measurement_end_ && requests_.empty()) break;
+        if (now >= measurement_end_ && requests_.empty() &&
+            retired_.empty() && marker_work_.empty()) break;
     }
     if (!awaited_.empty()) throw std::runtime_error("outstanding CQEs at completion");
     print_result();

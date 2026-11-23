@@ -118,6 +118,55 @@ int main() {
            waiting[0].message.other == first_id &&
            message_kind(waiting[1].message) == Kind::Next);
 
+    // Targeted retirement must not touch unrelated locks and must handle
+    // swap-removing the currently active lock without losing its neighbour.
+    HandoffState targeted(8, 2);
+    auto a = make_request_id(4, 9101);
+    auto b = make_request_id(5, 9102);
+    auto c = make_request_id(6, 9103);
+    auto ma = message(Kind::Acquire, 4, 1, a);
+    auto mb = message(Kind::Acquire, 5, 3, b);
+    auto mc = message(Kind::Acquire, 6, 6, c);
+    assert(targeted.admit(ma).append.size() == 1);
+    assert(targeted.admit(mb).append.size() == 1);
+    assert(targeted.admit(mc).append.size() == 1);
+    targeted.committed({0, ma});
+    targeted.committed({1, mb});
+    targeted.committed({2, mc});
+    std::map<uint64_t, uint64_t> evidence{{0,a},{1,0},{2,c}};
+    int reads = 0;
+    auto lookup = [&](uint64_t slot) { ++reads; return evidence[slot]; };
+    auto retired_a = targeted.retire_lock(1, lookup);
+    assert(retired_a.actions.size() == 1 && retired_a.actions[0].message.request == a);
+    assert(reads == 1);
+    auto retired_a_again = targeted.retire_lock(1, lookup);
+    assert(retired_a_again.actions.empty());
+    assert(reads == 1);
+    auto retired_b = targeted.retire_lock(3, lookup);
+    assert(retired_b.actions.empty());
+    assert(reads == 2);
+    auto retired_c = targeted.retire_lock(6, lookup);
+    assert(retired_c.actions.size() == 1 && retired_c.actions[0].message.request == c);
+    assert(reads == 3);
+    evidence[1] = b;
+    auto remaining = targeted.retire(lookup);
+    assert(remaining.actions.size() == 1 && remaining.actions[0].message.request == b);
+    assert(reads == 4);
+    assert(targeted.retire(lookup).actions.empty());
+    assert(reads == 4);
+    // A targeted check must reject evidence from a different request before
+    // either acknowledging release or granting a later prepared successor.
+    HandoffState foreign_targeted(8, 2);
+    assert(foreign_targeted.admit(ma).append.size() == 1);
+    foreign_targeted.committed({0, ma});
+    bool foreign_rejected = false;
+    try {
+        foreign_targeted.retire_lock(1, [&](uint64_t) { return b; });
+    } catch (const std::runtime_error&) {
+        foreign_rejected = true;
+    }
+    assert(foreign_rejected);
+
     HandoffState corrupted(1,1);
     auto id = make_request_id(4,1);
     auto entry = message(Kind::Acquire,4,0,id);

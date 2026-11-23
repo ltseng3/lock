@@ -37,8 +37,12 @@ std::vector<Action> HandoffState::committed(const Committed& item) {
                                     state.prepared.back().position;
     uint64_t position = state.next_position++;
     state.prepared.push_back({command.request, position, item.global_slot});
-    if (state.prepared.size() == 1)
+    if (state.prepared.size() == 1) {
+        if (state.active_index != static_cast<size_t>(-1))
+            throw std::runtime_error("duplicate active handoff lock");
+        state.active_index = active_locks_.size();
         active_locks_.push_back(command.lock_id);
+    }
     Message order = message(Kind::Order, 0, command.lock_id, command.request);
     order.other = predecessor;
     order.position = position;
@@ -56,34 +60,57 @@ std::vector<Action> HandoffState::committed(const Committed& item) {
     }
     return result;
 }
+void HandoffState::retire_one(
+    size_t lock_id,
+    const std::function<uint64_t(uint64_t)>& read_marker,
+    HandoffStep& out) {
+    if (lock_id >= locks_.size())
+        throw std::out_of_range("handoff retirement lock ID out of range");
+    auto& state = locks_[lock_id];
+    if (state.active_index == static_cast<size_t>(-1)) return;
+    if (state.active_index >= active_locks_.size() ||
+        active_locks_[state.active_index] != lock_id || state.prepared.empty())
+        throw std::runtime_error("invalid active handoff lock index");
+    while (!state.prepared.empty()) {
+        const auto& head = state.prepared.front();
+        const uint64_t marker = read_marker(head.log_slot);
+        if (!marker) break;
+        if (marker != head.request)
+            throw std::runtime_error("release-marker request mismatch: fail closed");
+        Message ack = message(Kind::ReleaseAck, 0, lock_id, head.request);
+        ack.position = head.position;
+        out.actions.push_back({request_node(head.request), ack});
+        state.prepared.pop_front();
+    }
+    admit_waiting(state, out);
+    if (state.prepared.empty()) {
+        // Swap-remove rather than shifting a potentially large active list.
+        const size_t index = state.active_index;
+        const size_t moved = active_locks_.back();
+        active_locks_[index] = moved;
+        locks_[moved].active_index = index;
+        active_locks_.pop_back();
+        state.active_index = static_cast<size_t>(-1);
+    }
+}
+HandoffStep HandoffState::retire_lock(
+    LockId lock_id,
+    const std::function<uint64_t(uint64_t)>& read_marker) {
+    HandoffStep out;
+    retire_one(lock_id, read_marker, out);
+    return out;
+}
 HandoffStep HandoffState::retire(
     const std::function<uint64_t(uint64_t)>& read_marker) {
     HandoffStep out;
-    // The original implementation scanned every configured lock on every
-    // event-loop iteration. Inspect only locks with a committed outstanding
-    // holder. Remove a lock when its committed frontier is drained.
     size_t i = 0;
     while (i < active_locks_.size()) {
-        const size_t lock_id = active_locks_[i];
-        auto& state = locks_[lock_id];
-        while (!state.prepared.empty()) {
-            const auto& head = state.prepared.front();
-            const uint64_t marker = read_marker(head.log_slot);
-            if (!marker) break;
-            if (marker != head.request)
-                throw std::runtime_error("release-marker request mismatch: fail closed");
-            Message ack = message(Kind::ReleaseAck, 0, lock_id, head.request);
-            ack.position = head.position;
-            out.actions.push_back({request_node(head.request), ack});
-            state.prepared.pop_front();
-        }
-        admit_waiting(state, out);
-        if (state.prepared.empty()) {
-            active_locks_[i] = active_locks_.back();
-            active_locks_.pop_back();
-        } else {
+        const size_t current = active_locks_[i];
+        retire_one(current, read_marker, out);
+        // Retired entries swap the last active lock into the current slot.
+        // Revisit that slot to avoid skipping a holder.
+        if (i < active_locks_.size() && active_locks_[i] == current)
             ++i;
-        }
     }
     return out;
 }

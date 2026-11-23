@@ -40,6 +40,11 @@ int main(int argc, char** argv) {
         auto backend = lock::parse_backend(opt.require("backend"));
         const bool profile_requested = opt.number("profile-leader", 0) != 0;
         const size_t lock_count = opt.number("locks", 1000);
+        const size_t mu_inflight_window = opt.number("mu-inflight-window", 512);
+        if (mu_inflight_window < 1 || mu_inflight_window > 512)
+            throw std::invalid_argument("mu-inflight-window must be 1..512");
+        const size_t append_window =
+            backend == lock::Backend::Mu ? mu_inflight_window : 128;
         if (std::find(replicas.begin(), replicas.end(), cfg.self) == replicas.end())
             throw std::invalid_argument("server node is not a replica");
         if (opt.number("mu-lanes", 1) != 1)
@@ -55,6 +60,8 @@ int main(int argc, char** argv) {
         uint64_t acquire_rx = 0, release_rx = 0, write_cqe = 0;
         uint64_t send_cqe = 0, committed_count = 0, sent_responses = 0;
         size_t max_inflight = 0, max_pending = 0;
+        std::vector<lock::rdma::Completion> completions;
+        completions.reserve(64);
         std::set<lock::NodeId> ready;
         std::set<lock::NodeId> finished;
         bool started = false;
@@ -72,7 +79,8 @@ int main(int argc, char** argv) {
         std::vector<lock::Message> pending;
         size_t head = 0;
         while (true) {
-            for (auto& event : net.poll()) {
+            net.poll_into(completions);
+            for (auto& event : completions) {
                 if (event.kind == lock::rdma::CompletionKind::Write) {
                     if (!leader || !log) throw std::runtime_error("unexpected server WRITE CQE");
                     log->on_write_complete(event.work_id);
@@ -131,9 +139,9 @@ int main(int argc, char** argv) {
                 }
             }
             if (!leader || !log) continue;
-            // Cap work on one RC send queue while allowing pipelined quorum commits.
+            // Bound in-flight log work; Mu has a configurable throughput window.
             if (profile_mu) max_pending = std::max(max_pending, pending.size() - head);
-            while (head < pending.size() && log->inflight() < 128) {
+            while (head < pending.size() && log->inflight() < append_window) {
                 log->append(pending[head++]);
             }
             if (profile_mu) max_inflight = std::max(max_inflight, log->inflight());
@@ -142,7 +150,9 @@ int main(int argc, char** argv) {
                 if (profile_mu) ++committed_count;
                 if (mu) for (auto& action : mu->apply(committed->command)) {
                     action.message.sender = cfg.self;
-                    net.send(action.destination, action.message);
+                    // Mu responses need reliable RC delivery, not per-SEND CQEs.
+                    // Transport forces a signaled SEND at least every 16 WRs/QP.
+                    net.send(action.destination, action.message, 0, false);
                     if (profile_mu) ++sent_responses;
                 }
                 if (handoff) for (auto& action : handoff->committed(*committed)) {
@@ -178,6 +188,7 @@ int main(int argc, char** argv) {
                                   << " send_cqe=" << send_cqe
                                   << " responses_sent=" << sent_responses
                                   << " max_inflight=" << max_inflight
+                                  << " window=" << append_window
                                   << " max_pending=" << max_pending
                                   << std::endl;
                     }

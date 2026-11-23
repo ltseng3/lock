@@ -371,8 +371,11 @@ void ClientEngine::run() {
     net_.send(leader, message(Kind::Ready, cfg_.self));
     auto barrier_deadline = Clock::now() + std::chrono::seconds(cfg_.watchdog_seconds);
     bool barrier = false;
+    std::vector<rdma::Completion> completions;
+    completions.reserve(64);
     while (!barrier && Clock::now() < barrier_deadline) {
-        for (const auto& e : net_.poll()) {
+        net_.poll_into(completions);
+        for (const auto& e : completions) {
             if (e.kind == rdma::CompletionKind::Receive) {
                 if (e.peer != leader || e.message.sender != leader ||
                     message_kind(e.message) != Kind::Ready)
@@ -394,7 +397,8 @@ void ClientEngine::run() {
                 if (ops_[i].phase == Phase::Idle) submit(i);
             }
         }
-        for (auto& event : net_.poll()) handle(event);
+        net_.poll_into(completions);
+        for (auto& event : completions) handle(event);
         if (now >= measurement_end_ && requests_.empty() &&
             marker_work_.empty() && !stop_sent_) {
             bool all_acknowledged = true;

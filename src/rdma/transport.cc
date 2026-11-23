@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <vector>
 #include <algorithm>
+#include <array>
 
 namespace lock::rdma {
 namespace {
@@ -126,6 +127,7 @@ struct Transport::Impl {
         ibv_qp* qp = nullptr;
         std::vector<Message*> receives;
         uint32_t psn = 0;
+        uint32_t unsignaled_posted = 0;
         Bootstrap remote{};
     };
     Config cfg;
@@ -339,32 +341,41 @@ void Transport::connect() {
     ::close(listen_fd);
     x.connected = true;
 }
-void Transport::send(NodeId peer, const Message& msg, WorkId id) {
+void Transport::send(NodeId peer, const Message& msg, WorkId id, bool signal) {
     auto& x = *impl_; auto& c = x.conn(peer);
     if (!x.connected) throw std::runtime_error("RDMA send before connect");
+    // Signal at least every 16 WRs per QP, even when the application only
+    // requests unsignaled traffic. A later signaled CQE retires earlier WRs.
+    const bool signaled = signal || c.unsignaled_posted >= 15;
     ibv_sge sge{};
     sge.addr = reinterpret_cast<uintptr_t>(&msg); sge.length = sizeof(msg);
     ibv_send_wr wr{}, *bad = nullptr;
     wr.wr_id = encode(Tag::Send, peer, id);
     wr.sg_list = &sge; wr.num_sge = 1;
-    wr.opcode = IBV_WR_SEND; wr.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
+    wr.opcode = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_INLINE | (signaled ? IBV_SEND_SIGNALED : 0);
     check(!ibv_post_send(c.qp, &wr, &bad), "post SEND");
+    c.unsignaled_posted = signaled ? 0 : c.unsignaled_posted + 1;
 }
-void Transport::write(NodeId peer, const void* p, size_t bytes,
-                      size_t offset, WorkId id) {
+bool Transport::write(NodeId peer, const void* p, size_t bytes,
+                      size_t offset, WorkId id, bool signal) {
     auto& x = *impl_;
     x.verify_remote(peer, offset, bytes);
     if (!x.is_local(p, bytes)) throw std::invalid_argument("WRITE source is not registered");
+    auto& c = x.conn(peer);
+    const bool signaled = signal || c.unsignaled_posted >= 15;
     ibv_sge sge{};
     sge.addr = reinterpret_cast<uintptr_t>(p); sge.length = static_cast<uint32_t>(bytes);
     sge.lkey = x.mr->lkey;
     ibv_send_wr wr{}, *bad = nullptr;
     wr.wr_id = encode(Tag::Write, peer, id);
     wr.sg_list = &sge; wr.num_sge = 1; wr.opcode = IBV_WR_RDMA_WRITE;
-    wr.send_flags = IBV_SEND_SIGNALED;
-    wr.wr.rdma.remote_addr = x.conn(peer).remote.base + offset;
-    wr.wr.rdma.rkey = x.conn(peer).remote.rkey;
-    check(!ibv_post_send(x.conn(peer).qp, &wr, &bad), "post WRITE");
+    wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
+    wr.wr.rdma.remote_addr = c.remote.base + offset;
+    wr.wr.rdma.rkey = c.remote.rkey;
+    check(!ibv_post_send(c.qp, &wr, &bad), "post WRITE");
+    c.unsignaled_posted = signaled ? 0 : c.unsignaled_posted + 1;
+    return signaled;
 }
 void Transport::compare_swap(NodeId peer, uint64_t* result, size_t offset,
                              uint64_t expected, uint64_t desired, WorkId id) {
@@ -386,13 +397,21 @@ void Transport::compare_swap(NodeId peer, uint64_t* result, size_t offset,
     wr.wr.atomic.compare_add = expected; wr.wr.atomic.swap = desired;
     check(!ibv_post_send(x.conn(peer).qp, &wr, &bad), "post CAS");
 }
-std::vector<Completion> Transport::poll(int batch) {
+void Transport::poll_into(std::vector<Completion>& result, int batch) {
     auto& x = *impl_;
     if (batch <= 0 || batch > 4096) throw std::invalid_argument("invalid poll batch");
-    std::vector<ibv_wc> wc(static_cast<size_t>(batch));
-    int n = ibv_poll_cq(x.cq, batch, wc.data());
+    // The benchmark always requests 64 CQEs. Avoid allocating this buffer
+    // on every empty CQ poll; also reuse the caller's output vector.
+    std::array<ibv_wc, 64> local;
+    std::vector<ibv_wc> larger;
+    ibv_wc* wc = local.data();
+    if (batch > static_cast<int>(local.size())) {
+        larger.resize(static_cast<size_t>(batch));
+        wc = larger.data();
+    }
+    int n = ibv_poll_cq(x.cq, batch, wc);
     check(n >= 0, "poll CQ");
-    std::vector<Completion> result;
+    result.clear();
     result.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
         auto& w = wc[i];
@@ -420,6 +439,10 @@ std::vector<Completion> Transport::poll(int batch) {
         }
         result.push_back(c);
     }
+}
+std::vector<Completion> Transport::poll(int batch) {
+    std::vector<Completion> result;
+    poll_into(result, batch);
     return result;
 }
 void* Transport::at(size_t offset, size_t length) { return impl_->at(offset, length); }

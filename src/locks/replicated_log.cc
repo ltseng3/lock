@@ -20,11 +20,17 @@ uint64_t ReplicatedLog::append(const Message& m) {
     *record = {};
     record->command = m;
     pending_.push_back({1, m});
+    // Local replica counts as one. Request completion from enough followers
+    // to establish a quorum; still post the record to every configured replica.
+    // Other follower WRs are signaled periodically to drain their QP queues.
+    // LogRecord storage is never reused, so unsignaled WR sources stay valid.
+    size_t required_remote = replicas_.size() / 2;
     for (NodeId peer : replicas_) {
         if (peer == net_.self()) continue;
+        const bool quorum_signal = required_remote-- > 0;
         WorkId id = next_work_++;
-        writes_.emplace(id, slot);
-        net_.write(peer, record, sizeof(LogRecord), offset, id);
+        if (net_.write(peer, record, sizeof(LogRecord), offset, id, quorum_signal))
+            writes_.emplace(id, slot);
     }
     return slot;
 }

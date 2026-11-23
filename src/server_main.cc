@@ -53,12 +53,19 @@ int main(int argc, char** argv) {
             backend == lock::Backend::Mu ? mu_inflight_window : 128;
         if (std::find(replicas.begin(), replicas.end(), cfg.self) == replicas.end())
             throw std::invalid_argument("server node is not a replica");
-        if (opt.number("mu-lanes", 1) != 1)
-            throw std::invalid_argument("only one replicated log lane supported");
+        const size_t mu_lanes = opt.number("mu-lanes", 1);
+        if (mu_lanes < 1 || mu_lanes > 8)
+            throw std::invalid_argument("mu-lanes must be 1..8");
+        if (backend == lock::Backend::Cas && mu_lanes != 1)
+            throw std::invalid_argument("CAS does not use Mu lanes");
         const bool leader = cfg.self == replicas.front();
-        if (leader && (backend == lock::Backend::Mu ||
-                       backend == lock::Backend::Handoff))
+        if (backend == lock::Backend::Mu ||
+            backend == lock::Backend::Handoff) {
+            // Every replica must bootstrap identical per-lane QPs, including
+            // passive followers, for the leader's one-sided inline WRITEs.
             cfg.replication_peers = replicas;
+            cfg.replication_lanes = mu_lanes;
+        }
         lock::rdma::Transport net(cfg);
         net.connect();
         std::cout << "READY node=" << cfg.self << std::endl;
@@ -67,12 +74,12 @@ int main(int argc, char** argv) {
                 if (backend == lock::Backend::Mu)
                     lock::run_mu_leader(net, cfg.self, replicas, clients,
                                         lock_count, mu_inflight_window,
-                                        profile_requested);
+                                        profile_requested, mu_lanes);
                 else
                     lock::run_handoff_leader(net, cfg.self, replicas, clients,
                                              lock_count, opt.number("prepared-window", 8),
                                              handoff_inflight_window,
-                                             profile_requested);
+                                             profile_requested, mu_lanes);
             } else {
                 // Follower NICs accept one-sided header WRITEs autonomously.
                 // No application-side polling in the measured path.

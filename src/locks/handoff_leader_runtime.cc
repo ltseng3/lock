@@ -4,6 +4,7 @@
 #include "lock/locks/mu_compact_log.h"
 #include "lock/locks/mu_encoding.h"
 #include "lock/locks/spsc_queue.h"
+#include "lock/locks/lane_layout.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -11,6 +12,7 @@
 #include <deque>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -26,12 +28,14 @@ struct Shared {
     std::atomic<bool> stopped{false}, failed{false};
     std::exception_ptr failure;
 };
-struct JoinWorker {
-    Shared& shared;
-    std::thread& worker;
-    ~JoinWorker() {
-        shared.stopped.store(true, std::memory_order_release);
-        if (worker.joinable()) worker.join();
+struct JoinWorkers {
+    std::vector<std::unique_ptr<Shared>>& lanes;
+    std::vector<std::thread>& workers;
+    ~JoinWorkers() {
+        for (auto& lane : lanes)
+            lane->stopped.store(true, std::memory_order_release);
+        for (auto& worker : workers)
+            if (worker.joinable()) worker.join();
     }
 };
 void submit_action(Shared& s, const Action& action) {
@@ -41,13 +45,14 @@ void submit_action(Shared& s, const Action& action) {
 void replication_loop(Shared& s, rdma::Transport& net,
                       const std::vector<NodeId>& replicas,
                       size_t lock_count, size_t prepared_window,
-                      size_t window, bool profile) {
+                      size_t window, bool profile,
+                      size_t lane, size_t lane_count) {
     try {
         // Half the registered log area holds 8-byte replicated headers. The
         // adjacent half holds one 8-byte marker per slot, written by the
         // completed client to the leader's NIC-exposed memory.
         const size_t capacity = handoff_log_capacity(net.memory_bytes());
-        MuCompactLog log(net, replicas, window, capacity);
+        MuCompactLog log(net, replicas, window, capacity, lane, lane_count);
         HandoffState state(lock_count, prepared_window);
         std::deque<Message> append_pending;
         std::vector<rdma::Completion> cqes;
@@ -57,7 +62,7 @@ void replication_loop(Shared& s, rdma::Transport& net,
         uint64_t emitted = 0;
         size_t max_inflight = 0, max_pending = 0;
         while (!s.stopped.load(std::memory_order_acquire)) {
-            net.poll_replication_into(cqes);
+            net.poll_replication_into(cqes, 64, lane);
             for (const auto& c : cqes) {
                 if (c.kind != rdma::CompletionKind::Write)
                     throw std::runtime_error("unexpected handoff replication CQE");
@@ -94,6 +99,8 @@ void replication_loop(Shared& s, rdma::Transport& net,
             // This thread exclusively owns the per-lock queue and reservation
             // state. Client receives never mutate those structures directly.
             while (s.requests.try_pop(request)) {
+                if (lock_lane(request.lock_id, lane_count) != lane)
+                    throw std::runtime_error("handoff request routed to wrong lane");
                 auto step = state.admit(request);
                 for (const auto& cmd : step.append)
                     append_pending.push_back(cmd);
@@ -117,6 +124,7 @@ void replication_loop(Shared& s, rdma::Transport& net,
                     const auto sends = s.send_cqe.exchange(0);
                     if (received || commits) {
                         std::cout << "HANDOFF_PROFILE"
+                                  << " lane=" << lane
                                   << " seconds=" << elapsed
                                   << " acquire_rx=" << received
                                   << " commits=" << commits
@@ -147,13 +155,24 @@ void run_handoff_leader(rdma::Transport& net, NodeId self,
                         const std::vector<NodeId>& replicas,
                         const std::vector<NodeId>& clients,
                         size_t lock_count, size_t prepared_window,
-                        size_t inflight_window, bool profile) {
-    Shared shared;
-    std::thread worker([&] {
-        replication_loop(shared, net, replicas, lock_count, prepared_window,
-                         inflight_window, profile);
-    });
-    JoinWorker join{shared, worker};
+                        size_t inflight_window, bool profile,
+                        size_t lane_count) {
+    if (lane_count < 1 || lane_count > 8)
+        throw std::invalid_argument("invalid handoff lane count");
+    std::vector<std::unique_ptr<Shared>> lanes;
+    std::vector<std::thread> workers;
+    lanes.reserve(lane_count);
+    workers.reserve(lane_count);
+    for (size_t lane = 0; lane < lane_count; ++lane)
+        lanes.push_back(std::make_unique<Shared>());
+    JoinWorkers join{lanes, workers};
+    for (size_t lane = 0; lane < lane_count; ++lane) {
+        Shared* shard = lanes[lane].get();
+        workers.emplace_back([&, shard, lane] {
+            replication_loop(*shard, net, replicas, lock_count, prepared_window,
+                             inflight_window, profile, lane, lane_count);
+        });
+    }
 
     // The communication thread exclusively owns client RC QPs and their CQ.
     // The worker owns follower QPs and the separate replication CQ.
@@ -162,12 +181,13 @@ void run_handoff_leader(rdma::Transport& net, NodeId self,
     std::set<NodeId> ready, finished;
     bool started = false;
     while (true) {
-        if (shared.failed.load(std::memory_order_acquire))
-            std::rethrow_exception(shared.failure);
+        for (const auto& shard : lanes)
+            if (shard->failed.load(std::memory_order_acquire))
+                std::rethrow_exception(shard->failure);
         net.poll_into(cqes);
         for (const auto& c : cqes) {
             if (c.kind == rdma::CompletionKind::Send) {
-                if (profile) shared.send_cqe.fetch_add(1, std::memory_order_relaxed);
+                if (profile) lanes[0]->send_cqe.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
             if (c.kind != rdma::CompletionKind::Receive)
@@ -198,23 +218,26 @@ void run_handoff_leader(rdma::Transport& net, NodeId self,
                     throw std::runtime_error("invalid handoff request");
                 // Reject unrepresentable identifiers before assigning log slots.
                 (void)pack_mu_command(m);
-                if (!shared.requests.try_push(m))
+                const size_t lane = lock_lane(m.lock_id, lane_count);
+                auto& shard = *lanes[lane];
+                if (!shard.requests.try_push(m))
                     throw std::runtime_error("handoff request queue capacity exceeded");
                 if (profile)
-                    shared.acquire_rx.fetch_add(1, std::memory_order_relaxed);
+                    shard.acquire_rx.fetch_add(1, std::memory_order_relaxed);
             } else {
                 throw std::runtime_error("unexpected handoff client message");
             }
         }
 
         Action action{};
-        while (shared.responses.try_pop(action)) {
-            action.message.sender = self;
-            // RC delivery is reliable; periodically signal the send queue to
-            // reclaim WRs without asking for one CQE per response.
-            net.send(action.destination, action.message, 0, false);
-            if (profile)
-                shared.responses_sent.fetch_add(1, std::memory_order_relaxed);
+        for (auto& shard : lanes) {
+            while (shard->responses.try_pop(action)) {
+                action.message.sender = self;
+                // Client SENDs share the communication thread's QPs.
+                net.send(action.destination, action.message, 0, false);
+                if (profile)
+                    shard->responses_sent.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
 }

@@ -2,12 +2,14 @@
 #include "lock/locks/mu_compact_log.h"
 #include "lock/locks/mu_state.h"
 #include "lock/locks/spsc_queue.h"
+#include "lock/locks/lane_layout.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -26,19 +28,22 @@ struct Shared {
     std::atomic<bool> failed{false};
     std::exception_ptr failure;
 };
-struct JoinWorker {
-    Shared& shared;
-    std::thread& worker;
-    ~JoinWorker() {
-        shared.stopped.store(true, std::memory_order_release);
-        if (worker.joinable()) worker.join();
+struct JoinWorkers {
+    std::vector<std::unique_ptr<Shared>>& lanes;
+    std::vector<std::thread>& workers;
+    ~JoinWorkers() {
+        for (auto& lane : lanes)
+            lane->stopped.store(true, std::memory_order_release);
+        for (auto& worker : workers)
+            if (worker.joinable()) worker.join();
     }
 };
 void replication_loop(Shared& s, rdma::Transport& net,
                       const std::vector<NodeId>& replicas,
-                      size_t lock_count, size_t window, bool profile) {
+                      size_t lock_count, size_t window, bool profile,
+                      size_t lane, size_t lane_count) {
     try {
-        MuCompactLog log(net, replicas, window);
+        MuCompactLog log(net, replicas, window, 0, lane, lane_count);
         MuState state(lock_count);
         std::vector<rdma::Completion> completions;
         completions.reserve(64);
@@ -47,7 +52,7 @@ void replication_loop(Shared& s, rdma::Transport& net,
         size_t max_inflight = 0, max_pending = 0;
         while (!s.stopped.load(std::memory_order_acquire)) {
             // Only this thread touches the replica QPs and the replication CQ.
-            net.poll_replication_into(completions);
+            net.poll_replication_into(completions, 64, lane);
             for (const auto& completion : completions) {
                 if (completion.kind != rdma::CompletionKind::Write)
                     throw std::runtime_error("unexpected completion on Mu replication CQ");
@@ -64,8 +69,11 @@ void replication_loop(Shared& s, rdma::Transport& net,
             }
             Message request{};
             max_pending = std::max(max_pending, s.requests.size());
-            while (log.inflight() < window && s.requests.try_pop(request))
+            while (log.inflight() < window && s.requests.try_pop(request)) {
+                if (lock_lane(request.lock_id, lane_count) != lane)
+                    throw std::runtime_error("Mu request routed to wrong lane");
                 log.append(request);
+            }
             max_inflight = std::max(max_inflight, log.inflight());
 
             if (profile && ((++loops & 4095ULL) == 0)) {
@@ -78,6 +86,7 @@ void replication_loop(Shared& s, rdma::Transport& net,
                     const auto sends = s.send_cqe.exchange(0);
                     if (acquire || release || commits) {
                         std::cout << "LEADER_PROFILE"
+                                  << " lane=" << lane
                                   << " seconds=" << seconds
                                   << " acquire_rx=" << acquire
                                   << " release_rx=" << release
@@ -106,26 +115,39 @@ void replication_loop(Shared& s, rdma::Transport& net,
 void run_mu_leader(rdma::Transport& net, NodeId self,
                    const std::vector<NodeId>& replicas,
                    const std::vector<NodeId>& clients, size_t lock_count,
-                   size_t inflight_window, bool profile) {
+                   size_t inflight_window, bool profile,
+                   size_t lane_count) {
     // Each queue has exactly one producer and one consumer.
     // The main thread owns all client QPs and the communication CQ.
     // The replication thread owns all follower QPs and its distinct CQ.
-    Shared shared;
-    std::thread worker([&] {
-        replication_loop(shared, net, replicas, lock_count, inflight_window, profile);
-    });
-    JoinWorker guard{shared, worker};
+    if (lane_count < 1 || lane_count > 8)
+        throw std::invalid_argument("invalid Mu lane count");
+    std::vector<std::unique_ptr<Shared>> lanes;
+    std::vector<std::thread> workers;
+    lanes.reserve(lane_count);
+    workers.reserve(lane_count);
+    for (size_t lane = 0; lane < lane_count; ++lane)
+        lanes.push_back(std::make_unique<Shared>());
+    JoinWorkers guard{lanes, workers};
+    for (size_t lane = 0; lane < lane_count; ++lane) {
+        Shared* shared = lanes[lane].get();
+        workers.emplace_back([&, shared, lane] {
+            replication_loop(*shared, net, replicas, lock_count, inflight_window,
+                             profile, lane, lane_count);
+        });
+    }
     std::vector<rdma::Completion> completions;
     completions.reserve(64);
     std::set<NodeId> ready, finished;
     bool started = false;
     while (true) {
-        if (shared.failed.load(std::memory_order_acquire))
-            std::rethrow_exception(shared.failure);
+        for (const auto& shard : lanes)
+            if (shard->failed.load(std::memory_order_acquire))
+                std::rethrow_exception(shard->failure);
         net.poll_into(completions);
         for (const auto& c : completions) {
             if (c.kind == rdma::CompletionKind::Send) {
-                if (profile) shared.send_cqe.fetch_add(1, std::memory_order_relaxed);
+                if (profile) lanes[0]->send_cqe.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
             if (c.kind != rdma::CompletionKind::Receive)
@@ -155,23 +177,28 @@ void run_mu_leader(rdma::Transport& net, NodeId self,
                 // Validate the eight-byte representation *before* enqueueing,
                 // so an unrepresentable request never enters the committed log.
                 (void)pack_mu_command(m);
-                if (!shared.requests.try_push(m))
+                const size_t lane = lock_lane(m.lock_id, lane_count);
+                auto& shard = *lanes[lane];
+                if (!shard.requests.try_push(m))
                     throw std::runtime_error("Mu mutation queue capacity exceeded");
                 if (profile) {
                     if (kind == Kind::Acquire)
-                        shared.acquire_rx.fetch_add(1, std::memory_order_relaxed);
+                        shard.acquire_rx.fetch_add(1, std::memory_order_relaxed);
                     else
-                        shared.release_rx.fetch_add(1, std::memory_order_relaxed);
+                        shard.release_rx.fetch_add(1, std::memory_order_relaxed);
                 }
             } else {
                 throw std::runtime_error("unexpected Mu client message");
             }
         }
         Action action{};
-        while (shared.responses.try_pop(action)) {
-            action.message.sender = self;
-            net.send(action.destination, action.message, 0, false);
-            if (profile) shared.responses_sent.fetch_add(1, std::memory_order_relaxed);
+        for (auto& shard : lanes) {
+            while (shard->responses.try_pop(action)) {
+                action.message.sender = self;
+                net.send(action.destination, action.message, 0, false);
+                if (profile)
+                    shard->responses_sent.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
 }

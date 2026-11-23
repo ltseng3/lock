@@ -13,6 +13,7 @@ struct ClientConfig {
     std::vector<NodeId> replicas;
     size_t lock_count = 1000;
     size_t outstanding = 1;
+    size_t workers = 1;
     std::string distribution = "uniform";
     uint64_t seed = 2026;
     uint64_t warmup_seconds = 5;
@@ -64,7 +65,7 @@ private:
     };
     rdma::Transport& net_;
     ClientConfig cfg_;
-    LockPicker picker_;
+    std::vector<LockPicker> pickers_;
     std::vector<Operation> ops_;
     std::unordered_map<RequestId, size_t> requests_;
     std::unordered_map<WorkId, Awaited> awaited_;

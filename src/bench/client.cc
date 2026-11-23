@@ -23,9 +23,16 @@ uint64_t percentile(std::vector<uint64_t> values, double p) {
 } // namespace
 ClientEngine::ClientEngine(rdma::Transport& net, ClientConfig cfg)
     : net_(net), cfg_(std::move(cfg)),
-      picker_(cfg_.lock_count, cfg_.distribution,
-              cfg_.seed ^ (static_cast<uint64_t>(cfg_.self) << 32)),
-      ops_(cfg_.outstanding) {
+      ops_(cfg_.outstanding * cfg_.workers) {
+    if (cfg_.workers < 1 || cfg_.workers > 16 ||
+        cfg_.outstanding * cfg_.workers > 512)
+        throw std::invalid_argument("workers * outstanding must be 1..512");
+    pickers_.reserve(cfg_.workers);
+    for (size_t worker = 0; worker < cfg_.workers; ++worker) {
+        pickers_.emplace_back(cfg_.lock_count, cfg_.distribution,
+            cfg_.seed ^ (static_cast<uint64_t>(cfg_.self) << 32) ^
+            (worker * 0x9e3779b97f4a7c15ULL));
+    }
     if (cfg_.replicas.size() != 3 && cfg_.replicas.size() != 5)
         throw std::invalid_argument("three or five replicas required");
     if (cfg_.outstanding == 0 || cfg_.outstanding > 512 || cfg_.lock_count == 0 ||
@@ -62,7 +69,7 @@ void ClientEngine::submit(size_t slot) {
     if (op.phase != Phase::Idle) throw std::logic_error("slot not idle");
     ++op.generation;
     op.request = make_request_id(cfg_.self, next_sequence_++);
-    op.lock = picker_.next();
+    op.lock = pickers_.at(slot / cfg_.outstanding).next();
     op.begun = Clock::now();
     op.ordered = false; op.started = false;
     op.predecessor = 0; op.successor = 0;
@@ -388,6 +395,8 @@ void ClientEngine::print_result() const {
     std::cout << "RESULT {"
               << "\"node\":" << cfg_.self
               << ",\"backend\":\"" << name << "\""
+              << ",\"workers\":" << cfg_.workers
+              << ",\"outstanding_per_worker\":" << cfg_.outstanding
               << ",\"completed\":" << completed_
               << ",\"measurement_seconds\":" << cfg_.duration_seconds
               << ",\"acquire_p50_ns\":" << percentile(acquire_ns_, 0.50)

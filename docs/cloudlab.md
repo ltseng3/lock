@@ -20,3 +20,12 @@ The default layout has replica nodes 1–3 and client nodes 4–8. For the optio
 Install CMake, a C++20 compiler, libibverbs-dev and rsync on all eight nodes, and ensure SSH connectivity from node 4 to the **other seven** hosts. The InfiniBand port must be active and memory-registration limits must support the configured MR sizes (512 MiB by default on servers). Raw logs and a run manifest are saved under `results/`.
 
 See docs/validation.md for the correctness boundary. Automated CI cannot verify CloudLab hardware behavior.
+
+## Ubuntu 20.04 / CMake 3.16.3
+
+CMake 3.16.3 is supported; no CMake upgrade is required. A C++20-capable
+compiler and standard library are required (GCC 10+). If the default compiler
+is GCC 9, install `g++-10` on each node and configure a fresh build directory
+using `CXX=g++-10 cmake -S . -B build -DLOCK_WITH_RDMA=ON`. Do not reuse
+a build directory configured with a different compiler. The legacy CTest
+invocation is `(cd build && ctest --output-on-failure)`.

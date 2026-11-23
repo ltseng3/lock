@@ -1,9 +1,27 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.16)
 project(lock LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+# CMake 3.16 can select C++20, but the compiler and standard library
+# must implement the features actually used in the project.
+include(CheckCXXSourceCompiles)
+check_cxx_source_compiles("
+#include <atomic>
+#include <map>
+#include <string>
+int main() {
+  int value = 0;
+  std::atomic_ref<int> a(value);
+  std::map<int, int> m;
+  std::string s = \"test\";
+  return a.load() + m.contains(1) + s.starts_with(\"t\");
+}
+" LOCK_HAS_REQUIRED_CXX20)
+if(NOT LOCK_HAS_REQUIRED_CXX20)
+  message(FATAL_ERROR "A C++20-capable C++ compiler and standard library are required (GCC 10+ recommended). On Ubuntu 20.04, install g++-10 and configure with CXX=g++-10 after removing the old build directory.")
+endif()
 add_library(lock_core STATIC src/config.cc src/locks/mu_state.cc src/locks/handoff_state.cc src/bench/workload.cc)
 target_include_directories(lock_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(lock_core PRIVATE -Wall -Wextra -Wpedantic)

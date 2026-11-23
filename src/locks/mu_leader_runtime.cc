@@ -10,6 +10,7 @@
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -18,6 +19,7 @@
 namespace lock {
 namespace {
 using Clock = std::chrono::steady_clock;
+std::mutex profile_output_mutex;
 
 struct Shared {
     SpscQueue<Message> requests;
@@ -85,6 +87,7 @@ void replication_loop(Shared& s, rdma::Transport& net,
                     const auto sent = s.responses_sent.exchange(0);
                     const auto sends = s.send_cqe.exchange(0);
                     if (acquire || release || commits) {
+                        std::lock_guard<std::mutex> output_lock(profile_output_mutex);
                         std::cout << "LEADER_PROFILE"
                                   << " lane=" << lane
                                   << " seconds=" << seconds

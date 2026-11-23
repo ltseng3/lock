@@ -201,3 +201,7 @@ before assigning predecessors to newly committed acquisitions. If a former
 holder has already retired and no other prepared predecessor exists, the
 successor's committed ORDER immediately starts ownership without an unnecessary
 NEXT/HANDOFF; otherwise FIFO and direct handoff remain enforced.
+
+For mixed-backend suites, CAS uses a single unused lane setting even if
+`--mu-lanes` is higher, so the same sweep can compare CAS against sharded
+Mu/handoff without an incompatible CAS server option.

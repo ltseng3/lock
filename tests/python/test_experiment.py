@@ -76,6 +76,14 @@ class TestExperiment(unittest.TestCase):
                 command = process_command(self.topo, node, tuned, case)
                 self.assertIn("--mu-lanes=4", command)
 
+    def test_multi_lanes_mixed_suite_keeps_cas_single(self):
+        tuned = dict(self.suite, mu_lanes=4)
+        case = dict(next(cases(self.suite)), backend="cas")
+        for node in self.topo.nodes:
+            command = process_command(self.topo, node, tuned, case)
+            self.assertIn("--mu-lanes=1", command)
+            self.assertNotIn("--mu-lanes=4", command)
+
     def test_command_has_ips_and_identity(self):
         case = next(cases(self.suite))
         command = process_command(self.topo, self.topo.by_id(8), self.suite, case)

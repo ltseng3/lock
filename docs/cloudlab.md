@@ -227,3 +227,30 @@ The 32-us periodic check may increase some otherwise idle retirement-ACK
 latencies; test a contended Zipf workload as well as uniform before selecting a
 default lane count. The fast path and its hardware performance are not
 established by CI alone.
+
+## Independent client communication lanes
+
+Mu and handoff now use a distinct leader client-communication RC QP and CQ
+for each lane and client peer, in addition to the already independent
+replication QPs/CQs. The leader runs one communication worker and one
+replication/state worker per lane. The communication thread for lane zero
+owns the READY/STOP handshake on the base QP; every other lane handles
+its own client requests and responses without passing through a central
+leader dispatcher. Clients map each lock to `lock_id % mu_lanes` before
+sending its ACQUIRE (and Mu RELEASE) to the corresponding QP. Client-to-client
+HANDOFF remains on the normal peer-to-peer QP. Clients currently retain one
+event loop polling a shared CQ across all leader-lane QPs.
+
+All peers bootstrap the same number of lane QPs where required. A lane count
+mismatch fails during RDMA bootstrap. The default `--mu-lanes=1` preserves
+the old single-lane configuration. Compare one, two, and four lanes on the
+same commit using the same single-case suite, and with profiling disabled.
+Real InfiniBand hardware testing is mandatory for this transport change.
+
+Handoff client release-marker buffers are now sized against the full
+`workers * outstanding` window, and when all marker buffers are in flight,
+the client retains a pending operation instead of terminating. Each buffer is
+reclaimed only after its local WRITE CQE. This is local backpressure, not a
+change to FIFO or the one-sided retirement-marker representation. Recheck
+8-worker/32-outstanding runs, including test completion and no missing
+release acknowledgments, before running a full sweep.

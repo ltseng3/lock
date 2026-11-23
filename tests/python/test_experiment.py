@@ -68,6 +68,17 @@ class TestExperiment(unittest.TestCase):
         self.assertIn("--handoff-inflight-window=256", leader)
         self.assertNotIn("--handoff-inflight-window=256", client)
 
+    def test_mu_lanes_stay_consistent_on_clients_and_replicas(self):
+        # The transport bootstrap requires both ends of each client-leader
+        # link to select the same number of QPs.
+        for count in (1, 2, 4, 8):
+            suite = dict(self.suite, mu_lanes=count)
+            for backend in ("mu", "handoff"):
+                case = dict(next(cases(self.suite)), backend=backend)
+                for node in self.topo.nodes:
+                    args = process_command(self.topo, node, suite, case)
+                    self.assertIn(f"--mu-lanes={count}", args)
+
     def test_mu_lanes_forwarded_to_all_nodes(self):
         tuned = dict(self.suite, mu_lanes=4)
         for backend in ("mu", "handoff"):

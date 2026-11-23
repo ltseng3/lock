@@ -217,8 +217,9 @@ void run_mu_leader(rdma::Transport& net, NodeId self,
     workers.reserve(2 * lane_count - 1);
     for (size_t lane = 0; lane < lane_count; ++lane)
         lanes.push_back(std::make_unique<Shared>());
-    JoinWorkers join{lanes, workers};
     std::atomic<bool> started{false};
+    // Join workers before destroying their shared start flag.
+    JoinWorkers join{lanes, workers};
     for (size_t lane = 0; lane < lane_count; ++lane) {
         Shared* shard = lanes[lane].get();
         workers.emplace_back([&, shard, lane] {

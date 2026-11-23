@@ -2,6 +2,7 @@
 #include "lock/locks/mu_compact_log.h"
 #include "lock/locks/mu_state.h"
 #include "lock/locks/spsc_queue.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>

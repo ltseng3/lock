@@ -235,6 +235,7 @@ def main() -> int:
     if not args.skip_build:
         def build(node):
             cmd = (f"cd {shlex.quote(remote_dir)} && "
+                   f"CXX=$(command -v g++-10 || command -v c++) "
                    f"cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLOCK_WITH_RDMA=ON "
                    f"&& cmake --build build -j 4")
             remote.command(node, cmd)

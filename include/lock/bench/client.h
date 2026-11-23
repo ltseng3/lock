@@ -4,6 +4,7 @@
 #include "lock/rdma/transport.h"
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <unordered_map>
 #include <vector>
 namespace lock {
@@ -14,6 +15,7 @@ struct ClientConfig {
     size_t lock_count = 1000;
     size_t outstanding = 1;
     size_t workers = 1;
+    size_t mu_lanes = 1;
     std::string distribution = "uniform";
     uint64_t seed = 2026;
     uint64_t warmup_seconds = 5;
@@ -75,6 +77,10 @@ private:
     std::unordered_map<RequestId, Message> early_handoff_;
     std::unordered_map<RequestId, Message> early_next_;
     std::vector<Marker> markers_;
+    std::vector<size_t> free_markers_;
+    // A marker WRITE owns its buffer until its local CQE. If the pool is
+    // full, retain the operation slot and post its marker on the next CQE.
+    std::deque<size_t> deferred_marker_slots_;
     std::unordered_map<WorkId, size_t> marker_work_;
     uint64_t handoffs_sent_ = 0;
     uint64_t handoffs_received_ = 0;

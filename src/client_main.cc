@@ -30,6 +30,15 @@ int main(int argc, char** argv) {
         cfg.self = net_cfg.self;
         cfg.replicas = ids(opt.list("replicas"));
         cfg.backend = lock::parse_backend(opt.require("backend"));
+        cfg.mu_lanes = opt.number("mu-lanes", 1);
+        if (cfg.mu_lanes < 1 || cfg.mu_lanes > 8)
+            throw std::invalid_argument("mu-lanes must be 1..8");
+        if (cfg.backend == lock::Backend::Cas && cfg.mu_lanes != 1)
+            throw std::invalid_argument("CAS does not use Mu lanes");
+        if (cfg.backend != lock::Backend::Cas) {
+            net_cfg.replication_lanes = cfg.mu_lanes;
+            net_cfg.client_lane_peers = {cfg.replicas.front()};
+        }
         cfg.lock_count = opt.number("locks", 1000);
         cfg.outstanding = opt.number("outstanding", 1);
         cfg.workers = opt.number("workers", 1);

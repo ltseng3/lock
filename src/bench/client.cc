@@ -2,6 +2,7 @@
 #include <algorithm>
 #include "lock/locks/replicated_log.h"
 #include "lock/locks/handoff_layout.h"
+#include "lock/locks/lane_layout.h"
 #include <cstddef>
 #include <chrono>
 #include <cmath>
@@ -36,6 +37,8 @@ ClientEngine::ClientEngine(rdma::Transport& net, ClientConfig cfg)
     }
     if (cfg_.replicas.size() != 3 && cfg_.replicas.size() != 5)
         throw std::invalid_argument("three or five replicas required");
+    if (cfg_.mu_lanes == 0 || cfg_.mu_lanes > 8)
+        throw std::invalid_argument("invalid client Mu lane count");
     if (cfg_.outstanding == 0 || cfg_.outstanding > 512 || cfg_.lock_count == 0 ||
         cfg_.lock_count > 1000)
         throw std::invalid_argument("invalid client window or lock count");
@@ -46,10 +49,18 @@ ClientEngine::ClientEngine(rdma::Transport& net, ClientConfig cfg)
         *op.release_zero = 0;
     }
     if (cfg_.backend == Backend::Handoff) {
-        const size_t count = std::max<size_t>(128, cfg_.outstanding * 4);
+        // Include every logical worker, not just the per-worker outstanding
+        // window. Bound the pool by 512 for the 1024-entry client send QP.
+        // No marker may reuse a buffer before its local WRITE completion.
+        const size_t count = std::max<size_t>(
+            128, std::min<size_t>(512, ops_.size() * 2));
         markers_.resize(count);
-        for (auto& marker : markers_)
-            marker.payload = static_cast<uint64_t*>(net_.allocate(sizeof(uint64_t), 8));
+        free_markers_.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            markers_[i].payload = static_cast<uint64_t*>(
+                net_.allocate(sizeof(uint64_t), 8));
+            free_markers_.push_back(i);
+        }
     }
 }
 WorkId ClientEngine::track(size_t slot, Purpose purpose) {
@@ -81,11 +92,13 @@ void ClientEngine::submit(size_t slot) {
     } else if (cfg_.backend == Backend::Mu) {
         op.phase = Phase::WaitGrant;
         net_.send(cfg_.replicas.front(),
-                  message(Kind::Acquire, cfg_.self, op.lock, op.request));
+                  message(Kind::Acquire, cfg_.self, op.lock, op.request),
+                  0, true, lock_lane(op.lock, cfg_.mu_lanes));
     } else {
         op.phase = Phase::WaitOrder;
         net_.send(cfg_.replicas.front(),
-                  message(Kind::Acquire, cfg_.self, op.lock, op.request));
+                  message(Kind::Acquire, cfg_.self, op.lock, op.request),
+                  0, true, lock_lane(op.lock, cfg_.mu_lanes));
     }
 }
 void ClientEngine::post_data(size_t slot) {
@@ -104,7 +117,8 @@ void ClientEngine::release(size_t slot) {
         publish_retirement(slot);
     } else if (cfg_.backend == Backend::Mu) {
         net_.send(cfg_.replicas.front(),
-                  message(Kind::Release, cfg_.self, op.lock, op.request));
+                  message(Kind::Release, cfg_.self, op.lock, op.request),
+                  0, true, lock_lane(op.lock, cfg_.mu_lanes));
     } else {
         NodeId owner = cfg_.replicas[op.lock % cfg_.replicas.size()];
         op.phase = Phase::WaitCasRelease;
@@ -151,6 +165,14 @@ void ClientEngine::publish_retirement(size_t slot) {
     auto& op = ops_.at(slot);
     if (!op.ordered || op.phase != Phase::WaitRelease)
         throw std::runtime_error("release before ordered, quiesced ownership");
+    // Keep the in-flight operation alive rather than failing or recycling
+    // a buffer still owned by an outstanding RDMA WRITE.
+    if (free_markers_.empty()) {
+        deferred_marker_slots_.push_back(slot);
+        return;
+    }
+    const size_t i = free_markers_.back();
+    free_markers_.pop_back();
     Retired record{op.lock, op.position, op.successor, op.successor_position, false};
     auto [it, added] = retired_.emplace(op.request, record);
     if (!added) throw std::runtime_error("duplicate retirement");
@@ -159,10 +181,8 @@ void ClientEngine::publish_retirement(size_t slot) {
         deliver_handoff(op.request, it->second);
         it->second.sent = true;
     }
-    size_t i = 0;
-    while (i < markers_.size() && markers_[i].occupied) ++i;
-    if (i == markers_.size())
-        throw std::runtime_error("marker-buffer pool exhausted: fail closed");
+    if (markers_[i].occupied)
+        throw std::runtime_error("reused occupied release marker buffer");
     markers_[i].occupied = true;
     *markers_[i].payload = op.request;
     WorkId work = next_work_++;
@@ -287,6 +307,16 @@ void ClientEngine::handle(const rdma::Completion& c) {
         if (c.message.sender != c.peer)
             throw std::runtime_error("message sender mismatch");
         const Kind kind = message_kind(c.message);
+        if (c.peer == cfg_.replicas.front()) {
+            const bool control = kind == Kind::Ready || kind == Kind::Stop;
+            if (control) {
+                if (c.lane != 0)
+                    throw std::runtime_error("barrier reply arrived on data lane");
+            } else if (cfg_.backend != Backend::Cas &&
+                       c.lane != lock_lane(c.message.lock_id, cfg_.mu_lanes)) {
+                throw std::runtime_error("leader reply arrived on wrong client lane");
+            }
+        }
         if (kind == Kind::Ready) return;
         if (kind == Kind::Stop) {
             if (c.peer != cfg_.replicas.front() || !stop_sent_ || server_stopped_)
@@ -338,8 +368,17 @@ void ClientEngine::handle(const rdma::Completion& c) {
     if (auto marker = marker_work_.find(c.work_id); marker != marker_work_.end()) {
         if (c.kind != rdma::CompletionKind::Write)
             throw std::runtime_error("release marker completion not WRITE");
-        markers_[marker->second].occupied = false;
+        const size_t freed = marker->second;
+        if (!markers_[freed].occupied)
+            throw std::runtime_error("duplicate marker buffer completion");
+        markers_[freed].occupied = false;
         marker_work_.erase(marker);
+        free_markers_.push_back(freed);
+        if (!deferred_marker_slots_.empty()) {
+            const size_t slot = deferred_marker_slots_.front();
+            deferred_marker_slots_.pop_front();
+            publish_retirement(slot);
+        }
         return;
     }
     auto it = awaited_.find(c.work_id);
@@ -410,7 +449,8 @@ void ClientEngine::run() {
         net_.poll_into(completions);
         for (auto& event : completions) handle(event);
         if (now >= measurement_end_ && requests_.empty() &&
-            marker_work_.empty() && !stop_sent_) {
+            marker_work_.empty() && deferred_marker_slots_.empty() &&
+            !stop_sent_) {
             bool all_acknowledged = true;
             for (const auto& [id, retired] : retired_) {
                 if (!retired.acknowledged) {

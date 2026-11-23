@@ -20,7 +20,8 @@ struct Committed {
 };
 class ReplicatedLog {
 public:
-    ReplicatedLog(rdma::Transport& transport, std::vector<NodeId> replicas);
+    ReplicatedLog(rdma::Transport& transport, std::vector<NodeId> replicas,
+                  bool quorum_only_signaling = false);
     uint64_t append(const Message& command);
     void on_write_complete(WorkId work_id);
     std::optional<Committed> next_committed();
@@ -33,6 +34,7 @@ private:
     };
     rdma::Transport& net_;
     std::vector<NodeId> replicas_;
+    bool quorum_only_signaling_ = false;
     std::vector<Pending> pending_;
     std::unordered_map<WorkId, uint64_t> writes_;
     uint64_t next_work_ = 1;

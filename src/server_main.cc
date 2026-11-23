@@ -69,7 +69,8 @@ int main(int argc, char** argv) {
         std::unique_ptr<lock::MuState> mu;
         std::unique_ptr<lock::HandoffState> handoff;
         if (leader && backend != lock::Backend::Cas) {
-            log = std::make_unique<lock::ReplicatedLog>(net, replicas);
+            log = std::make_unique<lock::ReplicatedLog>(
+                net, replicas, backend == lock::Backend::Mu);
             if (backend == lock::Backend::Mu)
                 mu = std::make_unique<lock::MuState>(lock_count);
             else

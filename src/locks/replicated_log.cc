@@ -2,8 +2,10 @@
 #include <algorithm>
 #include <stdexcept>
 namespace lock {
-ReplicatedLog::ReplicatedLog(rdma::Transport& net, std::vector<NodeId> replicas)
-    : net_(net), replicas_(std::move(replicas)) {
+ReplicatedLog::ReplicatedLog(rdma::Transport& net, std::vector<NodeId> replicas,
+                             bool quorum_only_signaling)
+    : net_(net), replicas_(std::move(replicas)),
+      quorum_only_signaling_(quorum_only_signaling) {
     if (replicas_.size() != 3 && replicas_.size() != 5)
         throw std::invalid_argument("only three or five replicas are supported");
     if (std::find(replicas_.begin(), replicas_.end(), net.self()) == replicas_.end())
@@ -27,7 +29,9 @@ uint64_t ReplicatedLog::append(const Message& m) {
     size_t required_remote = replicas_.size() / 2;
     for (NodeId peer : replicas_) {
         if (peer == net_.self()) continue;
-        const bool quorum_signal = required_remote-- > 0;
+        // Keep the existing all-signaled behavior for non-Mu backends.
+        const bool quorum_signal =
+            !quorum_only_signaling_ || required_remote-- > 0;
         WorkId id = next_work_++;
         if (net_.write(peer, record, sizeof(LogRecord), offset, id, quorum_signal))
             writes_.emplace(id, slot);

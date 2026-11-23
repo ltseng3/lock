@@ -291,7 +291,11 @@ void Transport::connect() {
     for (const auto& peer : x.cfg.peers) {
         if (peer.id >= x.cfg.self) continue;
         int fd = dial(peer.ip, x.cfg.tcp_port);
-        try { x.handshake(fd, peer.id); } catch (...) { ::close(fd); ::close(listen_fd); throw; }
+        try {
+            const uint32_t self_id = x.cfg.self;
+            send_all(fd, &self_id, sizeof(self_id));
+            x.handshake(fd, peer.id);
+        } catch (...) { ::close(fd); ::close(listen_fd); throw; }
         ::close(fd);
     }
     size_t expected = 0;

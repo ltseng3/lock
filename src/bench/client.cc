@@ -1,6 +1,7 @@
 #include "lock/bench/client.h"
 #include <algorithm>
 #include "lock/locks/replicated_log.h"
+#include "lock/locks/handoff_layout.h"
 #include <cstddef>
 #include <chrono>
 #include <cmath>
@@ -166,8 +167,8 @@ void ClientEngine::publish_retirement(size_t slot) {
     *markers_[i].payload = op.request;
     WorkId work = next_work_++;
     marker_work_.emplace(work, i);
-    const size_t remote_offset = rdma::kLogOffset + op.log_slot * sizeof(LogRecord) +
-                                 offsetof(LogRecord, retired);
+    const size_t remote_offset = handoff_marker_offset(
+        net_.remote_memory_bytes(cfg_.replicas.front()), op.log_slot);
     net_.write(cfg_.replicas.front(), markers_[i].payload, sizeof(uint64_t),
                remote_offset, work);
     complete(slot); // Local release is not blocked on marker completion.

@@ -8,9 +8,9 @@
 #include <vector>
 
 namespace lock {
-// Mu has its own 8-byte, inline-replicated append-only log. Unlike the shared
-// 128-byte handoff log, local mutation bookkeeping is a bounded ring and does
-// not scale with the total number of completed operations.
+// Eight-byte, inline-replicated append-only log for compact Acquire/Release
+// entries. Local bookkeeping is a bounded in-flight ring. A caller can limit
+// log capacity to leave a contiguous sidecar region for per-slot metadata.
 //
 // The leader writes to every follower but requires the completion of a fixed
 // majority subset. No follower CPU receives or applies log records in the
@@ -18,7 +18,7 @@ namespace lock {
 class MuCompactLog {
 public:
     MuCompactLog(rdma::Transport& net, std::vector<NodeId> replicas,
-                 size_t window);
+                 size_t window, size_t capacity_limit = 0);
     uint64_t append(const Message& mutation);
     void on_write_complete(NodeId peer, WorkId work_id);
     std::optional<Committed> next_committed();

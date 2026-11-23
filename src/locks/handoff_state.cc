@@ -37,6 +37,8 @@ std::vector<Action> HandoffState::committed(const Committed& item) {
                                     state.prepared.back().position;
     uint64_t position = state.next_position++;
     state.prepared.push_back({command.request, position, item.global_slot});
+    if (state.prepared.size() == 1)
+        active_locks_.push_back(command.lock_id);
     Message order = message(Kind::Order, 0, command.lock_id, command.request);
     order.other = predecessor;
     order.position = position;
@@ -58,7 +60,12 @@ std::vector<Action> HandoffState::committed(const Committed& item) {
 HandoffStep HandoffState::retire(
     const std::function<uint64_t(uint64_t)>& read_marker) {
     HandoffStep out;
-    for (size_t lock_id = 0; lock_id < locks_.size(); ++lock_id) {
+    // The original implementation scanned every configured lock on every
+    // event-loop iteration. Inspect only locks with a committed outstanding
+    // holder. Remove a lock when its committed frontier is drained.
+    size_t i = 0;
+    while (i < active_locks_.size()) {
+        const size_t lock_id = active_locks_[i];
         auto& state = locks_[lock_id];
         while (!state.prepared.empty()) {
             const auto& head = state.prepared.front();
@@ -72,6 +79,12 @@ HandoffStep HandoffState::retire(
             state.prepared.pop_front();
         }
         admit_waiting(state, out);
+        if (state.prepared.empty()) {
+            active_locks_[i] = active_locks_.back();
+            active_locks_.pop_back();
+        } else {
+            ++i;
+        }
     }
     return out;
 }

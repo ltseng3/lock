@@ -27,6 +27,9 @@ private:
     };
     size_t window_;
     std::vector<State> locks_;
+    // Only locks with committed, not-yet-retired entries need marker polling.
+    // The replication thread exclusively owns this list and every State.
+    std::vector<size_t> active_locks_;
     void admit_waiting(State& state, HandoffStep& out);
 };
 } // namespace lock

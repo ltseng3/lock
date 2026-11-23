@@ -4,7 +4,7 @@
 
 namespace lock {
 MuCompactLog::MuCompactLog(rdma::Transport& net, std::vector<NodeId> replicas,
-                           size_t window)
+                           size_t window, size_t capacity_limit)
     : net_(net), ring_(window) {
     if ((replicas.size() != 3 && replicas.size() != 5) ||
         std::find(replicas.begin(), replicas.end(), net.self()) == replicas.end())
@@ -16,6 +16,11 @@ MuCompactLog::MuCompactLog(rdma::Transport& net, std::vector<NodeId> replicas,
     quorum_followers_ = replicas.size() / 2;
     const size_t end = net.memory_bytes() - 16ULL * 1024 * 1024;
     capacity_ = (end - rdma::kLogOffset) / sizeof(uint64_t);
+    if (capacity_limit) {
+        if (capacity_limit > capacity_)
+            throw std::invalid_argument("compact log capacity exceeds registered region");
+        capacity_ = capacity_limit;
+    }
 }
 uint64_t MuCompactLog::append(const Message& mutation) {
     if (inflight() >= ring_.size())

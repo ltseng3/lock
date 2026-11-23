@@ -64,5 +64,7 @@
       "rdma_ip": "10.10.1.8",
       "role": "client"
     }
-  ]
+  ],
+  "controller_node_id": 4,
+  "ssh_user": "tsengle"
 }

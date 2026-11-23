@@ -1,18 +1,22 @@
 # Eight-node CloudLab runs
 
-The default topology uses three replica nodes at 10.10.1.1–10.10.1.3 and five client nodes at 10.10.1.4–10.10.1.8. Each node has separate ssh_host and rdma_ip fields in experiments/topologies/apt8.json. Edit those fields if private addresses differ.
+The experiment controller runs on **node 4 (10.10.1.4)**, and uses the SSH user **tsengle** by default.
 
-The controller runs from one machine with SSH and rsync access to all eight nodes. Install CMake, a C++20 compiler, libibverbs-dev, ssh and rsync. Make sure InfiniBand is active and its MR memlock limits support the configured sizes (by default 512 MiB on server processes).
+The topology files contain `"controller_node_id": 4` and `"ssh_user": "tsengle"`. For node 4, the controller runs shell commands and rsync locally and copies logs directly; **no SSH or SCP to 10.10.1.4** is attempted. All other nodes are accessed by SSH as `tsengle@10.10.1.X`. The SSH and RDMA addresses remain independently configurable via `ssh_host` and `rdma_ip`.
 
-    python3 experiments/run.py --ssh-user=$USER --smoke
-    python3 experiments/run.py --ssh-user=$USER --only-backend=cas --max-trials=1
-    python3 experiments/run.py --ssh-user=$USER
-    python3 experiments/run.py --dry-run --max-trials=1
+Run from the repository checkout on node 4:
 
-To check five replicas on the same eight nodes:
+    git checkout main && git pull origin main
+    python3 experiments/run.py --smoke
+    python3 experiments/run.py --only-backend=cas --max-trials=1
+    python3 experiments/run.py
 
-    python3 experiments/run.py --ssh-user=$USER --topology experiments/topologies/apt8_five.json --suite experiments/suites/five_small.json
+You can override the username with `--ssh-user=...` if needed. **The controller must actually be running on node 4**, since commands targeting controller_node_id are executed locally rather than over SSH. For a different controller machine, update `controller_node_id` in the topology before running.
 
-The suite contains 1000 locks, uniform/Zipf distributions, client worker counts and per-worker outstanding windows, and a single completed 8-byte RDMA WRITE while holding each lock. Raw logs and a run manifest are stored in results. The five-replica setting does not need a separate executable.
+The default layout has replica nodes 1–3 and client nodes 4–8. For the optional five-replica experiment, nodes 1–5 are replicas and nodes 6–8 are clients; node 4 remains the local controller, regardless of its experimental role.
 
-See docs/validation.md for the correctness boundary and validation checklist. Benchmarks have not been verified on CloudLab by automated CI.
+    python3 experiments/run.py --topology experiments/topologies/apt8_five.json --suite experiments/suites/five_small.json
+
+Install CMake, a C++20 compiler, libibverbs-dev and rsync on all eight nodes, and ensure SSH connectivity from node 4 to the **other seven** hosts. The InfiniBand port must be active and memory-registration limits must support the configured MR sizes (512 MiB by default on servers). Raw logs and a run manifest are saved under `results/`.
+
+See docs/validation.md for the correctness boundary. Automated CI cannot verify CloudLab hardware behavior.

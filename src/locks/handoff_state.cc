@@ -1,0 +1,78 @@
+#include "lock/locks/handoff_state.h"
+#include <stdexcept>
+namespace lock {
+HandoffState::HandoffState(size_t locks, size_t window)
+    : window_(window), locks_(locks) {
+    if (!locks || !window) throw std::invalid_argument("empty handoff locks or window");
+}
+void HandoffState::admit_waiting(State& state, HandoffStep& out) {
+    while (!state.waiting.empty() &&
+           state.prepared.size() + state.uncommitted < window_) {
+        Message m = state.waiting.front();
+        state.waiting.pop_front();
+        ++state.uncommitted;
+        out.append.push_back(m);
+    }
+}
+HandoffStep HandoffState::admit(const Message& acquire) {
+    if (message_kind(acquire) != Kind::Acquire || acquire.request == 0 ||
+        acquire.lock_id >= locks_.size())
+        throw std::runtime_error("invalid handoff acquire");
+    auto& state = locks_[acquire.lock_id];
+    state.waiting.push_back(acquire);
+    HandoffStep out;
+    admit_waiting(state, out);
+    return out;
+}
+std::vector<Action> HandoffState::committed(const Committed& item) {
+    const auto& command = item.command;
+    if (message_kind(command) != Kind::Acquire || command.lock_id >= locks_.size())
+        throw std::runtime_error("unexpected handoff commit");
+    auto& state = locks_[command.lock_id];
+    if (!state.uncommitted || state.prepared.size() >= window_)
+        throw std::runtime_error("handoff reservation invariant violated");
+    --state.uncommitted;
+    RequestId predecessor = state.prepared.empty() ? 0 : state.prepared.back().request;
+    uint64_t predecessor_position = state.prepared.empty() ? 0 :
+                                    state.prepared.back().position;
+    uint64_t position = state.next_position++;
+    state.prepared.push_back({command.request, position, item.global_slot});
+    Message order = message(Kind::Order, 0, command.lock_id, command.request);
+    order.other = predecessor;
+    order.position = position;
+    order.value = item.global_slot;
+    std::vector<Action> result{{request_node(command.request), order}};
+    if (predecessor == 0) {
+        Message start = message(Kind::Start, 0, command.lock_id, command.request);
+        start.position = position;
+        result.push_back({request_node(command.request), start});
+    } else {
+        Message next = message(Kind::Next, 0, command.lock_id, predecessor);
+        next.other = command.request;
+        next.position = predecessor_position;
+        next.value = position;
+        result.push_back({request_node(predecessor), next});
+    }
+    return result;
+}
+HandoffStep HandoffState::retire(
+    const std::function<uint64_t(uint64_t)>& read_marker) {
+    HandoffStep out;
+    for (size_t lock_id = 0; lock_id < locks_.size(); ++lock_id) {
+        auto& state = locks_[lock_id];
+        while (!state.prepared.empty()) {
+            const auto& head = state.prepared.front();
+            const uint64_t marker = read_marker(head.log_slot);
+            if (!marker) break;
+            if (marker != head.request)
+                throw std::runtime_error("release-marker request mismatch: fail closed");
+            Message ack = message(Kind::ReleaseAck, 0, lock_id, head.request);
+            ack.position = head.position;
+            out.actions.push_back({request_node(head.request), ack});
+            state.prepared.pop_front();
+        }
+        admit_waiting(state, out);
+    }
+    return out;
+}
+} // namespace lock

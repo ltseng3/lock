@@ -1,5 +1,7 @@
 #include "lock/bench/client.h"
 #include <algorithm>
+#include "lock/locks/replicated_log.h"
+#include <cstddef>
 #include <chrono>
 #include <cmath>
 #include <iomanip>
@@ -35,6 +37,12 @@ ClientEngine::ClientEngine(rdma::Transport& net, ClientConfig cfg)
         op.release_zero = static_cast<uint64_t*>(net_.allocate(sizeof(uint64_t), 8));
         *op.release_zero = 0;
     }
+    if (cfg_.backend == Backend::Handoff) {
+        const size_t count = std::max<size_t>(128, cfg_.outstanding * 4);
+        markers_.resize(count);
+        for (auto& marker : markers_)
+            marker.payload = static_cast<uint64_t*>(net_.allocate(sizeof(uint64_t), 8));
+    }
 }
 WorkId ClientEngine::track(size_t slot, Purpose purpose) {
     WorkId id = next_work_++;
@@ -56,6 +64,9 @@ void ClientEngine::submit(size_t slot) {
     op.request = make_request_id(cfg_.self, next_sequence_++);
     op.lock = picker_.next();
     op.begun = Clock::now();
+    op.ordered = false; op.started = false;
+    op.predecessor = 0; op.successor = 0;
+    op.position = 0; op.successor_position = 0; op.log_slot = 0;
     requests_.emplace(op.request, slot);
     if (cfg_.backend == Backend::Cas) {
         post_cas(slot);
@@ -64,7 +75,9 @@ void ClientEngine::submit(size_t slot) {
         net_.send(cfg_.replicas.front(),
                   message(Kind::Acquire, cfg_.self, op.lock, op.request));
     } else {
-        throw std::runtime_error("handoff backend not enabled in this revision");
+        op.phase = Phase::WaitOrder;
+        net_.send(cfg_.replicas.front(),
+                  message(Kind::Acquire, cfg_.self, op.lock, op.request));
     }
 }
 void ClientEngine::post_data(size_t slot) {
@@ -79,7 +92,9 @@ void ClientEngine::post_data(size_t slot) {
 void ClientEngine::release(size_t slot) {
     auto& op = ops_[slot];
     op.phase = Phase::WaitRelease;
-    if (cfg_.backend == Backend::Mu) {
+    if (cfg_.backend == Backend::Handoff) {
+        publish_retirement(slot);
+    } else if (cfg_.backend == Backend::Mu) {
         net_.send(cfg_.replicas.front(),
                   message(Kind::Release, cfg_.self, op.lock, op.request));
     } else {
@@ -106,6 +121,148 @@ void ClientEngine::complete(size_t slot) {
     requests_.erase(op.request);
     op.phase = Phase::Idle;
 }
+
+void ClientEngine::deliver_handoff(RequestId predecessor, const Retired& record) {
+    if (!record.successor) return;
+    Message m = message(Kind::Handoff, cfg_.self, record.lock, record.successor);
+    m.other = predecessor;
+    m.position = record.successor_position;
+    ++handoffs_sent_;
+    const NodeId peer = request_node(record.successor);
+    if (peer == cfg_.self) {
+        rdma::Completion c{};
+        c.kind = rdma::CompletionKind::Receive;
+        c.peer = cfg_.self;
+        c.message = m;
+        handle_activation(c);
+    } else {
+        net_.send(peer, m);
+    }
+}
+void ClientEngine::publish_retirement(size_t slot) {
+    auto& op = ops_.at(slot);
+    if (!op.ordered || op.phase != Phase::WaitRelease)
+        throw std::runtime_error("release before ordered, quiesced ownership");
+    Retired record{op.lock, op.position, op.successor, op.successor_position, false};
+    auto [it, added] = retired_.emplace(op.request, record);
+    if (!added) throw std::runtime_error("duplicate retirement");
+    // Protected data work was completed before entering this function.
+    if (it->second.successor) {
+        deliver_handoff(op.request, it->second);
+        it->second.sent = true;
+    }
+    size_t i = 0;
+    while (i < markers_.size() && markers_[i].occupied) ++i;
+    if (i == markers_.size())
+        throw std::runtime_error("marker-buffer pool exhausted: fail closed");
+    markers_[i].occupied = true;
+    *markers_[i].payload = op.request;
+    WorkId work = next_work_++;
+    marker_work_.emplace(work, i);
+    const size_t remote_offset = rdma::kLogOffset + op.log_slot * sizeof(LogRecord) +
+                                 offsetof(LogRecord, retired);
+    net_.write(cfg_.replicas.front(), markers_[i].payload, sizeof(uint64_t),
+               remote_offset, work);
+    complete(slot); // Local release is not blocked on marker completion.
+}
+void ClientEngine::handle_order(const rdma::Completion& c) {
+    const Message& m = c.message;
+    auto it = requests_.find(m.request);
+    if (it == requests_.end()) throw std::runtime_error("ORDER for unknown request");
+    auto& op = ops_.at(it->second);
+    if (op.phase != Phase::WaitOrder || op.ordered || op.lock != m.lock_id)
+        throw std::runtime_error("invalid ORDER");
+    op.ordered = true;
+    op.position = m.position;
+    op.log_slot = m.value;
+    op.predecessor = m.other;
+    if (auto found = early_next_.find(m.request); found != early_next_.end()) {
+        Message earlier = found->second;
+        early_next_.erase(found);
+        rdma::Completion saved{};
+        saved.kind = rdma::CompletionKind::Receive;
+        saved.peer = cfg_.replicas.front(); saved.message = earlier;
+        handle_next(saved);
+    }
+    if (auto found = early_start_.find(m.request); found != early_start_.end()) {
+        Message earlier = found->second;
+        early_start_.erase(found);
+        rdma::Completion saved{};
+        saved.kind = rdma::CompletionKind::Receive;
+        saved.peer = cfg_.replicas.front(); saved.message = earlier;
+        handle_activation(saved);
+    }
+    if (auto found = early_handoff_.find(m.request); found != early_handoff_.end()) {
+        Message earlier = found->second;
+        early_handoff_.erase(found);
+        rdma::Completion saved{};
+        saved.kind = rdma::CompletionKind::Receive;
+        saved.peer = earlier.sender; saved.message = earlier;
+        handle_activation(saved);
+    }
+}
+void ClientEngine::handle_activation(const rdma::Completion& c) {
+    const Message& m = c.message;
+    auto it = requests_.find(m.request);
+    if (it == requests_.end()) throw std::runtime_error("activation for unknown request");
+    auto& op = ops_.at(it->second);
+    if (op.lock != m.lock_id)
+        throw std::runtime_error("activation lock mismatch");
+    const Kind kind = message_kind(m);
+    if (kind != Kind::Start && kind != Kind::Handoff)
+        throw std::runtime_error("invalid activation kind");
+    if (!op.ordered) {
+        auto& pending = kind == Kind::Start ? early_start_ : early_handoff_;
+        if (!pending.emplace(m.request, m).second)
+            throw std::runtime_error("duplicate early activation");
+        return;
+    }
+    if (op.phase != Phase::WaitOrder || op.started || m.position != op.position)
+        throw std::runtime_error("duplicate or mismatched activation");
+    if (kind == Kind::Start) {
+        if (c.peer != cfg_.replicas.front() || op.predecessor != 0)
+            throw std::runtime_error("unauthorized START");
+    } else {
+        if (!op.predecessor || m.other != op.predecessor ||
+            c.peer != request_node(op.predecessor))
+            throw std::runtime_error("unauthorized HANDOFF");
+        ++handoffs_received_;
+    }
+    op.started = true;
+    post_data(it->second);
+}
+void ClientEngine::handle_next(const rdma::Completion& c) {
+    const Message& m = c.message;
+    if (c.peer != cfg_.replicas.front() || message_kind(m) != Kind::Next ||
+        !m.other || m.request == m.other || m.value != m.position + 1)
+        throw std::runtime_error("invalid NEXT");
+    if (auto it = requests_.find(m.request); it != requests_.end()) {
+        auto& op = ops_.at(it->second);
+        if (op.lock != m.lock_id) throw std::runtime_error("NEXT lock mismatch");
+        if (!op.ordered) {
+            if (!early_next_.emplace(m.request, m).second)
+                throw std::runtime_error("duplicate early NEXT");
+            return;
+        }
+        if (op.position != m.position || op.successor)
+            throw std::runtime_error("mismatched or duplicate NEXT");
+        op.successor = m.other;
+        op.successor_position = m.value;
+        return;
+    }
+    auto it = retired_.find(m.request);
+    if (it == retired_.end())
+        throw std::runtime_error("NEXT after acknowledged retirement");
+    if (it->second.lock != m.lock_id ||
+        it->second.position != m.position || it->second.successor)
+        throw std::runtime_error("invalid late NEXT");
+    it->second.successor = m.other;
+    it->second.successor_position = m.value;
+    ++late_next_;
+    deliver_handoff(m.request, it->second);
+    it->second.sent = true;
+}
+
 void ClientEngine::handle(const rdma::Completion& c) {
     if (c.kind == rdma::CompletionKind::Send) return;
     if (c.kind == rdma::CompletionKind::Receive) {
@@ -113,6 +270,26 @@ void ClientEngine::handle(const rdma::Completion& c) {
             throw std::runtime_error("message sender mismatch");
         const Kind kind = message_kind(c.message);
         if (kind == Kind::Ready) return;
+        if (cfg_.backend == Backend::Handoff) {
+            if (kind == Kind::Handoff) {
+                handle_activation(c);
+                return;
+            }
+            if (c.peer != cfg_.replicas.front())
+                throw std::runtime_error("handoff control from non-leader");
+            if (kind == Kind::Order) { handle_order(c); return; }
+            if (kind == Kind::Start) { handle_activation(c); return; }
+            if (kind == Kind::Next) { handle_next(c); return; }
+            if (kind == Kind::ReleaseAck) {
+                auto it = retired_.find(c.message.request);
+                if (it == retired_.end() || it->second.lock != c.message.lock_id ||
+                    it->second.position != c.message.position)
+                    throw std::runtime_error("invalid retirement ACK");
+                retired_.erase(it);
+                return;
+            }
+            throw std::runtime_error("unexpected handoff control message");
+        }
         if (c.peer != cfg_.replicas.front())
             throw std::runtime_error("unexpected server message");
         auto it = requests_.find(c.message.request);
@@ -127,6 +304,13 @@ void ClientEngine::handle(const rdma::Completion& c) {
             complete(slot);
         else
             throw std::runtime_error("unexpected response or phase");
+        return;
+    }
+    if (auto marker = marker_work_.find(c.work_id); marker != marker_work_.end()) {
+        if (c.kind != rdma::CompletionKind::Write)
+            throw std::runtime_error("release marker completion not WRITE");
+        markers_[marker->second].occupied = false;
+        marker_work_.erase(marker);
         return;
     }
     auto it = awaited_.find(c.work_id);
@@ -192,7 +376,8 @@ void ClientEngine::run() {
             }
         }
         for (auto& event : net_.poll()) handle(event);
-        if (now >= measurement_end_ && requests_.empty()) break;
+        if (now >= measurement_end_ && requests_.empty() &&
+            retired_.empty() && marker_work_.empty()) break;
     }
     if (!awaited_.empty()) throw std::runtime_error("outstanding CQEs at completion");
     print_result();
@@ -211,6 +396,9 @@ void ClientEngine::print_result() const {
               << ",\"total_p50_ns\":" << percentile(total_ns_, 0.50)
               << ",\"total_p99_ns\":" << percentile(total_ns_, 0.99)
               << ",\"total_p999_ns\":" << percentile(total_ns_, 0.999)
+              << ",\"handoffs_sent\":" << handoffs_sent_
+              << ",\"handoffs_received\":" << handoffs_received_
+              << ",\"late_next\":" << late_next_
               << "}" << std::endl;
 }
 } // namespace lock

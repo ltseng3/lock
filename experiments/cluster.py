@@ -1,4 +1,4 @@
-"""SSH and rsync helpers. Never runs a shell on the local machine for user input."""
+"""SSH/rsync helpers. Execute the controller node locally; SSH to other nodes."""
 from __future__ import annotations
 
 import dataclasses
@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import shlex
+import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
@@ -25,6 +26,8 @@ class Topology:
     tcp_port: int
     ib_port: int
     device: str
+    controller_node_id: int
+    ssh_user: str
 
     @classmethod
     def load(cls, path: pathlib.Path) -> "Topology":
@@ -56,11 +59,18 @@ class Topology:
                 raise ValueError("client role mismatch")
         if len(clients) == 0:
             raise ValueError("at least one client required")
+        controller_node_id = int(doc["controller_node_id"])
+        if controller_node_id not in by_id:
+            raise ValueError("controller_node_id must identify a configured node")
+        ssh_user = str(doc.get("ssh_user", "tsengle")).strip()
+        if not ssh_user:
+            raise ValueError("ssh_user cannot be empty")
         tcp_port = int(doc.get("tcp_port", 18515))
         if not 1 <= tcp_port <= 65535:
             raise ValueError("TCP port out of range")
         return cls(nodes, replicas, clients, tcp_port,
-                   int(doc.get("ib_port", 1)), str(doc.get("device", "")))
+                   int(doc.get("ib_port", 1)), str(doc.get("device", "")),
+                   controller_node_id, ssh_user)
 
     def peers_arg(self) -> str:
         return ",".join(f"{n.id}@{n.rdma_ip}" for n in sorted(self.nodes, key=lambda n: n.id))
@@ -75,10 +85,15 @@ class Topology:
         return next(node for node in self.nodes if node.id == node_id)
 
 class Remote:
-    def __init__(self, ssh_user: str, identity: str | None = None, dry_run: bool = False):
+    def __init__(self, ssh_user: str, identity: str | None = None,
+                 dry_run: bool = False, local_node_id: int | None = None):
         self.user = ssh_user
         self.identity = os.path.expanduser(identity) if identity else None
         self.dry_run = dry_run
+        self.local_node_id = local_node_id
+
+    def _is_local(self, node: Node) -> bool:
+        return node.id == self.local_node_id
 
     def _ssh_options(self) -> list[str]:
         result = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
@@ -91,22 +106,30 @@ class Remote:
         return f"{self.user}@{node.ssh_host}"
 
     def command(self, node: Node, script: str, check: bool = True) -> str:
-        cmd = ["ssh", *self._ssh_options(), self._target(node),
-               "bash", "-lc", shlex.quote(script)]
+        if self._is_local(node):
+            cmd = ["bash", "-lc", script]
+            location = f"local node {node.id}"
+        else:
+            cmd = ["ssh", *self._ssh_options(), self._target(node),
+                   "bash", "-lc", shlex.quote(script)]
+            location = f"ssh node {node.id}"
         if self.dry_run:
             print("DRY RUN:", shlex.join(cmd))
             return ""
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if check and proc.returncode:
-            raise RuntimeError(f"ssh {node.id}: {proc.stderr.strip()} {proc.stdout.strip()}")
+            raise RuntimeError(f"{location}: {proc.stderr.strip()} {proc.stdout.strip()}")
         return proc.stdout
 
     def deploy(self, node: Node, source: pathlib.Path, remote_dir: str) -> None:
         self.command(node, f"mkdir -p {shlex.quote(remote_dir)}")
         cmd = ["rsync", "-az", "--delete", "--exclude=.git", "--exclude=build",
-               "--exclude=results", "--exclude=__pycache__",
-               "-e", shlex.join(["ssh", *self._ssh_options()]),
-               f"{source}/", f"{self._target(node)}:{remote_dir}/"]
+               "--exclude=results", "--exclude=__pycache__"]
+        if self._is_local(node):
+            cmd += [f"{source}/", f"{remote_dir}/"]
+        else:
+            cmd += ["-e", shlex.join(["ssh", *self._ssh_options()]),
+                    f"{source}/", f"{self._target(node)}:{remote_dir}/"]
         if self.dry_run:
             print("DRY RUN:", shlex.join(cmd))
             return
@@ -114,6 +137,12 @@ class Remote:
 
     def collect(self, node: Node, remote_file: str, destination: pathlib.Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
+        if self._is_local(node):
+            if self.dry_run:
+                print("DRY RUN:", shlex.join(["cp", remote_file, str(destination)]))
+                return
+            shutil.copy2(remote_file, destination)
+            return
         cmd = ["scp", *self._ssh_options(), f"{self._target(node)}:{remote_file}",
                str(destination)]
         if self.dry_run:

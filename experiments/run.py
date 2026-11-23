@@ -218,15 +218,18 @@ def main() -> int:
     remote_dir = args.remote_dir or f"/tmp/lock-{commit[:12]}"
     if not remote_dir.startswith("/tmp/lock-"):
         raise ValueError("remote_dir must start with /tmp/lock- for safe cleanup")
-    user = args.ssh_user or __import__("getpass").getuser()
-    remote = Remote(user, args.identity, args.dry_run)
+    user = args.ssh_user or topo.ssh_user
+    remote = Remote(user, args.identity, args.dry_run,
+                    local_node_id=topo.controller_node_id)
     timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output_dir = ROOT / "results" / f"{timestamp}-{uuid.uuid4().hex[:8]}"
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "suite.json").write_text(json.dumps(suite, indent=2) + "\n")
     (output_dir / "topology.json").write_text(args.topology.read_text())
     (output_dir / "source.json").write_text(
-        json.dumps({"commit": commit, "remote_dir": remote_dir}, indent=2) + "\n")
+        json.dumps({"commit": commit, "remote_dir": remote_dir,
+                    "controller_node_id": topo.controller_node_id,
+                    "ssh_user": user}, indent=2) + "\n")
     if not args.skip_deploy:
         remote.parallel(topo.nodes, lambda n: remote.deploy(n, ROOT, remote_dir))
     if not args.skip_build:

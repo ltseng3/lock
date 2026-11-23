@@ -69,6 +69,7 @@ public:
     const void* at(size_t offset, size_t length) const;
     void* allocate(size_t length, size_t alignment = 64);
     size_t memory_bytes() const;
+    size_t remote_memory_bytes(NodeId peer) const;
     NodeId self() const;
 private:
     void poll_on_cq(std::vector<Completion>& out, int batch, bool replication);

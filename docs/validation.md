@@ -43,3 +43,37 @@ compilation does not establish RDMA WRITE correctness, FIFO under load, or
 failover safety. Test low concurrency, quorum ordering, completion handling,
 five-replica operation, sustained runs, and corrupted/out-of-range requests
 before relying on the new path.
+
+## Handoff compact-header layout
+
+The handoff backend writes only an 8-byte, packed ACQUIRE header to the
+replicated append-only log using inline one-sided RDMA WRITEs. Full request
+metadata remains in the leader's bounded local in-flight ring. For each
+assigned slot the leader's registered memory also reserves a separate,
+adjacent 8-byte release marker, addressed as
+
+    marker_offset = kLogOffset + capacity * 8 + slot * 8
+
+where capacity is calculated consistently from the leader's exported memory
+size. Header and marker ranges do not overlap the last 16 MiB scratch region.
+The marker is initialized to zero and the releasing client writes its full
+request ID to the marker after the protected data WRITE completes. The leader
+checks the marker against the committed holder's request ID before ACKing
+retirement, and scans only locks with committed, outstanding holders.
+
+The handoff leader has two threads and separate completion queues: one thread
+owns client QPs and sends ORDER/NEXT/START/ACK; the other owns follower QPs,
+the ordered quorum log, lock queue state, and marker checks. Follower processes
+remain passive after the RC bootstrap. Client-to-client HANDOFF notification
+remains direct, with late NEXT handled by the client as before.
+
+This is an engineering implementation with no verified fault recovery.
+Hardware latency, ordered commits, early/late notifications, the sidecar
+addressing, and operation under contention MUST be validated on the target
+RDMA devices; a green compilation/unit-test workflow is not sufficient.
+
+A predecessor-free committed ORDER is now sufficient to start the client
+without sending a second START message. For requests with a predecessor, the
+leader sends NEXT and the predecessor transfers ownership using HANDOFF.
+The client still verifies that ORDER came from the leader and preserves
+early-HANDOFF and late-NEXT handling.

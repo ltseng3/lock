@@ -496,5 +496,9 @@ void* Transport::allocate(size_t len, size_t alignment) {
     return p;
 }
 size_t Transport::memory_bytes() const { return impl_->cfg.memory_bytes; }
+size_t Transport::remote_memory_bytes(NodeId peer) const {
+    if (!impl_->connected) throw std::runtime_error("RDMA peer not connected");
+    return impl_->conn(peer).remote.bytes;
+}
 NodeId Transport::self() const { return impl_->cfg.self; }
 } // namespace lock::rdma

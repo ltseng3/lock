@@ -143,3 +143,32 @@ The 8-byte encoding supports node IDs 1..255, lock IDs 0..65535, and
 39-bit nonzero request sequences; larger values fail explicitly. The format
 is Mu-specific; the 128-byte handoff record remains unchanged. This path
 requires CloudLab correctness and latency validation before drawing conclusions.
+
+## Handoff compact-header diagnostic run
+
+Handoff now uses 8-byte inline-replicated ACQUIRE headers and a matching
+per-slot retirement-marker sidecar. The leader separates client communication
+from quorum replication and lock ordering; followers handle data through
+one-sided NIC operations without CPU polling. Only locks with committed
+outstanding holders are checked for retirement, rather than all configured
+locks on every loop. The Mu backend and its layout are unchanged.
+
+For a single run matching a 4-worker/16-outstanding Mu benchmark, create the
+same single-case suite with `backends: ["handoff"]` and run it with:
+
+    python3 experiments/run.py --suite=/tmp/handoff-throughput.json --profile-leader --show-clients --remote-dir=/tmp/lock-handoff-inline
+
+`HANDOFF_PROFILE` includes acquisition receives, committed headers, marker
+reads, signaled replication completions, response counts and queue occupancy.
+Direct HANDOFF is most relevant under contention. The `METRICS` line and
+per-client results include `handoffs_sent`, `handoffs_received`, and
+`late_next` counters. The default handoff replication admission window
+is 512, adjustable with `--handoff-inflight-window`.
+
+The run is a hardware correctness/latency check first. No improvement relative
+to Mu should be asserted without matching workload and physical topology.
+
+On the uncontended handoff path, a committed ORDER with no predecessor acts
+as START; the leader does not send a redundant second control message.
+This reduces leader response traffic without changing the queued
+predecessor/NEXT/HANDOFF path.

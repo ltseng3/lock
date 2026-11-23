@@ -7,8 +7,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Build and test core
+      - name: Install RDMA development headers
+        run: sudo apt-get update && sudo apt-get install -y libibverbs-dev
+      - name: Build and test
         run: |
-          cmake -S . -B build -DLOCK_WITH_RDMA=OFF -DCMAKE_BUILD_TYPE=Debug
+          cmake -S . -B build -DLOCK_WITH_RDMA=ON -DCMAKE_BUILD_TYPE=Debug
           cmake --build build -j 2
           ctest --test-dir build --output-on-failure

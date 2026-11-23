@@ -71,7 +71,9 @@ void replication_loop(Shared& s, rdma::Transport& net,
             }
             Message request{};
             max_pending = std::max(max_pending, s.requests.size());
-            while (log.inflight() < window && s.requests.try_pop(request)) {
+            size_t admitted = 0;
+            while (admitted++ < 64 && log.inflight() < window &&
+                   s.requests.try_pop(request)) {
                 if (lock_lane(request.lock_id, lane_count) != lane)
                     throw std::runtime_error("Mu request routed to wrong lane");
                 log.append(request);
@@ -196,7 +198,10 @@ void run_mu_leader(rdma::Transport& net, NodeId self,
         }
         Action action{};
         for (auto& shard : lanes) {
-            while (shard->responses.try_pop(action)) {
+            // A busy hot-lock lane must not starve other lanes on the shared
+            // client-communication thread. Drain a bounded fair batch.
+            size_t sent = 0;
+            while (sent++ < 64 && shard->responses.try_pop(action)) {
                 action.message.sender = self;
                 net.send(action.destination, action.message, 0, false);
                 if (profile)

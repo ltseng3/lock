@@ -104,7 +104,8 @@ void replication_loop(Shared& s, rdma::Transport& net,
             Message request{};
             // This thread exclusively owns the per-lock queue and reservation
             // state. Client receives never mutate those structures directly.
-            while (s.requests.try_pop(request)) {
+            size_t admitted = 0;
+            while (admitted++ < 64 && s.requests.try_pop(request)) {
                 if (lock_lane(request.lock_id, lane_count) != lane)
                     throw std::runtime_error("handoff request routed to wrong lane");
                 auto step = state.admit(request);
@@ -238,7 +239,10 @@ void run_handoff_leader(rdma::Transport& net, NodeId self,
 
         Action action{};
         for (auto& shard : lanes) {
-            while (shard->responses.try_pop(action)) {
+            // A busy hot-lock lane must not starve other lanes on the shared
+            // client-communication thread. Drain a bounded fair batch.
+            size_t sent = 0;
+            while (sent++ < 64 && shard->responses.try_pop(action)) {
                 action.message.sender = self;
                 // Client SENDs share the communication thread's QPs.
                 net.send(action.destination, action.message, 0, false);

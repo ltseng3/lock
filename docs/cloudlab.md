@@ -26,6 +26,6 @@ See docs/validation.md for the correctness boundary. Automated CI cannot verify 
 CMake 3.16.3 is supported; no CMake upgrade is required. A C++20-capable
 compiler and standard library are required (GCC 10+). If the default compiler
 is GCC 9, install `g++-10` on each node and configure a fresh build directory
-using `CXX=g++-10 cmake -S . -B build -DLOCK_WITH_RDMA=ON`. Do not reuse
+using `CXX=g++-10 cmake -S . -B build -DLOCK_WITH_RDMA=ON`. The experiment runner automatically prefers `g++-10` when installed. Do not reuse
 a build directory configured with a different compiler. The legacy CTest
 invocation is `(cd build && ctest --output-on-failure)`.

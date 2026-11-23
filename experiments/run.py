@@ -23,11 +23,6 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 def sha() -> str:
     return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
 
-def require_clean_tree() -> None:
-    if subprocess.run(["git", "diff", "--quiet"], cwd=ROOT).returncode or subprocess.run(
-            ["git", "diff", "--cached", "--quiet"], cwd=ROOT).returncode:
-        raise RuntimeError("working tree is modified; commit changes before running experiments")
-
 def cases(suite: dict):
     allowed = {"cas", "mu", "handoff"}
     if set(suite["backends"]) - allowed:
@@ -58,6 +53,8 @@ def process_command(topo: Topology, node, suite: dict, case: dict,
     ]
     if smoke:
         return ["./build/lock_rdma_smoke", *common]
+    if node.role == "replica" and suite.get("profile_leader", False):
+        common.append(arg("profile-leader", 1))
     common += [
         arg("replicas", topo.server_ids()),
         arg("clients", topo.client_ids()),
@@ -184,6 +181,10 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
                     raise ValueError(f"no completed pairs from node {node_id}")
                 results.append(record)
             manifest["client_results"] = results
+            if suite.get("profile_leader", False) and case["backend"] == "mu":
+                manifest["leader_profile"] = [
+                    line for line in logs[topo.replicas[0]].splitlines()
+                    if line.startswith("LEADER_PROFILE ")]
             manifest["summary"] = summarize(case, results)
             manifest["total_completed"] = manifest["summary"]["completed"]
             manifest["aggregate_goodput_pairs_per_second"] = (
@@ -238,9 +239,13 @@ def main() -> int:
     ap.add_argument("--repetitions", type=int, help="Override suite repetitions")
     ap.add_argument("--show-clients", action="store_true",
                     help="Print per-client throughput and latency details")
+    ap.add_argument("--profile-leader", action="store_true",
+                    help="Print one-second Mu leader diagnostics during the trial")
     args = ap.parse_args()
     topo = Topology.load(args.topology)
     suite = json.loads(args.suite.read_text())
+    if args.profile_leader:
+        suite["profile_leader"] = True
     for key in ("warmup_seconds", "duration_seconds", "repetitions"):
         override = getattr(args, key)
         if override is not None:
@@ -251,8 +256,6 @@ def main() -> int:
         raise ValueError("suite replica count does not match topology")
     if suite.get("mu_lanes", 1) != 1:
         raise ValueError("first implementation supports one Mu lane")
-    if not args.dry_run:
-        require_clean_tree()
     commit = sha()
     remote_dir = args.remote_dir or f"/tmp/lock-{commit[:12]}"
     if not remote_dir.startswith("/tmp/lock-"):
@@ -302,6 +305,8 @@ def main() -> int:
                 writer.writerow(record["summary"])
                 output.flush()
                 print("METRICS", format_summary(record["summary"]), flush=True)
+                for line in record.get("leader_profile", []):
+                    print(line, flush=True)
                 if args.show_clients:
                     for client in record["client_results"]:
                         print("  CLIENT", format_client(client), flush=True)

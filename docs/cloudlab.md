@@ -125,3 +125,21 @@ non-recycling (default 512 MiB server MR), so a faster implementation may
 exhaust it on long runs; the 3-second suite is for initial diagnosis, not
 unbounded throughput testing. CI checks compilation and unit tests without
 RDMA hardware and cannot verify the performance or device-level semantics.
+
+## Mu split leader and 8-byte inline replication
+
+Mu runs two threads on the leader: one owns client QPs and their CQ; one owns
+replica QPs, a separate CQ, global-slot assignment, and lock-state application.
+They exchange validated requests and committed responses through bounded SPSC
+queues. A full queue fails closed instead of silently dropping a mutation.
+The follower processes are passive after connection setup; their NICs accept
+8-byte inline RDMA WRITEs without follower CPU polling.
+
+Run the existing single-test configuration from node 4 after updating:
+
+    python3 experiments/run.py --suite=/tmp/mu-throughput.json --profile-leader --remote-dir=/tmp/lock-mu-inline
+
+The 8-byte encoding supports node IDs 1..255, lock IDs 0..65535, and
+39-bit nonzero request sequences; larger values fail explicitly. The format
+is Mu-specific; the 128-byte handoff record remains unchanged. This path
+requires CloudLab correctness and latency validation before drawing conclusions.

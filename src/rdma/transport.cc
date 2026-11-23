@@ -134,6 +134,7 @@ struct Transport::Impl {
     ibv_context* ctx = nullptr;
     ibv_pd* pd = nullptr;
     ibv_cq* cq = nullptr;
+    ibv_cq* replication_cq = nullptr;
     ibv_mr* mr = nullptr;
     void* mem = nullptr;
     uint16_t lid = 0;
@@ -168,6 +169,10 @@ struct Transport::Impl {
         check(pd != nullptr, "ibv_alloc_pd");
         cq = ibv_create_cq(ctx, 8192, nullptr, nullptr, 0);
         check(cq != nullptr, "ibv_create_cq");
+        if (!cfg.replication_peers.empty()) {
+            replication_cq = ibv_create_cq(ctx, 8192, nullptr, nullptr, 0);
+            check(replication_cq != nullptr, "ibv_create_cq replication");
+        }
         check(posix_memalign(&mem, 4096, align_up(cfg.memory_bytes, 4096)) == 0, "posix_memalign");
         std::memset(mem, 0, cfg.memory_bytes);
         mr = ibv_reg_mr(pd, mem, cfg.memory_bytes, IBV_ACCESS_LOCAL_WRITE |
@@ -195,7 +200,11 @@ struct Transport::Impl {
             if (peer.id == cfg.self) continue;
             auto& conn = connections[peer.id];
             ibv_qp_init_attr attr{};
-            attr.send_cq = cq; attr.recv_cq = cq; attr.qp_type = IBV_QPT_RC;
+            const bool repl = std::find(cfg.replication_peers.begin(),
+                cfg.replication_peers.end(), peer.id) != cfg.replication_peers.end();
+            attr.send_cq = repl ? replication_cq : cq;
+            attr.recv_cq = repl ? replication_cq : cq;
+            attr.qp_type = IBV_QPT_RC;
             attr.cap.max_send_wr = kMaxSend;
             attr.cap.max_recv_wr = cfg.receive_depth;
             attr.cap.max_send_sge = 1; attr.cap.max_recv_sge = 1;
@@ -226,6 +235,7 @@ struct Transport::Impl {
         for (auto& [id, conn] : connections) if (conn.qp) ibv_destroy_qp(conn.qp);
         if (mr) ibv_dereg_mr(mr);
         if (mem) std::free(mem);
+        if (replication_cq) ibv_destroy_cq(replication_cq);
         if (cq) ibv_destroy_cq(cq);
         if (pd) ibv_dealloc_pd(pd);
         if (ctx) ibv_close_device(ctx);
@@ -377,6 +387,29 @@ bool Transport::write(NodeId peer, const void* p, size_t bytes,
     c.unsignaled_posted = signaled ? 0 : c.unsignaled_posted + 1;
     return signaled;
 }
+bool Transport::write_inline(NodeId peer, uint64_t value, size_t offset,
+                             WorkId id, bool signal) {
+    auto& x = *impl_;
+    if (offset % alignof(uint64_t))
+        throw std::invalid_argument("unaligned Mu inline WRITE offset");
+    x.verify_remote(peer, offset, sizeof(uint64_t));
+    auto& c = x.conn(peer);
+    const bool signaled = signal || c.unsignaled_posted >= 15;
+    ibv_sge sge{};
+    sge.addr = reinterpret_cast<uintptr_t>(&value);
+    sge.length = sizeof(value);
+    // lkey is not used for IBV_SEND_INLINE.
+    ibv_send_wr wr{}, *bad = nullptr;
+    wr.wr_id = encode(Tag::Write, peer, id);
+    wr.sg_list = &sge; wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_WRITE;
+    wr.send_flags = IBV_SEND_INLINE | (signaled ? IBV_SEND_SIGNALED : 0);
+    wr.wr.rdma.remote_addr = c.remote.base + offset;
+    wr.wr.rdma.rkey = c.remote.rkey;
+    check(!ibv_post_send(c.qp, &wr, &bad), "post inline WRITE");
+    c.unsignaled_posted = signaled ? 0 : c.unsignaled_posted + 1;
+    return signaled;
+}
 void Transport::compare_swap(NodeId peer, uint64_t* result, size_t offset,
                              uint64_t expected, uint64_t desired, WorkId id) {
     auto& x = *impl_;
@@ -398,7 +431,15 @@ void Transport::compare_swap(NodeId peer, uint64_t* result, size_t offset,
     check(!ibv_post_send(x.conn(peer).qp, &wr, &bad), "post CAS");
 }
 void Transport::poll_into(std::vector<Completion>& result, int batch) {
+    poll_on_cq(result, batch, false);
+}
+void Transport::poll_replication_into(std::vector<Completion>& result, int batch) {
+    poll_on_cq(result, batch, true);
+}
+void Transport::poll_on_cq(std::vector<Completion>& result, int batch, bool replication) {
     auto& x = *impl_;
+    if (replication && !x.replication_cq)
+        throw std::runtime_error("replication CQ not configured");
     if (batch <= 0 || batch > 4096) throw std::invalid_argument("invalid poll batch");
     // The benchmark always requests 64 CQEs. Avoid allocating this buffer
     // on every empty CQ poll; also reuse the caller's output vector.
@@ -409,7 +450,7 @@ void Transport::poll_into(std::vector<Completion>& result, int batch) {
         larger.resize(static_cast<size_t>(batch));
         wc = larger.data();
     }
-    int n = ibv_poll_cq(x.cq, batch, wc);
+    int n = ibv_poll_cq(replication ? x.replication_cq : x.cq, batch, wc);
     check(n >= 0, "poll CQ");
     result.clear();
     result.reserve(static_cast<size_t>(n));

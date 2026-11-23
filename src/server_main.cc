@@ -4,6 +4,8 @@
 #include <atomic>
 #include <cstddef>
 #include "lock/locks/mu_state.h"
+#include "lock/locks/mu_leader_runtime.h"
+#include <thread>
 #include "lock/locks/replicated_log.h"
 #include "lock/rdma/transport.h"
 #include <algorithm>
@@ -49,10 +51,23 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("server node is not a replica");
         if (opt.number("mu-lanes", 1) != 1)
             throw std::invalid_argument("only one replicated log lane supported");
+        const bool leader = cfg.self == replicas.front();
+        if (leader && backend == lock::Backend::Mu)
+            cfg.replication_peers = replicas;
         lock::rdma::Transport net(cfg);
         net.connect();
         std::cout << "READY node=" << cfg.self << std::endl;
-        bool leader = cfg.self == replicas.front();
+        if (backend == lock::Backend::Mu) {
+            if (leader) {
+                lock::run_mu_leader(net, cfg.self, replicas, clients, lock_count,
+                                    mu_inflight_window, profile_requested);
+            } else {
+                // Follower NICs accept one-sided log WRITEs autonomously.
+                // No polling or CPU-side application logic in the measured path.
+                while (true) std::this_thread::sleep_for(std::chrono::hours(24));
+            }
+            return 0;
+        }
         const bool profile_mu = profile_requested && leader && backend == lock::Backend::Mu;
         using Clock = std::chrono::steady_clock;
         auto profile_start = Clock::now();

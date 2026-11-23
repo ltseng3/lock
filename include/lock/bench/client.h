@@ -58,6 +58,7 @@ private:
         RequestId successor = 0;
         uint64_t successor_position = 0;
         bool sent = false;
+        bool acknowledged = false;
     };
     struct Marker {
         uint64_t* payload = nullptr;
@@ -78,6 +79,8 @@ private:
     uint64_t handoffs_sent_ = 0;
     uint64_t handoffs_received_ = 0;
     uint64_t late_next_ = 0;
+    bool stop_sent_ = false;
+    bool server_stopped_ = false;
     uint64_t next_sequence_ = 1;
     uint64_t next_work_ = 1;
     Clock::time_point measurement_begin_{}, measurement_end_{};

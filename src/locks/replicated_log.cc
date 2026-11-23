@@ -31,7 +31,8 @@ uint64_t ReplicatedLog::append(const Message& m) {
         if (peer == net_.self()) continue;
         // Keep the existing all-signaled behavior for non-Mu backends.
         const bool quorum_signal =
-            !quorum_only_signaling_ || required_remote-- > 0;
+            !quorum_only_signaling_ || required_remote != 0;
+        if (quorum_only_signaling_ && quorum_signal) --required_remote;
         WorkId id = next_work_++;
         if (net_.write(peer, record, sizeof(LogRecord), offset, id, quorum_signal))
             writes_.emplace(id, slot);

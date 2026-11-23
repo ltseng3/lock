@@ -270,6 +270,26 @@ void ClientEngine::handle(const rdma::Completion& c) {
             throw std::runtime_error("message sender mismatch");
         const Kind kind = message_kind(c.message);
         if (kind == Kind::Ready) return;
+        if (cfg_.backend == Backend::Handoff) {
+            if (kind == Kind::Handoff) {
+                handle_activation(c);
+                return;
+            }
+            if (c.peer != cfg_.replicas.front())
+                throw std::runtime_error("handoff control from non-leader");
+            if (kind == Kind::Order) { handle_order(c); return; }
+            if (kind == Kind::Start) { handle_activation(c); return; }
+            if (kind == Kind::Next) { handle_next(c); return; }
+            if (kind == Kind::ReleaseAck) {
+                auto it = retired_.find(c.message.request);
+                if (it == retired_.end() || it->second.lock != c.message.lock_id ||
+                    it->second.position != c.message.position)
+                    throw std::runtime_error("invalid retirement ACK");
+                retired_.erase(it);
+                return;
+            }
+            throw std::runtime_error("unexpected handoff control message");
+        }
         if (c.peer != cfg_.replicas.front())
             throw std::runtime_error("unexpected server message");
         auto it = requests_.find(c.message.request);
@@ -284,6 +304,13 @@ void ClientEngine::handle(const rdma::Completion& c) {
             complete(slot);
         else
             throw std::runtime_error("unexpected response or phase");
+        return;
+    }
+    if (auto marker = marker_work_.find(c.work_id); marker != marker_work_.end()) {
+        if (c.kind != rdma::CompletionKind::Write)
+            throw std::runtime_error("release marker completion not WRITE");
+        markers_[marker->second].occupied = false;
+        marker_work_.erase(marker);
         return;
     }
     auto it = awaited_.find(c.work_id);
@@ -369,6 +396,9 @@ void ClientEngine::print_result() const {
               << ",\"total_p50_ns\":" << percentile(total_ns_, 0.50)
               << ",\"total_p99_ns\":" << percentile(total_ns_, 0.99)
               << ",\"total_p999_ns\":" << percentile(total_ns_, 0.999)
+              << ",\"handoffs_sent\":" << handoffs_sent_
+              << ",\"handoffs_received\":" << handoffs_received_
+              << ",\"late_next\":" << late_next_
               << "}" << std::endl;
 }
 } // namespace lock

@@ -27,6 +27,13 @@ class TestExperiment(unittest.TestCase):
     def test_case_count(self):
         self.assertEqual(len(list(cases(self.suite))), 3 * 3 * 2 * 5 * 5)
 
+    def test_fast_default_suite(self):
+        quick = json.loads((ROOT / "experiments/suites/quick.json").read_text())
+        self.assertEqual(len(list(cases(quick))), 3 * 2 * 2 * 5)
+        self.assertEqual(quick["warmup_seconds"], 1)
+        self.assertEqual(quick["duration_seconds"], 3)
+        self.assertEqual(quick["repetitions"], 1)
+
     def test_five_replica_topology(self):
         other = Topology.load(ROOT / "experiments/topologies/apt8_five.json")
         self.assertEqual(other.replicas, (1,2,3,4,5))

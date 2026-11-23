@@ -1,5 +1,8 @@
 #include "lock/config.h"
 #include "lock/locks/backend.h"
+#include "lock/locks/handoff_state.h"
+#include <atomic>
+#include <cstddef>
 #include "lock/locks/mu_state.h"
 #include "lock/locks/replicated_log.h"
 #include "lock/rdma/transport.h"
@@ -47,10 +50,14 @@ int main(int argc, char** argv) {
         bool started = false;
         std::unique_ptr<lock::ReplicatedLog> log;
         std::unique_ptr<lock::MuState> mu;
+        std::unique_ptr<lock::HandoffState> handoff;
         if (leader && backend != lock::Backend::Cas) {
             log = std::make_unique<lock::ReplicatedLog>(net, replicas);
             if (backend == lock::Backend::Mu)
                 mu = std::make_unique<lock::MuState>(lock_count);
+            else
+                handoff = std::make_unique<lock::HandoffState>(
+                    lock_count, opt.number("prepared-window", 8));
         }
         std::vector<lock::Message> pending;
         size_t head = 0;
@@ -81,7 +88,14 @@ int main(int argc, char** argv) {
                         lock::request_node(m.request) != event.peer ||
                         m.lock_id >= lock_count)
                         throw std::runtime_error("invalid mutation request");
-                    pending.push_back(m);
+                    if (handoff) {
+                        if (kind != lock::Kind::Acquire)
+                            throw std::runtime_error("handoff accepts only Acquire");
+                        auto step = handoff->admit(m);
+                        for (auto& command : step.append) pending.push_back(command);
+                    } else {
+                        pending.push_back(m);
+                    }
                 } else {
                     throw std::runtime_error("unexpected leader request");
                 }
@@ -97,6 +111,24 @@ int main(int argc, char** argv) {
                     action.message.sender = cfg.self;
                     net.send(action.destination, action.message);
                 }
+                if (handoff) for (auto& action : handoff->committed(*committed)) {
+                    action.message.sender = cfg.self;
+                    net.send(action.destination, action.message);
+                }
+            }
+            if (handoff) {
+                auto step = handoff->retire([&](uint64_t slot) -> uint64_t {
+                    size_t offset = lock::rdma::kLogOffset +
+                                    slot * sizeof(lock::LogRecord) +
+                                    offsetof(lock::LogRecord, retired);
+                    auto* ptr = static_cast<uint64_t*>(net.at(offset, sizeof(uint64_t)));
+                    return std::atomic_ref<uint64_t>(*ptr).load(std::memory_order_acquire);
+                });
+                for (auto& action : step.actions) {
+                    action.message.sender = cfg.self;
+                    net.send(action.destination, action.message);
+                }
+                for (auto& command : step.append) pending.push_back(command);
             }
         }
     } catch (const std::exception& e) {

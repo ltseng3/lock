@@ -77,3 +77,24 @@ across hosts concurrently to reduce control-plane overhead. For a repeated
 sweep of the **same already-deployed commit**, you can additionally pass
 `--skip-deploy --skip-build --remote-dir=<existing-dir>` once the binaries
 have been verified, but do not reuse binaries after source changes.
+
+## Mu leader diagnostics and working-tree experiments
+
+The experiment runner accepts modified/uncommitted source files: it deploys the
+files from the current checkout and **does not block on a dirty working tree**.
+The `source.json` commit SHA identifies the most recent commit, **not** a
+guarantee that uncommitted content matches that revision. For reproducible
+results, archive your local patch separately.
+
+For a single Mu diagnostic run, use a suite that selects only Mu, uniform
+access, four workers and 16 outstanding requests per worker, then pass
+`--profile-leader`. With this flag, leader node 1 emits approximately
+one-second `LEADER_PROFILE` records, which are also echoed on node 4.
+Each record reports acquire/release receives, log commits, signaled replication
+WRITE completions, send completions, outgoing responses, and maximum pending
+or in-flight log work. `max_inflight=128` indicates the fixed log admission
+window was fully occupied; growing `max_pending` can indicate backlog.
+
+This counter-based diagnostic does not attribute CPU cycles or NIC service
+time and is not, by itself, proof of a specific bottleneck. It adds a small
+amount of instrumentation overhead and is disabled by default.

@@ -7,6 +7,7 @@
 #include "lock/locks/replicated_log.h"
 #include "lock/rdma/transport.h"
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <memory>
 #include <set>
@@ -37,6 +38,7 @@ int main(int argc, char** argv) {
         auto replicas = ids(opt.list("replicas"));
         auto clients = ids(opt.list("clients"));
         auto backend = lock::parse_backend(opt.require("backend"));
+        const bool profile_requested = opt.number("profile-leader", 0) != 0;
         const size_t lock_count = opt.number("locks", 1000);
         if (std::find(replicas.begin(), replicas.end(), cfg.self) == replicas.end())
             throw std::invalid_argument("server node is not a replica");
@@ -46,6 +48,13 @@ int main(int argc, char** argv) {
         net.connect();
         std::cout << "READY node=" << cfg.self << std::endl;
         bool leader = cfg.self == replicas.front();
+        const bool profile_mu = profile_requested && leader && backend == lock::Backend::Mu;
+        using Clock = std::chrono::steady_clock;
+        auto profile_start = Clock::now();
+        uint64_t profile_loops = 0;
+        uint64_t acquire_rx = 0, release_rx = 0, write_cqe = 0;
+        uint64_t send_cqe = 0, committed_count = 0, sent_responses = 0;
+        size_t max_inflight = 0, max_pending = 0;
         std::set<lock::NodeId> ready;
         std::set<lock::NodeId> finished;
         bool started = false;
@@ -67,6 +76,11 @@ int main(int argc, char** argv) {
                 if (event.kind == lock::rdma::CompletionKind::Write) {
                     if (!leader || !log) throw std::runtime_error("unexpected server WRITE CQE");
                     log->on_write_complete(event.work_id);
+                    if (profile_mu) ++write_cqe;
+                    continue;
+                }
+                if (event.kind == lock::rdma::CompletionKind::Send) {
+                    if (profile_mu) ++send_cqe;
                     continue;
                 }
                 if (event.kind != lock::rdma::CompletionKind::Receive) continue;
@@ -107,6 +121,10 @@ int main(int argc, char** argv) {
                         for (auto& command : step.append) pending.push_back(command);
                     } else {
                         pending.push_back(m);
+                        if (profile_mu) {
+                            if (kind == lock::Kind::Acquire) ++acquire_rx;
+                            else ++release_rx;
+                        }
                     }
                 } else {
                     throw std::runtime_error("unexpected leader request");
@@ -114,14 +132,18 @@ int main(int argc, char** argv) {
             }
             if (!leader || !log) continue;
             // Cap work on one RC send queue while allowing pipelined quorum commits.
+            if (profile_mu) max_pending = std::max(max_pending, pending.size() - head);
             while (head < pending.size() && log->inflight() < 128) {
                 log->append(pending[head++]);
             }
+            if (profile_mu) max_inflight = std::max(max_inflight, log->inflight());
             if (head == pending.size()) { pending.clear(); head = 0; }
             while (auto committed = log->next_committed()) {
+                if (profile_mu) ++committed_count;
                 if (mu) for (auto& action : mu->apply(committed->command)) {
                     action.message.sender = cfg.self;
                     net.send(action.destination, action.message);
+                    if (profile_mu) ++sent_responses;
                 }
                 if (handoff) for (auto& action : handoff->committed(*committed)) {
                     action.message.sender = cfg.self;
@@ -141,6 +163,29 @@ int main(int argc, char** argv) {
                     net.send(action.destination, action.message);
                 }
                 for (auto& command : step.append) pending.push_back(command);
+            }
+            if (profile_mu && ((++profile_loops & 4095ULL) == 0)) {
+                const auto now = Clock::now();
+                const auto elapsed = std::chrono::duration<double>(now - profile_start).count();
+                if (elapsed >= 1.0) {
+                    if (acquire_rx || release_rx || committed_count) {
+                        std::cout << "LEADER_PROFILE"
+                                  << " seconds=" << elapsed
+                                  << " acquire_rx=" << acquire_rx
+                                  << " release_rx=" << release_rx
+                                  << " commits=" << committed_count
+                                  << " replication_write_cqe=" << write_cqe
+                                  << " send_cqe=" << send_cqe
+                                  << " responses_sent=" << sent_responses
+                                  << " max_inflight=" << max_inflight
+                                  << " max_pending=" << max_pending
+                                  << std::endl;
+                    }
+                    profile_start = now;
+                    acquire_rx = release_rx = write_cqe = send_cqe = 0;
+                    committed_count = sent_responses = 0;
+                    max_inflight = max_pending = 0;
+                }
             }
         }
     } catch (const std::exception& e) {

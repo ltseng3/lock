@@ -42,6 +42,14 @@ class TestExperiment(unittest.TestCase):
         self.assertEqual(other.ssh_user, "tsengle")
         self.assertEqual(other.by_id(8).ssh_host, "10.10.1.8")
 
+    def test_profile_leader_only_on_replicas(self):
+        case = next(cases(self.suite))
+        enhanced = dict(self.suite, profile_leader=True)
+        server = process_command(self.topo, self.topo.by_id(1), enhanced, case)
+        client = process_command(self.topo, self.topo.by_id(4), enhanced, case)
+        self.assertIn("--profile-leader=1", server)
+        self.assertNotIn("--profile-leader=1", client)
+
     def test_command_has_ips_and_identity(self):
         case = next(cases(self.suite))
         command = process_command(self.topo, self.topo.by_id(8), self.suite, case)

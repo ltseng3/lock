@@ -3,6 +3,7 @@
 #include "lock/locks/mu_state.h"
 #include <cassert>
 #include <cstdint>
+#include <initializer_list>
 #include <stdexcept>
 #include <thread>
 
@@ -10,7 +11,7 @@ int main() {
     using namespace lock;
     for (NodeId node : {1u, 4u, 255u}) {
         for (LockId lock : {0u, 999u, 65535u}) {
-            for (uint64_t seq : {1ULL, 1400000ULL, kMuSequenceMask}) {
+            for (uint64_t seq : std::initializer_list<uint64_t>{1, 1400000, kMuSequenceMask}) {
                 for (Kind kind : {Kind::Acquire, Kind::Release}) {
                     auto m = message(kind, node, lock, make_request_id(node, seq));
                     const auto encoded = pack_mu_command(m);

@@ -1,0 +1,67 @@
+#pragma once
+#include "lock/bench/workload.h"
+#include "lock/locks/backend.h"
+#include "lock/rdma/transport.h"
+#include <chrono>
+#include <cstdint>
+#include <unordered_map>
+#include <vector>
+namespace lock {
+struct ClientConfig {
+    Backend backend = Backend::Cas;
+    NodeId self = 0;
+    std::vector<NodeId> replicas;
+    size_t lock_count = 1000;
+    size_t outstanding = 1;
+    std::string distribution = "uniform";
+    uint64_t seed = 2026;
+    uint64_t warmup_seconds = 5;
+    uint64_t duration_seconds = 15;
+    uint64_t watchdog_seconds = 90;
+    bool cas_release_guarded = false;
+};
+class ClientEngine {
+public:
+    ClientEngine(rdma::Transport& net, ClientConfig cfg);
+    void run();
+private:
+    using Clock = std::chrono::steady_clock;
+    enum class Phase { Idle, WaitGrant, WaitCas, Writing, WaitRelease, WaitCasRelease };
+    enum class Purpose { AcquireCas, DataWrite, ReleaseCas, ReleaseWrite };
+    struct Operation {
+        Phase phase = Phase::Idle;
+        RequestId request = 0;
+        LockId lock = 0;
+        uint64_t generation = 0;
+        uint64_t* cas_result = nullptr;
+        uint64_t* data_value = nullptr;
+        uint64_t* release_zero = nullptr;
+        Clock::time_point begun{};
+        Clock::time_point acquired{};
+    };
+    struct Awaited {
+        size_t slot;
+        uint64_t generation;
+        Purpose purpose;
+    };
+    rdma::Transport& net_;
+    ClientConfig cfg_;
+    LockPicker picker_;
+    std::vector<Operation> ops_;
+    std::unordered_map<RequestId, size_t> requests_;
+    std::unordered_map<WorkId, Awaited> awaited_;
+    uint64_t next_sequence_ = 1;
+    uint64_t next_work_ = 1;
+    Clock::time_point measurement_begin_{}, measurement_end_{};
+    size_t completed_ = 0;
+    std::vector<uint64_t> acquire_ns_, total_ns_;
+    WorkId track(size_t slot, Purpose purpose);
+    void submit(size_t slot);
+    void post_cas(size_t slot);
+    void post_data(size_t slot);
+    void release(size_t slot);
+    void complete(size_t slot);
+    void handle(const rdma::Completion& c);
+    void print_result() const;
+};
+} // namespace lock

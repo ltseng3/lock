@@ -136,11 +136,12 @@ struct Transport::Impl {
     uint16_t lid = 0;
     std::map<NodeId, Connection> connections;
     size_t recv_next = 0x40000;
-    size_t scratch_next = kScratchOffset;
+    size_t scratch_next = 0;
     bool connected = false;
     explicit Impl(Config c) : cfg(std::move(c)) {
         if (!cfg.self || cfg.self > 255 || cfg.memory_bytes < kScratchOffset + 4096)
             throw std::invalid_argument("invalid local ID or registered memory size");
+        scratch_next = cfg.memory_bytes - 16ULL * 1024 * 1024;
         if (cfg.receive_depth < 2 || cfg.receive_depth > 1024)
             throw std::invalid_argument("receive depth must be 2..1024");
         int count = 0;

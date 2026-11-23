@@ -1,0 +1,29 @@
+{
+  "name": "first",
+  "backends": [
+    "cas",
+    "mu",
+    "handoff"
+  ],
+  "locks": 1000,
+  "distributions": [
+    "uniform",
+    "zipf_0.5",
+    "zipf_0.99"
+  ],
+  "outstanding": [
+    1,
+    2,
+    4,
+    8,
+    16
+  ],
+  "replicas": 3,
+  "mu_lanes": 1,
+  "prepared_window": 8,
+  "warmup_seconds": 5,
+  "duration_seconds": 15,
+  "watchdog_seconds": 90,
+  "repetitions": 5,
+  "seed": 2026
+}

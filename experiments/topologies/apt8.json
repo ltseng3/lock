@@ -1,0 +1,68 @@
+{
+  "name": "cloudlab-apt8",
+  "tcp_port": 18515,
+  "ib_port": 1,
+  "device": "",
+  "replicas": [
+    1,
+    2,
+    3
+  ],
+  "clients": [
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "nodes": [
+    {
+      "id": 1,
+      "ssh_host": "10.10.1.1",
+      "rdma_ip": "10.10.1.1",
+      "role": "replica"
+    },
+    {
+      "id": 2,
+      "ssh_host": "10.10.1.2",
+      "rdma_ip": "10.10.1.2",
+      "role": "replica"
+    },
+    {
+      "id": 3,
+      "ssh_host": "10.10.1.3",
+      "rdma_ip": "10.10.1.3",
+      "role": "replica"
+    },
+    {
+      "id": 4,
+      "ssh_host": "10.10.1.4",
+      "rdma_ip": "10.10.1.4",
+      "role": "client"
+    },
+    {
+      "id": 5,
+      "ssh_host": "10.10.1.5",
+      "rdma_ip": "10.10.1.5",
+      "role": "client"
+    },
+    {
+      "id": 6,
+      "ssh_host": "10.10.1.6",
+      "rdma_ip": "10.10.1.6",
+      "role": "client"
+    },
+    {
+      "id": 7,
+      "ssh_host": "10.10.1.7",
+      "rdma_ip": "10.10.1.7",
+      "role": "client"
+    },
+    {
+      "id": 8,
+      "ssh_host": "10.10.1.8",
+      "rdma_ip": "10.10.1.8",
+      "role": "client"
+    }
+  ]
+}

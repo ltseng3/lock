@@ -22,6 +22,7 @@ struct Completion {
     CompletionKind kind;
     NodeId peer;
     WorkId work_id = 0;
+    size_t lane = 0; // receive QP lane; zero for the standard channel
     Message message{};
 };
 struct Config {
@@ -38,6 +39,10 @@ struct Config {
     // Replica-to-replica links have this many separate QPs/CQs. Non-replica
     // peers retain one QP and the standard bootstrap protocol.
     size_t replication_lanes = 1;
+    // Only leader<->client peers use the additional bidirectional lane QPs.
+    // On the leader each lane has its own CQ; clients can poll a shared CQ.
+    // Client-to-client HANDOFF and replica data WRITEs retain lane zero.
+    std::vector<NodeId> client_lane_peers;
 };
 
 std::vector<Peer> parse_peers(const std::string& spec);
@@ -53,7 +58,8 @@ public:
     void connect();
     // Unsignaled SEND/WRITE requests are periodically signaled to retire QP WRs.
     // WRITE returns whether a CQE was requested; the caller must only track those.
-    void send(NodeId peer, const Message& m, WorkId work_id = 0, bool signal = true);
+    void send(NodeId peer, const Message& m, WorkId work_id = 0,
+              bool signal = true, size_t lane = 0);
     bool write(NodeId peer, const void* local, size_t length,
                size_t remote_offset, WorkId work_id, bool signal = true);
     // The eight-byte source is copied inline by the NIC at posting time;
@@ -67,6 +73,9 @@ public:
     void poll_into(std::vector<Completion>& out, int batch = 64);
     void poll_replication_into(std::vector<Completion>& out, int batch = 64,
                                size_t lane = 0);
+    // Each leader communication worker exclusively polls its own lane CQ.
+    void poll_communication_into(std::vector<Completion>& out, int batch = 64,
+                                 size_t lane = 0);
     std::vector<Completion> poll(int batch = 64);
 
     // Offset-addressed memory is registered for LOCAL_WRITE and remote access.
@@ -77,8 +86,9 @@ public:
     size_t remote_memory_bytes(NodeId peer) const;
     NodeId self() const;
 private:
-    void poll_on_cq(std::vector<Completion>& out, int batch, bool replication,
-                    size_t lane);
+    enum class PollGroup { Default, Replication, Communication };
+    void poll_on_cq(std::vector<Completion>& out, int batch,
+                    PollGroup group, size_t lane);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

@@ -129,12 +129,14 @@ struct Transport::Impl {
         ibv_qp* qp = nullptr;
         uint32_t psn = 0;
         uint32_t unsignaled_posted = 0;
+        std::vector<Message*> receives;
     };
     struct Connection {
         ibv_qp* qp = nullptr;
         std::vector<Message*> receives;
         uint32_t psn = 0;
         uint32_t unsignaled_posted = 0;
+        bool client_lanes = false;
         std::vector<ExtraQp> extra_qps;
         Bootstrap remote{};
     };
@@ -143,6 +145,7 @@ struct Transport::Impl {
     ibv_pd* pd = nullptr;
     ibv_cq* cq = nullptr;
     std::vector<ibv_cq*> replication_cqs;
+    std::vector<ibv_cq*> communication_cqs;
     ibv_mr* mr = nullptr;
     void* mem = nullptr;
     uint16_t lid = 0;
@@ -186,6 +189,17 @@ struct Transport::Impl {
                 replication_cqs.push_back(lane_cq);
             }
         }
+        // The server owns independent client QPs/CQs per lane. A client
+        // keeps one event loop and therefore polls all its client-facing
+        // lane QPs through the ordinary CQ, without a receive dispatcher
+        // on the leader.
+        if (!cfg.replication_peers.empty() && !cfg.client_lane_peers.empty()) {
+            for (size_t lane = 0; lane < cfg.replication_lanes; ++lane) {
+                ibv_cq* lane_cq = ibv_create_cq(ctx, 8192, nullptr, nullptr, 0);
+                check(lane_cq != nullptr, "ibv_create_cq communication lane");
+                communication_cqs.push_back(lane_cq);
+            }
+        }
         check(posix_memalign(&mem, 4096, align_up(cfg.memory_bytes, 4096)) == 0, "posix_memalign");
         std::memset(mem, 0, cfg.memory_bytes);
         mr = ibv_reg_mr(pd, mem, cfg.memory_bytes, IBV_ACCESS_LOCAL_WRITE |
@@ -215,8 +229,16 @@ struct Transport::Impl {
             ibv_qp_init_attr attr{};
             const bool repl = std::find(cfg.replication_peers.begin(),
                 cfg.replication_peers.end(), peer.id) != cfg.replication_peers.end();
-            attr.send_cq = repl ? replication_cqs.front() : cq;
-            attr.recv_cq = repl ? replication_cqs.front() : cq;
+            const bool client_link = std::find(cfg.client_lane_peers.begin(),
+                cfg.client_lane_peers.end(), peer.id) != cfg.client_lane_peers.end();
+            if (repl && client_link)
+                throw std::invalid_argument("replication and client QPs overlap");
+            conn.client_lanes = client_link;
+            ibv_cq* base_cq = repl ? replication_cqs.front() :
+                              (client_link && !communication_cqs.empty() ?
+                               communication_cqs.front() : cq);
+            attr.send_cq = base_cq;
+            attr.recv_cq = base_cq;
             attr.qp_type = IBV_QPT_RC;
             attr.cap.max_send_wr = kMaxSend;
             attr.cap.max_recv_wr = cfg.receive_depth;
@@ -233,22 +255,27 @@ struct Transport::Impl {
             check(!ibv_modify_qp(conn.qp, &init,
                   IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS),
                   "modify QP INIT");
-            if (repl && cfg.replication_lanes > 1) {
+            if ((repl || client_link) && cfg.replication_lanes > 1) {
                 conn.extra_qps.reserve(cfg.replication_lanes - 1);
                 for (size_t lane = 1; lane < cfg.replication_lanes; ++lane) {
                     ibv_qp_init_attr extra_attr = attr;
-                    extra_attr.send_cq = replication_cqs[lane];
-                    extra_attr.recv_cq = replication_cqs[lane];
-                    extra_attr.cap.max_recv_wr = 1;  // One-sided RDMA WRITE only.
+                    ibv_cq* lane_cq = repl ? replication_cqs[lane] :
+                                      (!communication_cqs.empty() ?
+                                       communication_cqs[lane] : cq);
+                    extra_attr.send_cq = lane_cq;
+                    extra_attr.recv_cq = lane_cq;
+                    // Replica lane QPs accept one-sided WRITEs. Client
+                    // control QPs need their own posted RECEIVE buffers.
+                    extra_attr.cap.max_recv_wr = repl ? 1 : cfg.receive_depth;
                     ExtraQp extra;
                     extra.qp = ibv_create_qp(pd, &extra_attr);
-                    check(extra.qp != nullptr, "ibv_create_qp replication lane");
+                    check(extra.qp != nullptr, "ibv_create_qp extra lane");
                     extra.psn = static_cast<uint32_t>((0x2345 + cfg.self * 7919 +
                                   peer.id * 131 + lane * 251) & 0xffffff);
                     check(!ibv_modify_qp(extra.qp, &init,
                           IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
                           IBV_QP_ACCESS_FLAGS), "modify extra QP INIT");
-                    conn.extra_qps.push_back(extra);
+                    conn.extra_qps.push_back(std::move(extra));
                 }
             }
             for (uint32_t slot = 0; slot < cfg.receive_depth; ++slot) {
@@ -259,6 +286,22 @@ struct Transport::Impl {
                 recv_next += sizeof(Message);
                 conn.receives.push_back(buffer);
                 post_recv(peer.id, slot);
+            }
+            if (client_link) {
+                for (size_t lane = 1; lane < cfg.replication_lanes; ++lane) {
+                    auto& extra = conn.extra_qps.at(lane - 1);
+                    for (uint32_t slot = 0; slot < cfg.receive_depth; ++slot) {
+                        recv_next = align_up(recv_next, alignof(Message));
+                        if (recv_next + sizeof(Message) > kLogOffset)
+                            throw std::runtime_error(
+                                "client lane receive rings exceed reserved memory");
+                        auto* buffer = reinterpret_cast<Message*>(
+                            static_cast<char*>(mem) + recv_next);
+                        recv_next += sizeof(Message);
+                        extra.receives.push_back(buffer);
+                        post_recv(peer.id, slot, lane);
+                    }
+                }
             }
         }
     }
@@ -272,6 +315,8 @@ struct Transport::Impl {
         if (mem) std::free(mem);
         for (auto* lane_cq : replication_cqs)
             if (lane_cq) ibv_destroy_cq(lane_cq);
+        for (auto* lane_cq : communication_cqs)
+            if (lane_cq) ibv_destroy_cq(lane_cq);
         if (cq) ibv_destroy_cq(cq);
         if (pd) ibv_dealloc_pd(pd);
         if (ctx) ibv_close_device(ctx);
@@ -281,15 +326,21 @@ struct Transport::Impl {
         if (it == connections.end()) throw std::invalid_argument("unknown RDMA peer");
         return it->second;
     }
-    void post_recv(NodeId peer, uint32_t slot) {
+    void post_recv(NodeId peer, uint32_t slot, size_t lane = 0) {
         auto& c = conn(peer);
+        if (lane && (!c.client_lanes || lane > c.extra_qps.size()))
+            throw std::invalid_argument("receive QP lane not configured");
+        ibv_qp* qp = lane ? c.extra_qps[lane - 1].qp : c.qp;
+        Message* buffer = lane ? c.extra_qps[lane - 1].receives.at(slot)
+                               : c.receives.at(slot);
         ibv_sge sge{};
-        sge.addr = reinterpret_cast<uintptr_t>(c.receives.at(slot));
+        sge.addr = reinterpret_cast<uintptr_t>(buffer);
         sge.length = sizeof(Message); sge.lkey = mr->lkey;
         ibv_recv_wr wr{}, *bad = nullptr;
-        wr.wr_id = encode(Tag::Receive, peer, slot);
+        // RECEIVE WR identifiers carry the lane and per-QP receive index.
+        wr.wr_id = encode(Tag::Receive, peer, lane * cfg.receive_depth + slot);
         wr.sg_list = &sge; wr.num_sge = 1;
-        check(!ibv_post_recv(c.qp, &wr, &bad), "post receive");
+        check(!ibv_post_recv(qp, &wr, &bad), "post receive");
     }
     void connect_qp(ibv_qp* qp, uint32_t local_psn, const Bootstrap& b) {
         ibv_qp_attr rtr{};
@@ -402,12 +453,17 @@ void Transport::connect() {
     ::close(listen_fd);
     x.connected = true;
 }
-void Transport::send(NodeId peer, const Message& msg, WorkId id, bool signal) {
+void Transport::send(NodeId peer, const Message& msg, WorkId id,
+                     bool signal, size_t lane) {
     auto& x = *impl_; auto& c = x.conn(peer);
     if (!x.connected) throw std::runtime_error("RDMA send before connect");
-    // Signal at least every 16 WRs per QP, even when the application only
-    // requests unsignaled traffic. A later signaled CQE retires earlier WRs.
-    const bool signaled = signal || c.unsignaled_posted >= 15;
+    if (lane && (!c.client_lanes || lane > c.extra_qps.size()))
+        throw std::invalid_argument("client communication QP lane not configured");
+    ibv_qp* qp = lane ? c.extra_qps[lane - 1].qp : c.qp;
+    uint32_t& unsignaled = lane ? c.extra_qps[lane - 1].unsignaled_posted
+                                : c.unsignaled_posted;
+    // Each lane owns its send queue; never share its unsignaled WR counter.
+    const bool signaled = signal || unsignaled >= 15;
     ibv_sge sge{};
     sge.addr = reinterpret_cast<uintptr_t>(&msg); sge.length = sizeof(msg);
     ibv_send_wr wr{}, *bad = nullptr;
@@ -415,8 +471,8 @@ void Transport::send(NodeId peer, const Message& msg, WorkId id, bool signal) {
     wr.sg_list = &sge; wr.num_sge = 1;
     wr.opcode = IBV_WR_SEND;
     wr.send_flags = IBV_SEND_INLINE | (signaled ? IBV_SEND_SIGNALED : 0);
-    check(!ibv_post_send(c.qp, &wr, &bad), "post SEND");
-    c.unsignaled_posted = signaled ? 0 : c.unsignaled_posted + 1;
+    check(!ibv_post_send(qp, &wr, &bad), "post SEND");
+    unsignaled = signaled ? 0 : unsignaled + 1;
 }
 bool Transport::write(NodeId peer, const void* p, size_t bytes,
                       size_t offset, WorkId id, bool signal) {
@@ -487,17 +543,23 @@ void Transport::compare_swap(NodeId peer, uint64_t* result, size_t offset,
     check(!ibv_post_send(x.conn(peer).qp, &wr, &bad), "post CAS");
 }
 void Transport::poll_into(std::vector<Completion>& result, int batch) {
-    poll_on_cq(result, batch, false, 0);
+    poll_on_cq(result, batch, PollGroup::Default, 0);
 }
 void Transport::poll_replication_into(std::vector<Completion>& result, int batch,
-                                       size_t lane) {
-    poll_on_cq(result, batch, true, lane);
+                                      size_t lane) {
+    poll_on_cq(result, batch, PollGroup::Replication, lane);
+}
+void Transport::poll_communication_into(std::vector<Completion>& result, int batch,
+                                        size_t lane) {
+    poll_on_cq(result, batch, PollGroup::Communication, lane);
 }
 void Transport::poll_on_cq(std::vector<Completion>& result, int batch,
-                           bool replication, size_t lane) {
+                           PollGroup group, size_t lane) {
     auto& x = *impl_;
-    if (replication && lane >= x.replication_cqs.size())
+    if (group == PollGroup::Replication && lane >= x.replication_cqs.size())
         throw std::runtime_error("replication CQ lane not configured");
+    if (group == PollGroup::Communication && lane >= x.communication_cqs.size())
+        throw std::runtime_error("communication CQ lane not configured");
     if (batch <= 0 || batch > 4096) throw std::invalid_argument("invalid poll batch");
     // The benchmark always requests 64 CQEs. Avoid allocating this buffer
     // on every empty CQ poll; also reuse the caller's output vector.
@@ -508,8 +570,11 @@ void Transport::poll_on_cq(std::vector<Completion>& result, int batch,
         larger.resize(static_cast<size_t>(batch));
         wc = larger.data();
     }
-    int n = ibv_poll_cq(replication ? x.replication_cqs[lane] : x.cq,
-                        batch, wc);
+    ibv_cq* cq = group == PollGroup::Replication ?
+                 x.replication_cqs[lane] :
+                 (group == PollGroup::Communication ?
+                  x.communication_cqs[lane] : x.cq);
+    int n = ibv_poll_cq(cq, batch, wc);
     check(n >= 0, "poll CQ");
     result.clear();
     result.reserve(static_cast<size_t>(n));
@@ -525,11 +590,19 @@ void Transport::poll_on_cq(std::vector<Completion>& result, int batch,
         switch (tag) {
         case Tag::Receive: {
             auto& connection = x.conn(peer);
-            if (token >= connection.receives.size() || w.byte_len != sizeof(Message))
+            const size_t recv_lane = token / x.cfg.receive_depth;
+            const size_t recv_slot = token % x.cfg.receive_depth;
+            if (recv_lane && (!connection.client_lanes ||
+                              recv_lane > connection.extra_qps.size()))
+                throw std::runtime_error("invalid client lane receive completion");
+            auto& receivers = recv_lane ? connection.extra_qps[recv_lane - 1].receives
+                                        : connection.receives;
+            if (recv_slot >= receivers.size() || w.byte_len != sizeof(Message))
                 throw std::runtime_error("invalid receive completion");
             c.kind = CompletionKind::Receive;
-            c.message = *connection.receives[token];
-            x.post_recv(peer, static_cast<uint32_t>(token));
+            c.lane = recv_lane;
+            c.message = *receivers[recv_slot];
+            x.post_recv(peer, static_cast<uint32_t>(recv_slot), recv_lane);
             break;
         }
         case Tag::Send: c.kind = CompletionKind::Send; break;

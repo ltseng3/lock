@@ -111,3 +111,26 @@ targeted removals.
 A 32-us periodic interval is a scheduling tradeoff, not a hardware durability
 guarantee. Progress and latency still require tests on the RDMA adapters,
 especially when multiple prepared successors exist for a contended lock.
+
+## Independent client QPs and marker backpressure
+
+Both Mu and handoff leader lanes now poll disjoint client communication CQs,
+post responses to disjoint per-client QPs and dispatch requests directly to
+the corresponding lane's SPSC queue. The client chooses the lane before
+transmission. The client still has one polling thread and a shared CQ but
+validates that leader replies arrive on the expected QP lane. The lane-zero
+QP retains READY/STOP barrier traffic and peer-to-peer HANDOFF uses the
+ordinary client-to-client QP.
+
+The connection bootstrap exchanges one QP per lane for both replica-peer and
+client/leader-peer relationships. Each extra client QP has its own receive
+buffers; completion WR IDs encode the receive-QP lane and slot so reposting
+is directed to the same QP. Only one thread posts/polls each leader QP/CQ.
+
+Handoff client marker buffers are bounded and cannot be reused before the
+corresponding WRITE CQE. If all are occupied, the complete operation remains
+pending and resumes on a marker completion, rather than failing with
+`marker-buffer pool exhausted`. Verify that direct handoffs still make
+progress when markers are delayed and that all marker WRs have completed
+before the client sends STOP. These are correctness requirements, not
+guaranteed by CI's hardware-free tests.

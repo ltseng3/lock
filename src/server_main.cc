@@ -65,6 +65,8 @@ int main(int argc, char** argv) {
             // passive followers, for the leader's one-sided inline WRITEs.
             cfg.replication_peers = replicas;
             cfg.replication_lanes = mu_lanes;
+            if (leader)
+                cfg.client_lane_peers = clients;
         }
         lock::rdma::Transport net(cfg);
         net.connect();

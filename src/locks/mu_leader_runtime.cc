@@ -28,7 +28,16 @@ struct Shared {
     std::atomic<uint64_t> responses_sent{0}, send_cqe{0};
     std::atomic<bool> stopped{false};
     std::atomic<bool> failed{false};
+    std::atomic<bool> failure_claimed{false};
     std::exception_ptr failure;
+    void report_failure(std::exception_ptr error) {
+        bool expected = false;
+        if (failure_claimed.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+            failure = error;
+            failed.store(true, std::memory_order_release);
+        }
+    }
 };
 struct JoinWorkers {
     std::vector<std::unique_ptr<Shared>>& lanes;
@@ -111,103 +120,126 @@ void replication_loop(Shared& s, rdma::Transport& net,
             }
         }
     } catch (...) {
-        s.failure = std::current_exception();
-        s.failed.store(true, std::memory_order_release);
+        s.report_failure(std::current_exception());
     }
 }
 } // namespace
+
+void mu_communication_loop(
+    Shared& s, const std::vector<std::unique_ptr<Shared>>& lanes,
+    rdma::Transport& net, NodeId self,
+    const std::vector<NodeId>& clients, size_t lock_count,
+    bool profile, size_t lane, size_t lane_count,
+    std::atomic<bool>& started) {
+    // Each worker owns client-facing QPs and CQ for exactly one lane.
+    // Only lane zero runs Ready/Stop barriers.
+    std::vector<rdma::Completion> completions;
+    completions.reserve(64);
+    std::set<NodeId> ready, finished;
+    while (!s.stopped.load(std::memory_order_acquire)) {
+        if (lane == 0) {
+            for (const auto& shard : lanes)
+                if (shard->failed.load(std::memory_order_acquire))
+                    std::rethrow_exception(shard->failure);
+        }
+        net.poll_communication_into(completions, 64, lane);
+        for (const auto& c : completions) {
+            if (c.kind == rdma::CompletionKind::Send) {
+                if (profile) s.send_cqe.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            if (c.kind != rdma::CompletionKind::Receive || c.lane != lane)
+                throw std::runtime_error("Mu receive on wrong communication lane");
+            const Message& m = c.message;
+            if (m.sender != c.peer)
+                throw std::runtime_error("Mu client sender mismatch");
+            const Kind kind = message_kind(m);
+            if (kind == Kind::Ready && lane == 0 &&
+                !started.load(std::memory_order_acquire)) {
+                if (std::find(clients.begin(), clients.end(), c.peer) == clients.end() ||
+                    !ready.insert(c.peer).second)
+                    throw std::runtime_error("invalid Mu readiness");
+                if (ready.size() == clients.size()) {
+                    started.store(true, std::memory_order_release);
+                    for (NodeId id : clients)
+                        net.send(id, message(Kind::Ready, self), 0, true, 0);
+                }
+            } else if (kind == Kind::Stop && lane == 0 &&
+                       started.load(std::memory_order_acquire)) {
+                if (std::find(clients.begin(), clients.end(), c.peer) == clients.end() ||
+                    !finished.insert(c.peer).second)
+                    throw std::runtime_error("invalid Mu shutdown");
+                if (finished.size() == clients.size())
+                    for (NodeId id : clients)
+                        net.send(id, message(Kind::Stop, self), 0, true, 0);
+            } else if ((kind == Kind::Acquire || kind == Kind::Release) &&
+                       started.load(std::memory_order_acquire)) {
+                if (std::find(clients.begin(), clients.end(), c.peer) == clients.end() ||
+                    request_node(m.request) != c.peer || m.lock_id >= lock_count ||
+                    lock_lane(m.lock_id, lane_count) != lane)
+                    throw std::runtime_error("Mu mutation routed to wrong lane");
+                (void)pack_mu_command(m);
+                if (!s.requests.try_push(m))
+                    throw std::runtime_error("Mu lane request queue capacity exceeded");
+                if (profile) {
+                    if (kind == Kind::Acquire)
+                        s.acquire_rx.fetch_add(1, std::memory_order_relaxed);
+                    else
+                        s.release_rx.fetch_add(1, std::memory_order_relaxed);
+                }
+            } else {
+                throw std::runtime_error("unexpected Mu lane message");
+            }
+        }
+        Action action{};
+        size_t sent = 0;
+        while (sent++ < 64 && s.responses.try_pop(action)) {
+            if (lock_lane(action.message.lock_id, lane_count) != lane)
+                throw std::runtime_error("Mu response routed to wrong lane");
+            action.message.sender = self;
+            net.send(action.destination, action.message, 0, false, lane);
+            if (profile)
+                s.responses_sent.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
 
 void run_mu_leader(rdma::Transport& net, NodeId self,
                    const std::vector<NodeId>& replicas,
                    const std::vector<NodeId>& clients, size_t lock_count,
                    size_t inflight_window, bool profile,
                    size_t lane_count) {
-    // Each queue has exactly one producer and one consumer.
-    // The main thread owns all client QPs and the communication CQ.
-    // The replication thread owns all follower QPs and its distinct CQ.
     if (lane_count < 1 || lane_count > 8)
         throw std::invalid_argument("invalid Mu lane count");
     std::vector<std::unique_ptr<Shared>> lanes;
     std::vector<std::thread> workers;
     lanes.reserve(lane_count);
-    workers.reserve(lane_count);
+    workers.reserve(2 * lane_count - 1);
     for (size_t lane = 0; lane < lane_count; ++lane)
         lanes.push_back(std::make_unique<Shared>());
-    JoinWorkers guard{lanes, workers};
+    std::atomic<bool> started{false};
+    // Join workers before destroying their shared start flag.
+    JoinWorkers join{lanes, workers};
     for (size_t lane = 0; lane < lane_count; ++lane) {
-        Shared* shared = lanes[lane].get();
-        workers.emplace_back([&, shared, lane] {
-            replication_loop(*shared, net, replicas, lock_count, inflight_window,
+        Shared* shard = lanes[lane].get();
+        workers.emplace_back([&, shard, lane] {
+            replication_loop(*shard, net, replicas, lock_count, inflight_window,
                              profile, lane, lane_count);
         });
     }
-    std::vector<rdma::Completion> completions;
-    completions.reserve(64);
-    std::set<NodeId> ready, finished;
-    bool started = false;
-    while (true) {
-        for (const auto& shard : lanes)
-            if (shard->failed.load(std::memory_order_acquire))
-                std::rethrow_exception(shard->failure);
-        net.poll_into(completions);
-        for (const auto& c : completions) {
-            if (c.kind == rdma::CompletionKind::Send) {
-                if (profile) lanes[0]->send_cqe.fetch_add(1, std::memory_order_relaxed);
-                continue;
+    for (size_t lane = 1; lane < lane_count; ++lane) {
+        Shared* shard = lanes[lane].get();
+        workers.emplace_back([&, shard, lane] {
+            try {
+                mu_communication_loop(*shard, lanes, net, self,
+                    clients, lock_count, profile, lane, lane_count, started);
+            } catch (...) {
+                shard->report_failure(std::current_exception());
             }
-            if (c.kind != rdma::CompletionKind::Receive)
-                throw std::runtime_error("unexpected Mu client CQ completion");
-            const Message& m = c.message;
-            if (m.sender != c.peer)
-                throw std::runtime_error("Mu request sender mismatch");
-            const Kind kind = message_kind(m);
-            if (kind == Kind::Ready && !started) {
-                if (std::find(clients.begin(), clients.end(), c.peer) == clients.end() ||
-                    !ready.insert(c.peer).second)
-                    throw std::runtime_error("invalid Mu client readiness");
-                if (ready.size() == clients.size()) {
-                    started = true;
-                    for (NodeId id : clients) net.send(id, message(Kind::Ready, self));
-                }
-            } else if (kind == Kind::Stop && started) {
-                if (std::find(clients.begin(), clients.end(), c.peer) == clients.end() ||
-                    !finished.insert(c.peer).second)
-                    throw std::runtime_error("invalid Mu client shutdown");
-                if (finished.size() == clients.size())
-                    for (NodeId id : clients) net.send(id, message(Kind::Stop, self));
-            } else if ((kind == Kind::Acquire || kind == Kind::Release) && started) {
-                if (std::find(clients.begin(), clients.end(), c.peer) == clients.end() ||
-                    request_node(m.request) != c.peer || m.lock_id >= lock_count)
-                    throw std::runtime_error("invalid Mu mutation request");
-                // Validate the eight-byte representation *before* enqueueing,
-                // so an unrepresentable request never enters the committed log.
-                (void)pack_mu_command(m);
-                const size_t lane = lock_lane(m.lock_id, lane_count);
-                auto& shard = *lanes[lane];
-                if (!shard.requests.try_push(m))
-                    throw std::runtime_error("Mu mutation queue capacity exceeded");
-                if (profile) {
-                    if (kind == Kind::Acquire)
-                        shard.acquire_rx.fetch_add(1, std::memory_order_relaxed);
-                    else
-                        shard.release_rx.fetch_add(1, std::memory_order_relaxed);
-                }
-            } else {
-                throw std::runtime_error("unexpected Mu client message");
-            }
-        }
-        Action action{};
-        for (auto& shard : lanes) {
-            // A busy hot-lock lane must not starve other lanes on the shared
-            // client-communication thread. Drain a bounded fair batch.
-            size_t sent = 0;
-            while (sent++ < 64 && shard->responses.try_pop(action)) {
-                action.message.sender = self;
-                net.send(action.destination, action.message, 0, false);
-                if (profile)
-                    shard->responses_sent.fetch_add(1, std::memory_order_relaxed);
-            }
-        }
+        });
     }
+    // Lane zero's control loop owns the start/stop barrier.
+    mu_communication_loop(*lanes.front(), lanes, net, self, clients,
+                    lock_count, profile, 0, lane_count, started);
 }
 } // namespace lock

@@ -28,6 +28,8 @@ struct Bootstrap {
     uint64_t base, bytes;
 };
 static_assert(sizeof(Bootstrap) == 48);
+struct LaneBootstrap { uint32_t qpn, psn; };
+static_assert(sizeof(LaneBootstrap) == 8);
 enum class Tag : uint64_t { Receive = 1, Send = 2, Write = 3, Cas = 4 };
 uint64_t encode(Tag tag, NodeId peer, uint64_t token) {
     if (peer > 255 || token > kTokenMask)
@@ -123,18 +125,24 @@ std::vector<Peer> parse_peers(const std::string& spec) {
 }
 
 struct Transport::Impl {
+    struct ExtraQp {
+        ibv_qp* qp = nullptr;
+        uint32_t psn = 0;
+        uint32_t unsignaled_posted = 0;
+    };
     struct Connection {
         ibv_qp* qp = nullptr;
         std::vector<Message*> receives;
         uint32_t psn = 0;
         uint32_t unsignaled_posted = 0;
+        std::vector<ExtraQp> extra_qps;
         Bootstrap remote{};
     };
     Config cfg;
     ibv_context* ctx = nullptr;
     ibv_pd* pd = nullptr;
     ibv_cq* cq = nullptr;
-    ibv_cq* replication_cq = nullptr;
+    std::vector<ibv_cq*> replication_cqs;
     ibv_mr* mr = nullptr;
     void* mem = nullptr;
     uint16_t lid = 0;
@@ -145,6 +153,8 @@ struct Transport::Impl {
     explicit Impl(Config c) : cfg(std::move(c)) {
         if (!cfg.self || cfg.self > 255 || cfg.memory_bytes < kScratchOffset + 4096)
             throw std::invalid_argument("invalid local ID or registered memory size");
+        if (cfg.replication_lanes < 1 || cfg.replication_lanes > 8)
+            throw std::invalid_argument("replication lane count must be 1..8");
         scratch_next = cfg.memory_bytes - 16ULL * 1024 * 1024;
         if (cfg.receive_depth < 2 || cfg.receive_depth > 1024)
             throw std::invalid_argument("receive depth must be 2..1024");
@@ -170,8 +180,11 @@ struct Transport::Impl {
         cq = ibv_create_cq(ctx, 8192, nullptr, nullptr, 0);
         check(cq != nullptr, "ibv_create_cq");
         if (!cfg.replication_peers.empty()) {
-            replication_cq = ibv_create_cq(ctx, 8192, nullptr, nullptr, 0);
-            check(replication_cq != nullptr, "ibv_create_cq replication");
+            for (size_t lane = 0; lane < cfg.replication_lanes; ++lane) {
+                ibv_cq* lane_cq = ibv_create_cq(ctx, 8192, nullptr, nullptr, 0);
+                check(lane_cq != nullptr, "ibv_create_cq replication lane");
+                replication_cqs.push_back(lane_cq);
+            }
         }
         check(posix_memalign(&mem, 4096, align_up(cfg.memory_bytes, 4096)) == 0, "posix_memalign");
         std::memset(mem, 0, cfg.memory_bytes);
@@ -202,8 +215,8 @@ struct Transport::Impl {
             ibv_qp_init_attr attr{};
             const bool repl = std::find(cfg.replication_peers.begin(),
                 cfg.replication_peers.end(), peer.id) != cfg.replication_peers.end();
-            attr.send_cq = repl ? replication_cq : cq;
-            attr.recv_cq = repl ? replication_cq : cq;
+            attr.send_cq = repl ? replication_cqs.front() : cq;
+            attr.recv_cq = repl ? replication_cqs.front() : cq;
             attr.qp_type = IBV_QPT_RC;
             attr.cap.max_send_wr = kMaxSend;
             attr.cap.max_recv_wr = cfg.receive_depth;
@@ -220,6 +233,24 @@ struct Transport::Impl {
             check(!ibv_modify_qp(conn.qp, &init,
                   IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS),
                   "modify QP INIT");
+            if (repl && cfg.replication_lanes > 1) {
+                conn.extra_qps.reserve(cfg.replication_lanes - 1);
+                for (size_t lane = 1; lane < cfg.replication_lanes; ++lane) {
+                    ibv_qp_init_attr extra_attr = attr;
+                    extra_attr.send_cq = replication_cqs[lane];
+                    extra_attr.recv_cq = replication_cqs[lane];
+                    extra_attr.cap.max_recv_wr = 1;  // One-sided RDMA WRITE only.
+                    ExtraQp extra;
+                    extra.qp = ibv_create_qp(pd, &extra_attr);
+                    check(extra.qp != nullptr, "ibv_create_qp replication lane");
+                    extra.psn = static_cast<uint32_t>((0x2345 + cfg.self * 7919 +
+                                  peer.id * 131 + lane * 251) & 0xffffff);
+                    check(!ibv_modify_qp(extra.qp, &init,
+                          IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
+                          IBV_QP_ACCESS_FLAGS), "modify extra QP INIT");
+                    conn.extra_qps.push_back(extra);
+                }
+            }
             for (uint32_t slot = 0; slot < cfg.receive_depth; ++slot) {
                 recv_next = align_up(recv_next, alignof(Message));
                 if (recv_next + sizeof(Message) > kLogOffset)
@@ -232,10 +263,15 @@ struct Transport::Impl {
         }
     }
     ~Impl() {
-        for (auto& [id, conn] : connections) if (conn.qp) ibv_destroy_qp(conn.qp);
+        for (auto& [id, conn] : connections) {
+            for (auto& extra : conn.extra_qps)
+                if (extra.qp) ibv_destroy_qp(extra.qp);
+            if (conn.qp) ibv_destroy_qp(conn.qp);
+        }
         if (mr) ibv_dereg_mr(mr);
         if (mem) std::free(mem);
-        if (replication_cq) ibv_destroy_cq(replication_cq);
+        for (auto* lane_cq : replication_cqs)
+            if (lane_cq) ibv_destroy_cq(lane_cq);
         if (cq) ibv_destroy_cq(cq);
         if (pd) ibv_dealloc_pd(pd);
         if (ctx) ibv_close_device(ctx);
@@ -255,7 +291,7 @@ struct Transport::Impl {
         wr.sg_list = &sge; wr.num_sge = 1;
         check(!ibv_post_recv(c.qp, &wr, &bad), "post receive");
     }
-    void connect_qp(Connection& c, const Bootstrap& b) {
+    void connect_qp(ibv_qp* qp, uint32_t local_psn, const Bootstrap& b) {
         ibv_qp_attr rtr{};
         rtr.qp_state = IBV_QPS_RTR;
         rtr.path_mtu = IBV_MTU_1024;
@@ -268,31 +304,46 @@ struct Transport::Impl {
         rtr.ah_attr.sl = 0;
         rtr.ah_attr.src_path_bits = 0;
         rtr.ah_attr.port_num = cfg.ib_port;
-        check(!ibv_modify_qp(c.qp, &rtr, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+        check(!ibv_modify_qp(qp, &rtr, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
               IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
               IBV_QP_MIN_RNR_TIMER), "modify QP RTR");
         ibv_qp_attr rts{};
         rts.qp_state = IBV_QPS_RTS;
         rts.timeout = 14; rts.retry_cnt = 7; rts.rnr_retry = 7;
-        rts.sq_psn = c.psn; rts.max_rd_atomic = 1;
-        check(!ibv_modify_qp(c.qp, &rts, IBV_QP_STATE | IBV_QP_TIMEOUT |
+        rts.sq_psn = local_psn; rts.max_rd_atomic = 1;
+        check(!ibv_modify_qp(qp, &rts, IBV_QP_STATE | IBV_QP_TIMEOUT |
               IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
               IBV_QP_MAX_QP_RD_ATOMIC), "modify QP RTS");
     }
     void handshake(int fd, NodeId expected) {
         auto& c = conn(expected);
+        const size_t lanes = c.extra_qps.size() + 1;
         Bootstrap mine{kMagic, kWireVersion, cfg.self, c.qp->qp_num,
-                       c.psn, mr->rkey, lid, 0,
+                       c.psn, mr->rkey, lid, static_cast<uint32_t>(lanes),
                        reinterpret_cast<uint64_t>(mem), cfg.memory_bytes};
         Bootstrap theirs{};
         send_all(fd, &mine, sizeof(mine));
         read_all(fd, &theirs, sizeof(theirs));
         if (theirs.magic != kMagic || theirs.version != kWireVersion ||
             theirs.node != expected || theirs.bytes < kScratchOffset + 4096 ||
-            theirs.lid == 0)
-            throw std::runtime_error("invalid RDMA bootstrap from peer");
+            theirs.lid == 0 || theirs.reserved != lanes)
+            throw std::runtime_error("RDMA peer lane/bootstrap mismatch");
         c.remote = theirs;
-        connect_qp(c, theirs);
+        connect_qp(c.qp, c.psn, theirs);
+        for (size_t i = 0; i < c.extra_qps.size(); ++i) {
+            const LaneBootstrap local{c.extra_qps[i].qp->qp_num,
+                                      c.extra_qps[i].psn};
+            LaneBootstrap remote{};
+            send_all(fd, &local, sizeof(local));
+            read_all(fd, &remote, sizeof(remote));
+            if (!remote.qpn || remote.psn >= (1u << 24))
+                throw std::runtime_error("invalid replication lane bootstrap");
+            auto lane_bootstrap = theirs;
+            lane_bootstrap.qpn = remote.qpn;
+            lane_bootstrap.psn = remote.psn;
+            connect_qp(c.extra_qps[i].qp, c.extra_qps[i].psn,
+                       lane_bootstrap);
+        }
     }
     bool is_local(const void* p, size_t bytes) const {
         uintptr_t addr = reinterpret_cast<uintptr_t>(p);
@@ -388,13 +439,18 @@ bool Transport::write(NodeId peer, const void* p, size_t bytes,
     return signaled;
 }
 bool Transport::write_inline(NodeId peer, uint64_t value, size_t offset,
-                             WorkId id, bool signal) {
+                             WorkId id, bool signal, size_t lane) {
     auto& x = *impl_;
     if (offset % alignof(uint64_t))
         throw std::invalid_argument("unaligned Mu inline WRITE offset");
     x.verify_remote(peer, offset, sizeof(uint64_t));
     auto& c = x.conn(peer);
-    const bool signaled = signal || c.unsignaled_posted >= 15;
+    if (lane > c.extra_qps.size())
+        throw std::out_of_range("replication QP lane not configured");
+    ibv_qp* qp = lane ? c.extra_qps[lane - 1].qp : c.qp;
+    uint32_t& unsignaled = lane ? c.extra_qps[lane - 1].unsignaled_posted
+                                : c.unsignaled_posted;
+    const bool signaled = signal || unsignaled >= 15;
     ibv_sge sge{};
     sge.addr = reinterpret_cast<uintptr_t>(&value);
     sge.length = sizeof(value);
@@ -406,8 +462,8 @@ bool Transport::write_inline(NodeId peer, uint64_t value, size_t offset,
     wr.send_flags = IBV_SEND_INLINE | (signaled ? IBV_SEND_SIGNALED : 0);
     wr.wr.rdma.remote_addr = c.remote.base + offset;
     wr.wr.rdma.rkey = c.remote.rkey;
-    check(!ibv_post_send(c.qp, &wr, &bad), "post inline WRITE");
-    c.unsignaled_posted = signaled ? 0 : c.unsignaled_posted + 1;
+    check(!ibv_post_send(qp, &wr, &bad), "post inline WRITE");
+    unsignaled = signaled ? 0 : unsignaled + 1;
     return signaled;
 }
 void Transport::compare_swap(NodeId peer, uint64_t* result, size_t offset,
@@ -431,15 +487,17 @@ void Transport::compare_swap(NodeId peer, uint64_t* result, size_t offset,
     check(!ibv_post_send(x.conn(peer).qp, &wr, &bad), "post CAS");
 }
 void Transport::poll_into(std::vector<Completion>& result, int batch) {
-    poll_on_cq(result, batch, false);
+    poll_on_cq(result, batch, false, 0);
 }
-void Transport::poll_replication_into(std::vector<Completion>& result, int batch) {
-    poll_on_cq(result, batch, true);
+void Transport::poll_replication_into(std::vector<Completion>& result, int batch,
+                                       size_t lane) {
+    poll_on_cq(result, batch, true, lane);
 }
-void Transport::poll_on_cq(std::vector<Completion>& result, int batch, bool replication) {
+void Transport::poll_on_cq(std::vector<Completion>& result, int batch,
+                           bool replication, size_t lane) {
     auto& x = *impl_;
-    if (replication && !x.replication_cq)
-        throw std::runtime_error("replication CQ not configured");
+    if (replication && lane >= x.replication_cqs.size())
+        throw std::runtime_error("replication CQ lane not configured");
     if (batch <= 0 || batch > 4096) throw std::invalid_argument("invalid poll batch");
     // The benchmark always requests 64 CQEs. Avoid allocating this buffer
     // on every empty CQ poll; also reuse the caller's output vector.
@@ -450,7 +508,8 @@ void Transport::poll_on_cq(std::vector<Completion>& result, int batch, bool repl
         larger.resize(static_cast<size_t>(batch));
         wc = larger.data();
     }
-    int n = ibv_poll_cq(replication ? x.replication_cq : x.cq, batch, wc);
+    int n = ibv_poll_cq(replication ? x.replication_cqs[lane] : x.cq,
+                        batch, wc);
     check(n >= 0, "poll CQ");
     result.clear();
     result.reserve(static_cast<size_t>(n));

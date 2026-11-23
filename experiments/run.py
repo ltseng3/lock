@@ -125,6 +125,13 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
     result_dir.mkdir(parents=True, exist_ok=True)
     manifest = dict(case=case, name=name, valid=False, error=None,
                     nodes=[n.id for n in topo.nodes])
+    if remote.dry_run:
+        for node in topo.nodes:
+            start_node(remote, node, remote_dir, name,
+                       process_command(topo, node, suite, case, smoke))
+        manifest["dry_run"] = True
+        (result_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        return manifest
     try:
         remote.parallel(topo.nodes, lambda node: start_node(
             remote, node, remote_dir, name, process_command(topo, node, suite, case, smoke)))
@@ -173,7 +180,13 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
                 remote.collect(node, folder + "/node.log", result_dir / f"node-{node.id}.log")
             except Exception as exc:
                 manifest.setdefault("collection_errors", []).append(str(exc))
-        remote.parallel(topo.nodes, lambda node: kill_node(remote, node, folder))
+        for node in topo.nodes:
+            try:
+                kill_node(remote, node, folder)
+            except Exception as exc:
+                manifest.setdefault("cleanup_errors", []).append(str(exc))
+        if manifest.get("collection_errors") or manifest.get("cleanup_errors"):
+            manifest["valid"] = False
         (result_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
 
@@ -199,7 +212,8 @@ def main() -> int:
         raise ValueError("suite replica count does not match topology")
     if suite.get("mu_lanes", 1) != 1:
         raise ValueError("first implementation supports one Mu lane")
-    require_clean_tree()
+    if not args.dry_run:
+        require_clean_tree()
     commit = sha()
     remote_dir = args.remote_dir or f"/tmp/lock-{commit[:12]}"
     if not remote_dir.startswith("/tmp/lock-"):

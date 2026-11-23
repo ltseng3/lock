@@ -199,6 +199,15 @@ void ClientEngine::handle_order(const rdma::Completion& c) {
         saved.kind = rdma::CompletionKind::Receive;
         saved.peer = cfg_.replicas.front(); saved.message = earlier;
         handle_activation(saved);
+    } else if (op.predecessor == 0) {
+        // A committed predecessor-free ORDER acts as the start signal.
+        rdma::Completion synthetic{};
+        synthetic.kind = rdma::CompletionKind::Receive;
+        synthetic.peer = cfg_.replicas.front();
+        synthetic.message = message(Kind::Start, cfg_.replicas.front(),
+                                    op.lock, op.request);
+        synthetic.message.position = op.position;
+        handle_activation(synthetic);
     }
     if (auto found = early_handoff_.find(m.request); found != early_handoff_.end()) {
         Message earlier = found->second;

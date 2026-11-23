@@ -71,3 +71,9 @@ This is an engineering implementation with no verified fault recovery.
 Hardware latency, ordered commits, early/late notifications, the sidecar
 addressing, and operation under contention MUST be validated on the target
 RDMA devices; a green compilation/unit-test workflow is not sufficient.
+
+A predecessor-free committed ORDER is now sufficient to start the client
+without sending a second START message. For requests with a predecessor, the
+leader sends NEXT and the predecessor transfers ownership using HANDOFF.
+The client still verifies that ORDER came from the leader and preserves
+early-HANDOFF and late-NEXT handling.

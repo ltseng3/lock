@@ -167,3 +167,8 @@ is 512, adjustable with `--handoff-inflight-window`.
 
 The run is a hardware correctness/latency check first. No improvement relative
 to Mu should be asserted without matching workload and physical topology.
+
+On the uncontended handoff path, a committed ORDER with no predecessor acts
+as START; the leader does not send a redundant second control message.
+This reduces leader response traffic without changing the queued
+predecessor/NEXT/HANDOFF path.

@@ -27,7 +27,8 @@ int main() {
     auto mc = message(Kind::Acquire, 6, 17, c);
     assert(state.admit(ma).append.size() == 1);
     auto x = state.committed({0, ma});
-    assert(x.size() == 2 && message_kind(x[1].message) == Kind::Start);
+    assert(x.size() == 1 && message_kind(x[0].message) == Kind::Order &&
+           x[0].message.other == 0);
     assert(state.admit(mb).append.size() == 1);
     x = state.committed({1, mb});
     assert(x.size() == 2 && message_kind(x[1].message) == Kind::Next);
@@ -41,6 +42,7 @@ int main() {
     assert(progress.actions.size() == 2 && progress.append.size() == 1);
     assert(progress.append[0].request == c);
     x = state.committed({2, mc});
-    assert(x.size() == 2 && message_kind(x[1].message) == Kind::Start);
+    assert(x.size() == 1 && message_kind(x[0].message) == Kind::Order &&
+           x[0].message.other == 0);
     assert(x[0].message.position == 2);
 }

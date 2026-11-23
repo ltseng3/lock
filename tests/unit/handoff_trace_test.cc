@@ -30,15 +30,16 @@ int main() {
             Message m = ready.front();
             ready.pop_front();
             auto actions = state.committed({committed, m});
-            assert(actions.size() == 2);
+            assert(actions.size() == 1 || actions.size() == 2);
             assert(actions[0].message.position == committed);
             assert(actions[0].message.value == committed);
             assert(actions[0].message.request == requests[committed]);
-            // NEXT is never sent to a future request; START is valid after a fully
-            // observed release frontier empties the queue.
-            auto activation = message_kind(actions[1].message);
-            assert(activation == Kind::Start || activation == Kind::Next);
-            if (activation == Kind::Next) {
+            // An ORDER without a predecessor immediately activates ownership;
+            // otherwise NEXT notifies the already-ordered predecessor.
+            if (actions.size() == 1) {
+                assert(actions[0].message.other == 0);
+            } else {
+                assert(message_kind(actions[1].message) == Kind::Next);
                 assert(actions[1].message.other == m.request);
                 assert(actions[1].message.position + 1 == committed);
             }

@@ -44,11 +44,10 @@ std::vector<Action> HandoffState::committed(const Committed& item) {
     order.position = position;
     order.value = item.global_slot;
     std::vector<Action> result{{request_node(command.request), order}};
-    if (predecessor == 0) {
-        Message start = message(Kind::Start, 0, command.lock_id, command.request);
-        start.position = position;
-        result.push_back({request_node(command.request), start});
-    } else {
+    if (predecessor != 0) {
+        // ORDER with no predecessor already conveys a committed, immediately
+        // active ownership slot; no separate START RPC is necessary.
+        // When there is a predecessor, notify it about the next owner.
         Message next = message(Kind::Next, 0, command.lock_id, predecessor);
         next.other = command.request;
         next.position = predecessor_position;

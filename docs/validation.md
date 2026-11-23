@@ -95,3 +95,19 @@ still enforces FIFO waiting. Unit tests also cover 1/2/4/8 lane mapping,
 address uniqueness and bounds. CI cannot validate device-level CQ routing,
 multi-QP setup, NIC progress, per-lock exclusivity under contention, or any
 failure/recovery property. Start with low load before throughput sweeps.
+
+## Targeted and bounded handoff retirement checks
+
+The handoff leader no longer polls every active lock on every empty-CQ loop.
+Before committing an acquisition it checks only the same lock's retirement
+frontier, removing visible predecessors and preserving strict FIFO. Independently,
+each lane scans all active locks periodically (32-us minimum spacing) so an
+RDMA one-sided retirement marker is eventually acknowledged even when no more
+commits arrive. Active-list membership has an O(1) index maintained on
+swap-removal; unit tests cover targeted release, unrelated-lock isolation,
+out-of-order evidence, invalid identifiers, and full-scan progress after
+targeted removals.
+
+A 32-us periodic interval is a scheduling tradeoff, not a hardware durability
+guarantee. Progress and latency still require tests on the RDMA adapters,
+especially when multiple prepared successors exist for a contended lock.

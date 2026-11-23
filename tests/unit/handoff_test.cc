@@ -21,6 +21,10 @@ int main() {
     assert(rejected);
 
     HandoffState state(1000, 2);
+    bool bad_lock = false;
+    try { (void)state.retire_lock(1000, [](uint64_t) { return uint64_t{0}; }); }
+    catch (const std::out_of_range&) { bad_lock = true; }
+    assert(bad_lock);
     auto a = make_request_id(4, 1), b = make_request_id(5, 1), c = make_request_id(6, 1);
     auto ma = message(Kind::Acquire, 4, 17, a);
     auto mb = message(Kind::Acquire, 5, 17, b);

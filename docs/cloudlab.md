@@ -205,3 +205,25 @@ NEXT/HANDOFF; otherwise FIFO and direct handoff remain enforced.
 For mixed-backend suites, CAS uses a single unused lane setting even if
 `--mu-lanes` is higher, so the same sweep can compare CAS against sharded
 Mu/handoff without an incompatible CAS server option.
+
+## Handoff bounded retirement polling
+
+For Mu/handoff multilanes, the handoff leader checks the retirement markers of
+just the lock currently being committed before assigning a predecessor. It also
+performs a full active-lock scan at most once every **32 microseconds per lane**,
+because client one-sided marker WRITEs do not generate a leader completion CQE.
+This replaces the old full active-lock scan on every empty-CQ iteration and
+avoids tens of millions of redundant marker loads per second. Releases with
+no subsequent acquisitions still progress during periodic scans. The reader
+precomputes the base address of the sidecar marker array once per lane.
+Mu's replication path is unchanged.
+
+Compare one, two, and four lanes on the *same git commit* with the
+`/tmp/handoff-throughput.json` single-case uniform suite, and omit
+`--profile-leader` to avoid instrumentation overhead. Use distinct
+`--remote-dir` values for each lane count, without skipping deploy/build when
+changing lane count. Archive the resulting `METRICS` lines and commit SHA.
+The 32-us periodic check may increase some otherwise idle retirement-ACK
+latencies; test a contended Zipf workload as well as uniform before selecting a
+default lane count. The fast path and its hardware performance are not
+established by CI alone.

@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -63,6 +64,32 @@ void replication_loop(Shared& s, rdma::Transport& net,
         uint64_t loops = 0, commits = 0, write_cqe = 0, retire_reads = 0;
         uint64_t emitted = 0;
         size_t max_inflight = 0, max_pending = 0;
+        // The sidecar marker region is contiguous; compute its base once
+        // rather than checking offset arithmetic for every DMA-visible load.
+        auto* marker_base = static_cast<uint64_t*>(net.at(
+            handoff_marker_offset(net.memory_bytes(), 0),
+            capacity * sizeof(uint64_t)));
+        const std::function<uint64_t(uint64_t)> read_marker =
+            [&](uint64_t slot) {
+                ++retire_reads;
+                if (slot >= capacity)
+                    throw std::out_of_range("handoff marker slot out of range");
+                return std::atomic_ref<uint64_t>(marker_base[slot])
+                    .load(std::memory_order_acquire);
+            };
+        auto publish_retirement = [&](HandoffStep&& step) {
+            for (const auto& action : step.actions) {
+                submit_action(s, action);
+                ++emitted;
+            }
+            for (const auto& cmd : step.append)
+                append_pending.push_back(cmd);
+        };
+        // Never spin across the entire active-lock set on every empty-CQ
+        // iteration. Poll periodically for releases with no new commits,
+        // and check only the relevant lock before assigning a successor.
+        constexpr auto kRetirementScanPeriod = std::chrono::microseconds(32);
+        auto next_retirement_scan = Clock::now() + kRetirementScanPeriod;
         while (!s.stopped.load(std::memory_order_acquire)) {
             net.poll_replication_into(cqes, 64, lane);
             for (const auto& c : cqes) {
@@ -72,28 +99,21 @@ void replication_loop(Shared& s, rdma::Transport& net,
                 ++write_cqe;
             }
 
-            // Only inspect locks with committed, not-yet-retired entries.
-            // Retirement evidence is a client one-sided WRITE to the marker
-            // sidecar; the leader does not need an RPC for release.
-            auto retired = state.retire([&](uint64_t slot) {
-                ++retire_reads;
-                const size_t offset = handoff_marker_offset(net.memory_bytes(), slot);
-                auto* ptr = static_cast<uint64_t*>(net.at(offset, sizeof(uint64_t)));
-                return std::atomic_ref<uint64_t>(*ptr).load(std::memory_order_acquire);
-            });
-            for (const auto& action : retired.actions) {
-                submit_action(s, action);
-                ++emitted;
+            // Markers are written one-sidedly by clients and do not generate
+            // a leader CQE. Periodic scans guarantee eventual retirement even
+            // if no further acquisition or replication completion arrives.
+            const auto now = Clock::now();
+            if (now >= next_retirement_scan) {
+                publish_retirement(state.retire(read_marker));
+                next_retirement_scan = now + kRetirementScanPeriod;
             }
-            for (const auto& cmd : retired.append)
-                append_pending.push_back(cmd);
 
-            // Release verified, already-retired predecessors before
-            // assigning a predecessor to a newly committed acquisition.
-            // In particular, this avoids NEXT to a locally retired client
-            // if its marker is already visible to the leader.
-            // Commit and emit ORDER/NEXT/START in the global log order.
+            // Preserve the retirement-first optimization without repeatedly
+            // scanning unrelated active locks. This targeted check is done
+            // before each new commit gets assigned its immediate predecessor.
             while (auto committed = log.next_committed()) {
+                publish_retirement(state.retire_lock(
+                    committed->command.lock_id, read_marker));
                 ++commits;
                 for (const auto& action : state.committed(*committed)) {
                     submit_action(s, action);

@@ -87,6 +87,37 @@ int main() {
     assert(sparse.retire(no_marker).actions.empty());
     assert(probes == 2); // The lock was removed from the active list.
 
+    // When a committed holder is already retired, process its visible marker
+    // BEFORE committing the next prepared acquisition. The new ORDER must
+    // have predecessor=0 and be immediately active without NEXT/HANDOFF.
+    HandoffState released_first(4, 4);
+    auto first_id = make_request_id(4, 9001);
+    auto second_id = make_request_id(5, 9001);
+    auto first_req = message(Kind::Acquire, 4, 1, first_id);
+    auto second_req = message(Kind::Acquire, 5, 1, second_id);
+    assert(released_first.admit(first_req).append.size() == 1);
+    auto first_order = released_first.committed({0, first_req});
+    assert(first_order.size() == 1 && first_order[0].message.other == 0);
+    assert(released_first.admit(second_req).append.size() == 1);
+    auto released = released_first.retire([&](uint64_t slot) {
+        assert(slot == 0);
+        return first_id;
+    });
+    assert(released.actions.size() == 1);
+    assert(released.actions[0].message.request == first_id);
+    auto second_order = released_first.committed({1, second_req});
+    assert(second_order.size() == 1 && second_order[0].message.other == 0);
+    // When the marker is NOT visible, the successor still waits for
+    // predecessor-triggered handoff.
+    HandoffState occupied(4, 4);
+    assert(occupied.admit(first_req).append.size() == 1);
+    assert(occupied.committed({0, first_req}).size() == 1);
+    assert(occupied.admit(second_req).append.size() == 1);
+    auto waiting = occupied.committed({1, second_req});
+    assert(waiting.size() == 2 &&
+           waiting[0].message.other == first_id &&
+           message_kind(waiting[1].message) == Kind::Next);
+
     HandoffState corrupted(1,1);
     auto id = make_request_id(4,1);
     auto entry = message(Kind::Acquire,4,0,id);

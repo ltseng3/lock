@@ -77,3 +77,21 @@ without sending a second START message. For requests with a predecessor, the
 leader sends NEXT and the predecessor transfers ownership using HANDOFF.
 The client still verifies that ORDER came from the leader and preserves
 early-HANDOFF and late-NEXT handling.
+
+## Parallel Mu lanes: ordering and hardware boundary
+
+With `--mu-lanes=N`, each lock is assigned to exactly one lane by
+`lock_id % N`. The lane has an independent worker, quorum completion queue,
+and follower QPs; committed order is strict within a lane. Global log slots
+use `local_slot*N+lane` to preserve disjoint 8-byte header/marker sidecar
+addresses. There is no cross-lane global mutation order (distinct locks do
+not depend on such an order in the common-path prototype). All replicas
+must bootstrap the same number of lane QPs before clients start. Followers
+remain CPU-passive for one-sided writes.
+
+A regression trace verifies that retirement before committing a successor
+avoids assigning an already-retired predecessor, while a nonretired predecessor
+still enforces FIFO waiting. Unit tests also cover 1/2/4/8 lane mapping,
+address uniqueness and bounds. CI cannot validate device-level CQ routing,
+multi-QP setup, NIC progress, per-lock exclusivity under contention, or any
+failure/recovery property. Start with low load before throughput sweeps.

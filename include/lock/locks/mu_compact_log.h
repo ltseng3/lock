@@ -18,7 +18,8 @@ namespace lock {
 class MuCompactLog {
 public:
     MuCompactLog(rdma::Transport& net, std::vector<NodeId> replicas,
-                 size_t window, size_t capacity_limit = 0);
+                 size_t window, size_t capacity_limit = 0,
+                 size_t lane = 0, size_t lane_count = 1);
     uint64_t append(const Message& mutation);
     void on_write_complete(NodeId peer, WorkId work_id);
     std::optional<Committed> next_committed();
@@ -37,6 +38,8 @@ private:
     std::vector<Pending> ring_;
     size_t capacity_ = 0;
     size_t quorum_followers_ = 0;
+    size_t lane_ = 0;
+    size_t lane_count_ = 1;
     uint64_t next_ = 0;
     uint64_t applied_ = 0;
 };

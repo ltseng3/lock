@@ -1,16 +1,20 @@
 #include "lock/locks/mu_compact_log.h"
+#include "lock/locks/lane_layout.h"
 #include <algorithm>
 #include <stdexcept>
 
 namespace lock {
 MuCompactLog::MuCompactLog(rdma::Transport& net, std::vector<NodeId> replicas,
-                           size_t window, size_t capacity_limit)
-    : net_(net), ring_(window) {
+                           size_t window, size_t capacity_limit,
+                           size_t lane, size_t lane_count)
+    : net_(net), ring_(window), lane_(lane), lane_count_(lane_count) {
     if ((replicas.size() != 3 && replicas.size() != 5) ||
         std::find(replicas.begin(), replicas.end(), net.self()) == replicas.end())
         throw std::invalid_argument("Mu requires three or five replicas including leader");
     if (window == 0 || window > 4096)
         throw std::invalid_argument("invalid Mu log pipeline window");
+    if (lane_count_ == 0 || lane_count_ > 8 || lane_ >= lane_count_)
+        throw std::invalid_argument("invalid Mu log lane configuration");
     for (NodeId id : replicas)
         if (id != net.self()) followers_.push_back(id);
     quorum_followers_ = replicas.size() / 2;
@@ -25,26 +29,28 @@ MuCompactLog::MuCompactLog(rdma::Transport& net, std::vector<NodeId> replicas,
 uint64_t MuCompactLog::append(const Message& mutation) {
     if (inflight() >= ring_.size())
         throw std::runtime_error("Mu log admission window full");
-    if (next_ >= capacity_)
+    const uint64_t slot = compact_global_slot(next_, lane_, lane_count_);
+    if (slot >= capacity_)
         throw std::runtime_error("Mu replicated log exhausted: fail closed");
     const uint64_t word = pack_mu_command(mutation);
-    const uint64_t slot = next_++;
+    const uint64_t local_slot = next_++;
     const size_t offset = rdma::kLogOffset + slot * sizeof(uint64_t);
     *static_cast<uint64_t*>(net_.at(offset, sizeof(uint64_t))) = word;
-    auto& entry = ring_[slot % ring_.size()];
+    auto& entry = ring_[local_slot % ring_.size()];
     entry = {};
-    entry.slot = slot;
+    entry.slot = local_slot;
     entry.command = mutation;
     entry.remaining = static_cast<uint8_t>(quorum_followers_);
     for (size_t i = 0; i < followers_.size(); ++i) {
         // Rotate the majority subset to avoid always waiting on one follower.
         const size_t relative = (i + followers_.size() -
-                                 slot % followers_.size()) % followers_.size();
+                                 local_slot % followers_.size()) % followers_.size();
         const bool quorum = relative < quorum_followers_;
         if (quorum) entry.quorum_mask |= static_cast<uint8_t>(1u << i);
         // Source is copied by the inline WRITE before this call returns.
         // WorkId is the log slot+1, well within the transport's 48-bit tag.
-        net_.write_inline(followers_[i], word, offset, slot + 1, quorum);
+        net_.write_inline(followers_[i], word, offset, local_slot + 1,
+                          quorum, lane_);
     }
     return slot;
 }
@@ -78,6 +84,8 @@ std::optional<Committed> MuCompactLog::next_committed() {
     if (entry.slot != applied_)
         throw std::runtime_error("Mu log slot ordering violation");
     if (entry.remaining != 0) return std::nullopt;
-    return Committed{applied_++, entry.command};
+    const uint64_t global = compact_global_slot(applied_, lane_, lane_count_);
+    ++applied_;
+    return Committed{global, entry.command};
 }
 } // namespace lock

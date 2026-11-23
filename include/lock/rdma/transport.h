@@ -35,6 +35,9 @@ struct Config {
     // Leader-only Mu configuration: these peer QPs get a dedicated
     // replication CQ, separate from the client-communication CQ.
     std::vector<NodeId> replication_peers;
+    // Replica-to-replica links have this many separate QPs/CQs. Non-replica
+    // peers retain one QP and the standard bootstrap protocol.
+    size_t replication_lanes = 1;
 };
 
 std::vector<Peer> parse_peers(const std::string& spec);
@@ -56,12 +59,14 @@ public:
     // The eight-byte source is copied inline by the NIC at posting time;
     // it does not need a registered backing allocation.
     bool write_inline(NodeId peer, uint64_t value, size_t remote_offset,
-                      WorkId work_id, bool signal = true);
+                      WorkId work_id, bool signal = true,
+                      size_t lane = 0);
     void compare_swap(NodeId peer, uint64_t* result, size_t remote_offset,
                       uint64_t expected, uint64_t desired, WorkId work_id);
     // Reuse the caller's completion storage on the hot path.
     void poll_into(std::vector<Completion>& out, int batch = 64);
-    void poll_replication_into(std::vector<Completion>& out, int batch = 64);
+    void poll_replication_into(std::vector<Completion>& out, int batch = 64,
+                               size_t lane = 0);
     std::vector<Completion> poll(int batch = 64);
 
     // Offset-addressed memory is registered for LOCAL_WRITE and remote access.
@@ -72,7 +77,8 @@ public:
     size_t remote_memory_bytes(NodeId peer) const;
     NodeId self() const;
 private:
-    void poll_on_cq(std::vector<Completion>& out, int batch, bool replication);
+    void poll_on_cq(std::vector<Completion>& out, int batch, bool replication,
+                    size_t lane);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

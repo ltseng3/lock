@@ -172,3 +172,36 @@ On the uncontended handoff path, a committed ORDER with no predecessor acts
 as START; the leader does not send a redundant second control message.
 This reduces leader response traffic without changing the queued
 predecessor/NEXT/HANDOFF path.
+
+## Multiple independent Mu lanes
+
+The Mu and handoff backends support `--mu-lanes=N` (1–8; default 1).
+Each lock maps to lane `lock_id % N`, so the owner/queue and quorum-ordered
+log for that lock are always on a single thread. Different locks can commit
+concurrently, with a separate RC QP and completion queue per replica peer
+and lane. All replica nodes must run the same lane count; the runner forwards
+the setting to every node. There is no global ordering guarantee between
+different lanes or unrelated locks. Log slots are interleaved:
+`global_slot = local_slot * N + lane`, preserving the deterministic sidecar
+marker address and avoiding overlapping writes.
+
+For one handoff run with four lanes, use a single-case handoff suite:
+
+    python3 experiments/run.py --suite=/tmp/handoff-throughput.json --mu-lanes=4 --profile-leader --show-clients --remote-dir=/tmp/lock-handoff-4lane
+
+To measure the default single lane, omit `--mu-lanes`. Lane-count changes
+require a full deploy/rebuild and fresh process startup on every node.
+Multiple replication lanes increase CPU and NIC resource consumption and are
+not expected to help a workload focused on only one hot lock. The communication
+thread remains a shared per-node bottleneck. Hardware correctness and
+performance on target adapters remain unverified until tested.
+
+The handoff replication worker now checks completed client release markers
+before assigning predecessors to newly committed acquisitions. If a former
+holder has already retired and no other prepared predecessor exists, the
+successor's committed ORDER immediately starts ownership without an unnecessary
+NEXT/HANDOFF; otherwise FIFO and direct handoff remain enforced.
+
+For mixed-backend suites, CAS uses a single unused lane setting even if
+`--mu-lanes` is higher, so the same sweep can compare CAS against sharded
+Mu/handoff without an incompatible CAS server option.

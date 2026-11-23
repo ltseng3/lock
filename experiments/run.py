@@ -29,15 +29,17 @@ def cases(suite: dict):
     allowed = {"cas", "mu", "handoff"}
     if set(suite["backends"]) - allowed:
         raise ValueError("unknown backend")
-    for backend, distribution, outstanding, repeat in itertools.product(
-            suite["backends"], suite["distributions"],
+    for backend, distribution, workers, outstanding, repeat in itertools.product(
+            suite["backends"], suite["distributions"], suite.get("workers", [1]),
             suite["outstanding"], range(suite["repetitions"])):
         if outstanding < 1 or outstanding > 512:
             raise ValueError("outstanding must be 1..512")
         if distribution not in ("uniform", "zipf_0.5", "zipf_0.99"):
             raise ValueError("unsupported lock distribution")
+        if workers < 1 or workers > 16 or workers * outstanding > 512:
+            raise ValueError("logical workers * outstanding must be 1..512")
         yield dict(backend=backend, distribution=distribution,
-                   outstanding=outstanding, repeat=repeat)
+                   workers=workers, outstanding=outstanding, repeat=repeat)
 
 def arg(name: str, value) -> str:
     return f"--{name}={value}"
@@ -59,6 +61,7 @@ def process_command(topo: Topology, node, suite: dict, case: dict,
         arg("backend", case["backend"]),
         arg("locks", suite["locks"]),
         arg("outstanding", case["outstanding"]),
+        arg("workers", case.get("workers", 1)),
         arg("distribution", case["distribution"]),
         arg("mu-lanes", suite.get("mu_lanes", 1)),
         arg("prepared-window", suite.get("prepared_window", 8)),
@@ -116,7 +119,7 @@ def kill_node(remote: Remote, node, folder: str) -> None:
 def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
              remote_dir: str, output_dir: pathlib.Path, smoke: bool = False) -> dict:
     name = ("smoke" if smoke else
-            f"{case['backend']}-{case['distribution']}-w{case['outstanding']}-r{case['repeat']}")
+            f"{case['backend']}-{case['distribution']}-k{case.get('workers', 1)}-w{case['outstanding']}-r{case['repeat']}")
     folder = f"{remote_dir}/runs/{name}"
     result_dir = output_dir / name
     result_dir.mkdir(parents=True, exist_ok=True)
@@ -142,11 +145,20 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
                 if len(found) != 1:
                     raise ValueError(f"node {node_id} did not emit exactly one RESULT")
                 record = json.loads(found[0])
-                if record.get("node") != node_id or record.get("backend") != case["backend"]:
+                if (record.get("node") != node_id or
+                    record.get("backend") != case["backend"] or
+                    record.get("workers") != case.get("workers", 1) or
+                    record.get("outstanding_per_worker") != case["outstanding"]):
                     raise ValueError(f"invalid result identity from node {node_id}")
+                if record.get("measurement_seconds", 0) <= 0:
+                    raise ValueError(f"invalid measurement duration from node {node_id}")
                 if record.get("completed", 0) <= 0:
                     raise ValueError(f"no completed pairs from node {node_id}")
                 results.append(record)
+            for node in topo.nodes:
+                log = remote.command(node, f"cat {shlex.quote(folder + '/node.log')}")
+                if any(line.startswith("ERROR ") for line in log.splitlines()):
+                    raise RuntimeError(f"node {node.id} reported a runtime error")
             manifest["client_results"] = results
             manifest["total_completed"] = sum(x["completed"] for x in results)
             manifest["aggregate_goodput_pairs_per_second"] = sum(
@@ -219,6 +231,8 @@ def main() -> int:
     for case in all_cases:
         print("RUN", json.dumps(case), flush=True)
         record = run_case(remote, topo, suite, case, remote_dir, output_dir, args.smoke)
+        if not remote.dry_run and not record["valid"]:
+            raise RuntimeError(f"invalid run: {record['name']}")
         valid.append(record)
     print("OUTPUT", output_dir)
     print("VALID_TRIALS", len(valid))

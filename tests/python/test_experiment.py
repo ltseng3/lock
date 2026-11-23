@@ -21,7 +21,13 @@ class TestExperiment(unittest.TestCase):
         self.assertIn("1@10.10.1.1", self.topo.peers_arg())
 
     def test_case_count(self):
-        self.assertEqual(len(list(cases(self.suite))), 3 * 3 * 5 * 5)
+        self.assertEqual(len(list(cases(self.suite))), 3 * 3 * 2 * 5 * 5)
+
+    def test_five_replica_topology(self):
+        other = Topology.load(ROOT / "experiments/topologies/apt8_five.json")
+        self.assertEqual(other.replicas, (1,2,3,4,5))
+        self.assertEqual(other.clients, (6,7,8))
+        self.assertEqual(other.by_id(8).ssh_host, "10.10.1.8")
 
     def test_command_has_ips_and_identity(self):
         case = next(cases(self.suite))
@@ -29,6 +35,7 @@ class TestExperiment(unittest.TestCase):
         self.assertIn("--node-id=8", command)
         self.assertIn("--replicas=1,2,3", command)
         self.assertIn("--clients=4,5,6,7,8", command)
+        self.assertIn("--workers=1", command)
         self.assertIn("--peers=" + self.topo.peers_arg(), command)
 
 if __name__ == "__main__":

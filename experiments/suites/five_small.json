@@ -1,0 +1,28 @@
+{
+  "name": "five-small",
+  "backends": [
+    "cas",
+    "mu",
+    "handoff"
+  ],
+  "locks": 1000,
+  "distributions": [
+    "uniform",
+    "zipf_0.99"
+  ],
+  "workers": [
+    1
+  ],
+  "outstanding": [
+    1,
+    8
+  ],
+  "replicas": 5,
+  "mu_lanes": 1,
+  "prepared_window": 8,
+  "warmup_seconds": 2,
+  "duration_seconds": 5,
+  "watchdog_seconds": 60,
+  "repetitions": 1,
+  "seed": 2026
+}

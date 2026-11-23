@@ -268,6 +268,7 @@ void ClientEngine::handle_next(const rdma::Completion& c) {
     ++late_next_;
     deliver_handoff(m.request, it->second);
     it->second.sent = true;
+    if (it->second.acknowledged) retired_.erase(it);
 }
 
 void ClientEngine::handle(const rdma::Completion& c) {
@@ -277,6 +278,12 @@ void ClientEngine::handle(const rdma::Completion& c) {
             throw std::runtime_error("message sender mismatch");
         const Kind kind = message_kind(c.message);
         if (kind == Kind::Ready) return;
+        if (kind == Kind::Stop) {
+            if (c.peer != cfg_.replicas.front() || !stop_sent_ || server_stopped_)
+                throw std::runtime_error("invalid shutdown barrier");
+            server_stopped_ = true;
+            return;
+        }
         if (cfg_.backend == Backend::Handoff) {
             if (kind == Kind::Handoff) {
                 handle_activation(c);
@@ -292,7 +299,12 @@ void ClientEngine::handle(const rdma::Completion& c) {
                 if (it == retired_.end() || it->second.lock != c.message.lock_id ||
                     it->second.position != c.message.position)
                     throw std::runtime_error("invalid retirement ACK");
-                retired_.erase(it);
+                if (it->second.acknowledged)
+                    throw std::runtime_error("duplicate retirement ACK");
+                it->second.acknowledged = true;
+                // If no successor exists yet, keep the retired predecessor
+                // alive for an ORDER/NEXT committed after its release.
+                if (it->second.sent) retired_.erase(it);
                 return;
             }
             throw std::runtime_error("unexpected handoff control message");
@@ -384,7 +396,23 @@ void ClientEngine::run() {
         }
         for (auto& event : net_.poll()) handle(event);
         if (now >= measurement_end_ && requests_.empty() &&
-            retired_.empty() && marker_work_.empty()) break;
+            marker_work_.empty() && !stop_sent_) {
+            bool all_acknowledged = true;
+            for (const auto& [id, retired] : retired_) {
+                if (!retired.acknowledged) {
+                    all_acknowledged = false;
+                    break;
+                }
+            }
+            if (all_acknowledged) {
+                // A client is done issuing work but must keep serving late
+                // NEXT until every client has finished and the leader closes
+                // the shared queue. All marker writes have completed locally.
+                net_.send(leader, message(Kind::Stop, cfg_.self));
+                stop_sent_ = true;
+            }
+        }
+        if (stop_sent_ && server_stopped_) break;
     }
     if (!awaited_.empty()) throw std::runtime_error("outstanding CQEs at completion");
     print_result();

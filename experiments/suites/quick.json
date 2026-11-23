@@ -1,0 +1,32 @@
+{
+  "name": "quick-diagnostic",
+  "backends": [
+    "cas",
+    "mu",
+    "handoff"
+  ],
+  "locks": 1000,
+  "distributions": [
+    "uniform",
+    "zipf_0.99"
+  ],
+  "workers": [
+    1,
+    4
+  ],
+  "outstanding": [
+    1,
+    2,
+    4,
+    8,
+    16
+  ],
+  "replicas": 3,
+  "mu_lanes": 1,
+  "prepared_window": 8,
+  "warmup_seconds": 1,
+  "duration_seconds": 3,
+  "watchdog_seconds": 60,
+  "repetitions": 1,
+  "seed": 2026
+}

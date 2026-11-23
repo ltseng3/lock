@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import itertools
 import json
@@ -15,6 +16,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from cluster import Remote, Topology
+from metrics import SUMMARY_FIELDS, summarize, format_summary, format_client
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -154,10 +156,18 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
             wait_for(remote, tuple(topo.by_id(n) for n in topo.clients),
                      folder, "RESULT ", duration)
         if not smoke:
+            # Fetch all eight logs concurrently; serial SSH calls dominate short trials.
+            with ThreadPoolExecutor(max_workers=len(topo.nodes)) as pool:
+                logs = dict(zip(
+                    (n.id for n in topo.nodes),
+                    pool.map(lambda n: remote.command(
+                        n, f"cat {shlex.quote(folder + '/node.log')}"), topo.nodes)))
+            for node_id, log in logs.items():
+                if any(line.startswith("ERROR ") for line in log.splitlines()):
+                    raise RuntimeError(f"node {node_id} reported a runtime error")
             results = []
             for node_id in topo.clients:
-                node = topo.by_id(node_id)
-                log = remote.command(node, f"cat {shlex.quote(folder + '/node.log')}")
+                log = logs[node_id]
                 found = [line.split("RESULT ", 1)[1] for line in log.splitlines()
                          if line.startswith("RESULT ")]
                 if len(found) != 1:
@@ -173,29 +183,36 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
                 if record.get("completed", 0) <= 0:
                     raise ValueError(f"no completed pairs from node {node_id}")
                 results.append(record)
-            for node in topo.nodes:
-                log = remote.command(node, f"cat {shlex.quote(folder + '/node.log')}")
-                if any(line.startswith("ERROR ") for line in log.splitlines()):
-                    raise RuntimeError(f"node {node.id} reported a runtime error")
             manifest["client_results"] = results
-            manifest["total_completed"] = sum(x["completed"] for x in results)
-            manifest["aggregate_goodput_pairs_per_second"] = sum(
-                x["completed"] / x["measurement_seconds"] for x in results)
+            manifest["summary"] = summarize(case, results)
+            manifest["total_completed"] = manifest["summary"]["completed"]
+            manifest["aggregate_goodput_pairs_per_second"] = (
+                manifest["summary"]["aggregate_pairs_per_second"])
         manifest["valid"] = True
     except Exception as exc:
         manifest["error"] = str(exc)
         raise
     finally:
-        for node in topo.nodes:
-            try:
-                remote.collect(node, folder + "/node.log", result_dir / f"node-{node.id}.log")
-            except Exception as exc:
-                manifest.setdefault("collection_errors", []).append(str(exc))
-        for node in topo.nodes:
-            try:
-                kill_node(remote, node, folder)
-            except Exception as exc:
-                manifest.setdefault("cleanup_errors", []).append(str(exc))
+        # Parallelize collection and cleanup across hosts to keep fast sweeps fast.
+        with ThreadPoolExecutor(max_workers=len(topo.nodes)) as pool:
+            tasks = [(node, pool.submit(remote.collect, node, folder + "/node.log",
+                                       result_dir / f"node-{node.id}.log"))
+                     for node in topo.nodes]
+            for node, task in tasks:
+                try:
+                    task.result()
+                except Exception as exc:
+                    manifest.setdefault("collection_errors", []).append(
+                        f"node {node.id}: {exc}")
+        with ThreadPoolExecutor(max_workers=len(topo.nodes)) as pool:
+            tasks = [(node, pool.submit(kill_node, remote, node, folder))
+                     for node in topo.nodes]
+            for node, task in tasks:
+                try:
+                    task.result()
+                except Exception as exc:
+                    manifest.setdefault("cleanup_errors", []).append(
+                        f"node {node.id}: {exc}")
         if manifest.get("collection_errors") or manifest.get("cleanup_errors"):
             manifest["valid"] = False
         (result_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -206,7 +223,7 @@ def main() -> int:
     ap.add_argument("--topology", type=pathlib.Path,
                     default=ROOT / "experiments/topologies/apt8.json")
     ap.add_argument("--suite", type=pathlib.Path,
-                    default=ROOT / "experiments/suites/first.json")
+                    default=ROOT / "experiments/suites/quick.json")
     ap.add_argument("--ssh-user", default=None)
     ap.add_argument("--identity", default=None)
     ap.add_argument("--remote-dir", default=None)
@@ -216,9 +233,20 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--only-backend", choices=("cas", "mu", "handoff"))
     ap.add_argument("--max-trials", type=int)
+    ap.add_argument("--warmup-seconds", type=int, help="Override suite warmup")
+    ap.add_argument("--duration-seconds", type=int, help="Override suite measurement")
+    ap.add_argument("--repetitions", type=int, help="Override suite repetitions")
+    ap.add_argument("--show-clients", action="store_true",
+                    help="Print per-client throughput and latency details")
     args = ap.parse_args()
     topo = Topology.load(args.topology)
     suite = json.loads(args.suite.read_text())
+    for key in ("warmup_seconds", "duration_seconds", "repetitions"):
+        override = getattr(args, key)
+        if override is not None:
+            suite[key] = override
+    if suite["warmup_seconds"] < 0 or suite["duration_seconds"] < 1 or suite["repetitions"] < 1:
+        raise ValueError("warmup must be >=0; duration and repetitions must be >=1")
     if suite["replicas"] != len(topo.replicas):
         raise ValueError("suite replica count does not match topology")
     if suite.get("mu_lanes", 1) != 1:
@@ -256,13 +284,28 @@ def main() -> int:
         all_cases = [c for c in all_cases if c["backend"] == args.only_backend]
     if args.max_trials:
         all_cases = all_cases[:args.max_trials]
+    print(f"PLAN trials={len(all_cases)} warmup={suite['warmup_seconds']}s "
+          f"measurement={suite['duration_seconds']}s repetitions={suite['repetitions']}",
+          flush=True)
     valid = []
-    for case in all_cases:
-        print("RUN", json.dumps(case), flush=True)
-        record = run_case(remote, topo, suite, case, remote_dir, output_dir, args.smoke)
-        if not remote.dry_run and not record["valid"]:
-            raise RuntimeError(f"invalid run: {record['name']}")
-        valid.append(record)
+    with (output_dir / "summary.csv").open("w", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=SUMMARY_FIELDS)
+        writer.writeheader()
+        output.flush()
+        for case in all_cases:
+            print("RUN", json.dumps(case), flush=True)
+            record = run_case(remote, topo, suite, case, remote_dir, output_dir, args.smoke)
+            if not remote.dry_run and not record["valid"]:
+                raise RuntimeError(f"invalid run: {record['name']}")
+            valid.append(record)
+            if "summary" in record:
+                writer.writerow(record["summary"])
+                output.flush()
+                print("METRICS", format_summary(record["summary"]), flush=True)
+                if args.show_clients:
+                    for client in record["client_results"]:
+                        print("  CLIENT", format_client(client), flush=True)
+    print("SUMMARY_CSV", output_dir / "summary.csv")
     print("OUTPUT", output_dir)
     print("VALID_TRIALS", len(valid))
     return 0

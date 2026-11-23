@@ -105,7 +105,8 @@ void replication_loop(Shared& s, rdma::Transport& net,
             const auto now = Clock::now();
             if (now >= next_retirement_scan) {
                 publish_retirement(state.retire(read_marker));
-                next_retirement_scan = now + kRetirementScanPeriod;
+                // Space complete scans apart even if a scan itself is costly.
+                next_retirement_scan = Clock::now() + kRetirementScanPeriod;
             }
 
             // Preserve the retirement-first optimization without repeatedly

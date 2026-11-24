@@ -297,3 +297,24 @@ WRs); commits / replication_batches estimates the observed batch size.
 Rebuild all nodes on the same commit. Compare with prepared_window=64,
 peer READ off, and identical offered concurrency. The physical lane layout
 changed; do not reuse old log memory for recovery.
+
+## Empty critical section and single-lock diagnostics
+
+The client option `--critical-section-ops=0` runs an empty critical
+section (no application RDMA WR, not a zero-length WRITE). The default
+`1` retains one signaled eight-byte protected WRITE. All backends use the
+same workload selection; release and replication semantics are unchanged.
+The runner accepts the same option, as well as `--locks=1` for a single
+contended lock. Both settings appear in trial names, client results, the
+summary CSV and effective suite. A single lock maps to one lane; use
+`--mu-lanes=1` for the isolated single-lock diagnostic.
+
+Example (from the repository root):
+
+    python3 experiments/run.py --suite=/tmp/handoff-window-64.json --locks=1 --mu-lanes=1 --critical-section-ops=0 --replication-batch=16 --leader-comm-batch=64 --handoff-peer-read=0
+
+Use short measurement intervals for high-throughput empty-section runs:
+log capacity is still finite. Do not describe an empty-section result as
+application throughput with a protected WRITE. The goodput counter and
+acquisition timing definition remain unchanged. Handoff's local release
+completion boundary is still marker posting, unlike Mu's ACK boundary.

@@ -27,6 +27,12 @@ def cases(suite: dict):
     allowed = {"cas", "mu", "handoff"}
     if set(suite["backends"]) - allowed:
         raise ValueError("unknown backend")
+    locks = suite["locks"]
+    critical_section_ops = suite.get("critical_section_ops", 1)
+    if type(locks) is not int or not 1 <= locks <= 1000:
+        raise ValueError("locks must be an integer in 1..1000")
+    if type(critical_section_ops) is not int or critical_section_ops not in (0, 1):
+        raise ValueError("critical_section_ops must be 0 or 1")
     for backend, distribution, workers, outstanding, repeat in itertools.product(
             suite["backends"], suite["distributions"], suite.get("workers", [1]),
             suite["outstanding"], range(suite["repetitions"])):
@@ -37,7 +43,8 @@ def cases(suite: dict):
         if workers < 1 or workers > 16 or workers * outstanding > 512:
             raise ValueError("logical workers * outstanding must be 1..512")
         yield dict(backend=backend, distribution=distribution,
-                   workers=workers, outstanding=outstanding, repeat=repeat)
+                   workers=workers, outstanding=outstanding, repeat=repeat,
+                   locks=locks, critical_section_ops=critical_section_ops)
 
 def arg(name: str, value) -> str:
     return f"--{name}={value}"
@@ -53,6 +60,8 @@ def process_command(topo: Topology, node, suite: dict, case: dict,
     ]
     if smoke:
         return ["./build/lock_rdma_smoke", *common]
+    if node.role == "client":
+        common.append(arg("critical-section-ops", case["critical_section_ops"]))
     if node.role == "replica" and suite.get("profile_leader", False):
         common.append(arg("profile-leader", 1))
     if node.role == "replica" and case["backend"] in ("mu", "handoff"):
@@ -70,7 +79,7 @@ def process_command(topo: Topology, node, suite: dict, case: dict,
         arg("replicas", topo.server_ids()),
         arg("clients", topo.client_ids()),
         arg("backend", case["backend"]),
-        arg("locks", suite["locks"]),
+        arg("locks", case["locks"]),
         arg("outstanding", case["outstanding"]),
         arg("workers", case.get("workers", 1)),
         arg("distribution", case["distribution"]),
@@ -141,7 +150,8 @@ def kill_node(remote: Remote, node, folder: str) -> None:
 def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
              remote_dir: str, output_dir: pathlib.Path, smoke: bool = False) -> dict:
     name = ("smoke" if smoke else
-            f"{case['backend']}-{case['distribution']}-k{case.get('workers', 1)}-w{case['outstanding']}-r{case['repeat']}")
+            f"{case['backend']}-{case['distribution']}-k{case.get('workers', 1)}-w{case['outstanding']}"
+            f"-l{case['locks']}-cs{case['critical_section_ops']}-r{case['repeat']}")
     folder = f"{remote_dir}/runs/{name}"
     result_dir = output_dir / name
     result_dir.mkdir(parents=True, exist_ok=True)
@@ -185,7 +195,9 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
                 if (record.get("node") != node_id or
                     record.get("backend") != case["backend"] or
                     record.get("workers") != case.get("workers", 1) or
-                    record.get("outstanding_per_worker") != case["outstanding"]):
+                    record.get("outstanding_per_worker") != case["outstanding"] or
+                    record.get("locks") != case["locks"] or
+                    record.get("critical_section_ops") != case["critical_section_ops"]):
                     raise ValueError(f"invalid result identity from node {node_id}")
                 if record.get("measurement_seconds", 0) <= 0:
                     raise ValueError(f"invalid measurement duration from node {node_id}")
@@ -248,6 +260,10 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--only-backend", choices=("cas", "mu", "handoff"))
     ap.add_argument("--max-trials", type=int)
+    ap.add_argument("--locks", type=int, choices=range(1, 1001),
+                    metavar="1..1000", help="Override number of locks")
+    ap.add_argument("--critical-section-ops", type=int, choices=(0, 1),
+                    help="0: immediate release; 1: one completed 8-byte WRITE (default)")
     ap.add_argument("--warmup-seconds", type=int, help="Override suite warmup")
     ap.add_argument("--duration-seconds", type=int, help="Override suite measurement")
     ap.add_argument("--repetitions", type=int, help="Override suite repetitions")
@@ -270,6 +286,14 @@ def main() -> int:
     args = ap.parse_args()
     topo = Topology.load(args.topology)
     suite = json.loads(args.suite.read_text())
+    if args.locks is not None:
+        suite["locks"] = args.locks
+    if args.critical_section_ops is not None:
+        suite["critical_section_ops"] = args.critical_section_ops
+    suite.setdefault("critical_section_ops", 1)
+    if not args.smoke:
+        # Validate the workload before any remote deployment.
+        next(cases(suite), None)
     if args.profile_leader:
         suite["profile_leader"] = True
     for key, maximum, default in (("replication_batch", 16, 8),

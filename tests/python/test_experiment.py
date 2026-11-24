@@ -68,6 +68,25 @@ class TestExperiment(unittest.TestCase):
         self.assertIn("--handoff-inflight-window=256", leader)
         self.assertNotIn("--handoff-inflight-window=256", client)
 
+    def test_critical_section_mode_and_lock_count(self):
+        for ops in (0, 1):
+            tuned = dict(self.suite, locks=1, critical_section_ops=ops)
+            for backend in ("cas", "mu", "handoff"):
+                case = dict(next(cases(tuned)), backend=backend)
+                self.assertEqual(case["locks"], 1)
+                self.assertEqual(case["critical_section_ops"], ops)
+                for node in self.topo.nodes:
+                    args = process_command(self.topo, node, tuned, case)
+                    self.assertIn("--locks=1", args)
+                    self.assertEqual(f"--critical-section-ops={ops}" in args,
+                                     node.role == "client")
+        self.assertEqual(next(cases(self.suite))["critical_section_ops"], 1)
+        for invalid in (-1, 2, True, "0"):
+            with self.assertRaises(ValueError):
+                next(cases(dict(self.suite, critical_section_ops=invalid)))
+        with self.assertRaises(ValueError):
+            next(cases(dict(self.suite, locks=0)))
+
     def test_peer_read_only_on_handoff_clients(self):
         tuned = dict(self.suite, handoff_peer_read=True)
         for backend in ("cas", "mu", "handoff"):

@@ -116,6 +116,7 @@ class RecoveryControl:
             self.channels[node].send({
                 "kind": "arm",
                 "delay_ms": self.delay_ms if node == self.replicas[0] else None,
+                "trial_delay_ms": self.delay_ms,
             })
 
     def crash_and_promote(self):
@@ -178,15 +179,19 @@ def supervise(host, port, token, node, folder, timeout, argv):
     channel = None
     log = folder / "node.log"
     pid = folder / "pid"
+    supervisor_pid = folder / "control.pid"
+    supervisor_pid.write_text(str(os.getpid()) + "\n")
     try:
         channel = Channel(socket.create_connection((host, port), timeout), timeout)
         channel.send({"kind": "hello", "node": node, "token": token})
         arm = channel.receive()
         delay = arm.get("delay_ms")
-        if (arm.get("kind") != "arm" or
-                (delay is not None and (type(delay) is not int or delay <= 0))):
+        trial_delay = arm.get("trial_delay_ms")
+        if (arm.get("kind") != "arm" or type(trial_delay) is not int or
+                trial_delay <= 0 or (delay is not None and
+                (type(delay) is not int or delay != trial_delay))):
             raise RuntimeError("invalid supervisor arm")
-        channel.sock.settimeout(timeout + (delay or 0) / 1000)
+        channel.sock.settimeout(timeout + trial_delay / 1000)
         with log.open("wb") as output:
             proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
                                     stdout=output, stderr=subprocess.STDOUT)
@@ -203,7 +208,11 @@ def supervise(host, port, token, node, folder, timeout, argv):
             killed = time.monotonic_ns()
             proc.kill()
             returned = time.monotonic_ns()
-            code = proc.wait(timeout=timeout)
+            # Blocking waitpid avoids subprocess.wait(timeout)'s exponential
+            # sleep polling, which would itself add artificial outage.
+            # The controller's socket deadline and supervisor teardown bound
+            # the trial if kernel exit stalls.
+            code = proc.wait()
             exited = time.monotonic_ns()
             if code != -signal.SIGKILL:
                 raise RuntimeError("leader did not exit by SIGKILL")
@@ -241,6 +250,8 @@ def supervise(host, port, token, node, folder, timeout, argv):
                 pid.unlink()
         if channel is not None:
             channel.close()
+        if supervisor_pid.exists() and supervisor_pid.read_text().strip() == str(os.getpid()):
+            supervisor_pid.unlink()
 
 
 def main():

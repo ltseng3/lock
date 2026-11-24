@@ -111,9 +111,9 @@ def start_node(remote: Remote, node, remote_dir: str,
         # diagnostics and PID are separate from the server log and PID.
         cmd = shlex.join(control.agent_command(node.id, folder, argv))
         launch = (f"mkdir -p {shlex.quote(folder)}; cd {shlex.quote(remote_dir)}; "
-                  f"rm -f {shlex.quote(folder + '/pid')} {shlex.quote(folder + '/node.log')}; "
-                  f"nohup {cmd} > {shlex.quote(folder + '/control.log')} 2>&1 < /dev/null "
-                  f"& echo $! > {shlex.quote(folder + '/control.pid')}")
+                  f"rm -f {shlex.quote(folder + '/pid')} {shlex.quote(folder + '/node.log')} "
+                  f"{shlex.quote(folder + '/control.pid')}; "
+                  f"nohup {cmd} > {shlex.quote(folder + '/control.log')} 2>&1 < /dev/null &")
         remote.command(node, launch)
         return
     cmd = shlex.join(argv)

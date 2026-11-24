@@ -162,3 +162,45 @@ outstanding after retirement, mismatched proof, ring collision, local probe,
 and early HANDOFF. It also checks leader NEXT-before-ACK ordering.
 CI cannot establish coherent DMA visibility, remote READ progress,
 hardware exclusivity, or performance; physical testing remains required.
+
+## Compact batch replication invariants
+
+A lane owns a disjoint contiguous range of compact physical slots.
+The range length is rounded down to eight words; the final remainder
+is unused. All replicas must agree on memory size, lane count and
+layout. Handoff markers use the same physical slot index as their
+corresponding header. Neither log wraparound nor recovery is implemented.
+
+A batch is a nonempty contiguous range, copied into local log memory and
+posted inline to every follower. Every follower's signaled WRITE CQE
+identifies its exclusive end; validate completion against the FIFO of
+posted batch ends. The quorum prefix is the majority order statistic of
+follower prefixes (leader counts as one). Apply only entries below that
+prefix, once and in increasing lane-local order. No cross-lane total
+order is implied. The apply ring is bounded separately from the per-follower
+SQ credit (512 outstanding batches); a slow follower can exert backpressure
+even if a quorum is making progress. A partial verbs post or CQ error is
+fatal, not silently retried. A successful CQE is not a crash-persistent
+commit record, and recovery needs explicit epochs, fencing, a negotiated
+layout and a safe prefix reconstruction protocol.
+
+Communication batches group already available responses by destination
+without changing FIFO order on any client/lane QP. Copy received messages
+before reposting buffers. Tail SEND completions retire a bounded per-peer
+prefix of WR credits. A bounded staging batch retains responses when
+credits are unavailable; the existing inter-thread queue still fails
+closed on overflow. Barriers reserve SQ capacity and keep token zero.
+Do not add a delay waiting to fill a batch.
+
+### TODO: retirement reclamation outside the ordering hot path
+
+Keep the existing per-operation ReleaseAck for now. The client retires via
+one-sided marker WRITE and does not wait for ReleaseAck to complete an
+operation. ACKs reclaim client metadata and certify that any relevant
+NEXT precedes the ACK on that client's ordered lane QP. A future GC worker
+may batch/defer reclamation after the state owner removes retired heads;
+it must not mutate live lane state, race the QP owner, or send reclamation
+ahead of a queued NEXT. Use an ordered notification fence or explicit
+sequence watermark if moving delivery to a separate QP. Bound retained
+metadata, drain GC at shutdown, and specify how recovery fences stale
+notifications before changing the acknowledgment contract.

@@ -3,6 +3,8 @@
 #include "lock/locks/mu_state.h"
 #include "lock/locks/spsc_queue.h"
 #include "lock/locks/lane_layout.h"
+#include "lock/locks/leader_response_batch.h"
+#include <array>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -52,14 +54,14 @@ struct JoinWorkers {
 void replication_loop(Shared& s, rdma::Transport& net,
                       const std::vector<NodeId>& replicas,
                       size_t lock_count, size_t window, bool profile,
-                      size_t lane, size_t lane_count) {
+                      size_t lane, size_t lane_count, size_t replication_batch) {
     try {
         MuCompactLog log(net, replicas, window, 0, lane, lane_count);
         MuState state(lock_count);
         std::vector<rdma::Completion> completions;
         completions.reserve(64);
         auto profile_start = Clock::now();
-        uint64_t loops = 0, commits = 0, replication_cqe = 0;
+        uint64_t loops = 0, commits = 0, replication_cqe = 0, replication_batches = 0;
         size_t max_inflight = 0, max_pending = 0;
         while (!s.stopped.load(std::memory_order_acquire)) {
             // Only this thread touches the replica QPs and the replication CQ.
@@ -78,14 +80,21 @@ void replication_loop(Shared& s, rdma::Transport& net,
                     if (!s.responses.try_push(action))
                         throw std::runtime_error("Mu response queue capacity exceeded");
             }
-            Message request{};
+            std::array<Message, MuCompactLog::max_batch> batch;
             max_pending = std::max(max_pending, s.requests.size());
             size_t admitted = 0;
-            while (admitted++ < 64 && log.inflight() < window &&
-                   s.requests.try_pop(request)) {
-                if (lock_lane(request.lock_id, lane_count) != lane)
-                    throw std::runtime_error("Mu request routed to wrong lane");
-                log.append(request);
+            while (admitted < 64) {
+                const size_t limit = std::min({log.available(), replication_batch, 64 - admitted});
+                size_t count = 0;
+                while (count < limit && s.requests.try_pop(batch[count])) {
+                    if (lock_lane(batch[count].lock_id, lane_count) != lane)
+                        throw std::runtime_error("Mu request routed to wrong lane");
+                    ++count;
+                }
+                if (!count) break;
+                log.append_batch({batch.data(), count});
+                admitted += count;
+                ++replication_batches;
             }
             max_inflight = std::max(max_inflight, log.inflight());
 
@@ -105,6 +114,7 @@ void replication_loop(Shared& s, rdma::Transport& net,
                                   << " acquire_rx=" << acquire
                                   << " release_rx=" << release
                                   << " commits=" << commits
+                                  << " replication_batches=" << replication_batches
                                   << " replication_write_cqe=" << replication_cqe
                                   << " send_cqe=" << sends
                                   << " responses_sent=" << sent
@@ -114,7 +124,7 @@ void replication_loop(Shared& s, rdma::Transport& net,
                                   << std::endl;
                     }
                     profile_start = now;
-                    commits = replication_cqe = 0;
+                    commits = replication_cqe = replication_batches = 0;
                     max_inflight = max_pending = 0;
                 }
             }
@@ -130,12 +140,13 @@ void mu_communication_loop(
     rdma::Transport& net, NodeId self,
     const std::vector<NodeId>& clients, size_t lock_count,
     bool profile, size_t lane, size_t lane_count,
-    std::atomic<bool>& started) {
+    std::atomic<bool>& started, size_t communication_batch) {
     // Each worker owns client-facing QPs and CQ for exactly one lane.
     // Only lane zero runs Ready/Stop barriers.
     std::vector<rdma::Completion> completions;
     completions.reserve(64);
     std::set<NodeId> ready, finished;
+    LeaderResponseBatch responses(net, self, clients, lane, lane_count, communication_batch);
     while (!s.stopped.load(std::memory_order_acquire)) {
         if (lane == 0) {
             for (const auto& shard : lanes)
@@ -145,6 +156,7 @@ void mu_communication_loop(
         net.poll_communication_into(completions, 64, lane);
         for (const auto& c : completions) {
             if (c.kind == rdma::CompletionKind::Send) {
+                responses.completed(c.peer, c.work_id);
                 if (profile) s.send_cqe.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
@@ -191,16 +203,9 @@ void mu_communication_loop(
                 throw std::runtime_error("unexpected Mu lane message");
             }
         }
-        Action action{};
-        size_t sent = 0;
-        while (sent++ < 64 && s.responses.try_pop(action)) {
-            if (lock_lane(action.message.lock_id, lane_count) != lane)
-                throw std::runtime_error("Mu response routed to wrong lane");
-            action.message.sender = self;
-            net.send(action.destination, action.message, 0, false, lane);
-            if (profile)
-                s.responses_sent.fetch_add(1, std::memory_order_relaxed);
-        }
+        const size_t sent = responses.drain(s.responses);
+        if (profile && sent)
+            s.responses_sent.fetch_add(sent, std::memory_order_relaxed);
     }
 }
 
@@ -208,7 +213,11 @@ void run_mu_leader(rdma::Transport& net, NodeId self,
                    const std::vector<NodeId>& replicas,
                    const std::vector<NodeId>& clients, size_t lock_count,
                    size_t inflight_window, bool profile,
-                   size_t lane_count) {
+                   size_t lane_count, size_t replication_batch,
+                        size_t communication_batch) {
+    if (!replication_batch || replication_batch > MuCompactLog::max_batch ||
+        !communication_batch || communication_batch > LeaderResponseBatch::drain_limit)
+        throw std::invalid_argument("invalid leader batch size");
     if (lane_count < 1 || lane_count > 8)
         throw std::invalid_argument("invalid Mu lane count");
     std::vector<std::unique_ptr<Shared>> lanes;
@@ -224,7 +233,7 @@ void run_mu_leader(rdma::Transport& net, NodeId self,
         Shared* shard = lanes[lane].get();
         workers.emplace_back([&, shard, lane] {
             replication_loop(*shard, net, replicas, lock_count, inflight_window,
-                             profile, lane, lane_count);
+                             profile, lane, lane_count, replication_batch);
         });
     }
     for (size_t lane = 1; lane < lane_count; ++lane) {
@@ -232,7 +241,7 @@ void run_mu_leader(rdma::Transport& net, NodeId self,
         workers.emplace_back([&, shard, lane] {
             try {
                 mu_communication_loop(*shard, lanes, net, self,
-                    clients, lock_count, profile, lane, lane_count, started);
+                    clients, lock_count, profile, lane, lane_count, started, communication_batch);
             } catch (...) {
                 shard->report_failure(std::current_exception());
             }
@@ -240,6 +249,6 @@ void run_mu_leader(rdma::Transport& net, NodeId self,
     }
     // Lane zero's control loop owns the start/stop barrier.
     mu_communication_loop(*lanes.front(), lanes, net, self, clients,
-                    lock_count, profile, 0, lane_count, started);
+                    lock_count, profile, 0, lane_count, started, communication_batch);
 }
 } // namespace lock

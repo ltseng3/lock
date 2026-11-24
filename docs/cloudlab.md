@@ -280,3 +280,18 @@ normal HANDOFF after NEXT, so late-next counts need not fall. At clean
 shutdown, by-read equals redundant-handoffs across all clients.
 Run the updated RDMA smoke first, which now checks CPU-published word READ
 visibility, then low-concurrency and contended hardware trials.
+
+## Opportunistic leader batching
+
+Both replicated backends use lane-major contiguous compact headers and
+one signaled inline WRITE per available batch per follower.
+`--replication-batch=1..16` (default 8) sets the maximum entries per
+WRITE; `--leader-comm-batch=1..64` (default 64) bounds linked SEND and
+leader receive repost chains. Neither waits for a full batch or uses
+a batching timer. Batch size 1 is a same-version non-coalesced reference,
+not the older per-entry rotated-quorum algorithm. Followers remain passive.
+Leader profile includes replication_batches (logical batches, not per-peer
+WRs); commits / replication_batches estimates the observed batch size.
+Rebuild all nodes on the same commit. Compare with prepared_window=64,
+peer READ off, and identical offered concurrency. The physical lane layout
+changed; do not reuse old log memory for recovery.

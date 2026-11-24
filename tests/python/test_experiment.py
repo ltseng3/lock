@@ -80,6 +80,16 @@ class TestExperiment(unittest.TestCase):
         self.assertIn("--handoff-peer-read=0", process_command(
             self.topo, self.topo.by_id(4), self.suite, case))
 
+    def test_leader_batch_flags_only_on_replicated_servers(self):
+        tuned = dict(self.suite, replication_batch=16, leader_comm_batch=32)
+        for backend in ("cas", "mu", "handoff"):
+            case = dict(next(cases(self.suite)), backend=backend)
+            for node in self.topo.nodes:
+                args = process_command(self.topo, node, tuned, case)
+                expected = backend != "cas" and node.role == "replica"
+                self.assertEqual("--replication-batch=16" in args, expected)
+                self.assertEqual("--leader-comm-batch=32" in args, expected)
+
     def test_mu_lanes_stay_consistent_on_clients_and_replicas(self):
         # The transport bootstrap requires both ends of each client-leader
         # link to select the same number of QPs.

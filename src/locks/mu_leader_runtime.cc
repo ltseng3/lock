@@ -141,13 +141,13 @@ void mu_communication_loop(
     rdma::Transport& net, NodeId self,
     const std::vector<NodeId>& clients, size_t lock_count,
     bool profile, size_t lane, size_t lane_count,
-    std::atomic<bool>& started, size_t communication_batch) {
+    std::atomic<bool>& started, size_t communication_batch, Epoch epoch) {
     // Each worker owns client-facing QPs and CQ for exactly one lane.
     // Only lane zero runs Ready/Stop barriers.
     std::vector<rdma::Completion> completions;
     completions.reserve(64);
     std::set<NodeId> ready, finished;
-    LeaderResponseBatch responses(net, self, clients, lane, lane_count, communication_batch);
+    LeaderResponseBatch responses(net, self, clients, lane, lane_count, communication_batch, false, epoch);
     while (!s.stopped.load(std::memory_order_acquire)) {
         if (lane == 0) {
             for (const auto& shard : lanes)
@@ -167,6 +167,7 @@ void mu_communication_loop(
             if (m.sender != c.peer)
                 throw std::runtime_error("Mu client sender mismatch");
             const Kind kind = message_kind(m);
+            if (m.epoch != epoch) throw std::runtime_error("Mu request epoch mismatch");
             if (kind == Kind::Ready && lane == 0 &&
                 !started.load(std::memory_order_acquire)) {
                 if (std::find(clients.begin(), clients.end(), c.peer) == clients.end() ||
@@ -176,7 +177,7 @@ void mu_communication_loop(
                     started.store(true, std::memory_order_release);
                     std::cout << "MU_SERVICE_STARTED" << std::endl;
                     for (NodeId id : clients)
-                        net.send(id, message(Kind::Ready, self), 0, true, 0);
+                        net.send(id, message(Kind::Ready, self, 0, 0, epoch), 0, true, 0);
                 }
             } else if (kind == Kind::Stop && lane == 0 &&
                        started.load(std::memory_order_acquire)) {
@@ -185,7 +186,7 @@ void mu_communication_loop(
                     throw std::runtime_error("invalid Mu shutdown");
                 if (finished.size() == clients.size())
                     for (NodeId id : clients)
-                        net.send(id, message(Kind::Stop, self), 0, true, 0);
+                        net.send(id, message(Kind::Stop, self, 0, 0, epoch), 0, true, 0);
             } else if ((kind == Kind::Acquire || kind == Kind::Release) &&
                        started.load(std::memory_order_acquire)) {
                 if (std::find(clients.begin(), clients.end(), c.peer) == clients.end() ||
@@ -239,6 +240,7 @@ void run_mu_leader(rdma::Transport& net, NodeId self,
             if (!lanes.front()->responses.try_push(a))
                 throw std::runtime_error("recovery responses overflow");
     }
+    const Epoch epoch = recovery.promoted ? kReplacementEpoch : kInitialEpoch;
     std::atomic<bool> started{promotion != nullptr};
     // Join workers before destroying their shared start flag.
     JoinWorkers join{lanes, workers};
@@ -254,7 +256,7 @@ void run_mu_leader(rdma::Transport& net, NodeId self,
         workers.emplace_back([&, shard, lane] {
             try {
                 mu_communication_loop(*shard, lanes, net, self,
-                    clients, lock_count, profile, lane, lane_count, started, communication_batch);
+                    clients, lock_count, profile, lane, lane_count, started, communication_batch, epoch);
             } catch (...) {
                 shard->report_failure(std::current_exception());
             }
@@ -262,6 +264,6 @@ void run_mu_leader(rdma::Transport& net, NodeId self,
     }
     // Lane zero's control loop owns the start/stop barrier.
     mu_communication_loop(*lanes.front(), lanes, net, self, clients,
-                    lock_count, profile, 0, lane_count, started, communication_batch);
+                    lock_count, profile, 0, lane_count, started, communication_batch, epoch);
 }
 } // namespace lock

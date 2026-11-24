@@ -97,7 +97,7 @@ void ClientEngine::submit(size_t slot) {
     } else if (cfg_.backend == Backend::Mu) {
         op.phase = Phase::WaitGrant;
         net_.send(leader_,
-                  message(Kind::Acquire, cfg_.self, op.lock, op.request),
+                  message(Kind::Acquire, cfg_.self, op.lock, op.request, epoch_),
                   0, true, lock_lane(op.lock, cfg_.mu_lanes));
     } else {
         op.phase = Phase::WaitOrder;
@@ -152,7 +152,7 @@ void ClientEngine::release(size_t slot) {
     } else if (cfg_.backend == Backend::Mu) {
         if (recovery_paused_) return; // preserve WaitRelease for reconciliation
         net_.send(leader_,
-                  message(Kind::Release, cfg_.self, op.lock, op.request),
+                  message(Kind::Release, cfg_.self, op.lock, op.request, epoch_),
                   0, true, lock_lane(op.lock, cfg_.mu_lanes));
     } else {
         NodeId owner = cfg_.replicas[op.lock % cfg_.replicas.size()];
@@ -410,14 +410,15 @@ void ClientEngine::begin_mu_recovery() {
     recovery_notice_ = Clock::now();
     net_.fence_peer(leader_);
     leader_ = cfg_.replicas[1];
+    epoch_ = kReplacementEpoch;
     for (const auto& op : ops_) {
         if (op.phase == Phase::Idle) continue;
         if (op.phase != Phase::WaitGrant && op.phase != Phase::WaitRelease)
             throw std::runtime_error("unsupported recovery phase");
         net_.send(leader_, message(op.phase == Phase::WaitGrant ? Kind::RecoveryAcquire :
-            Kind::RecoveryRelease, cfg_.self, op.lock, op.request));
+            Kind::RecoveryRelease, cfg_.self, op.lock, op.request, epoch_));
     }
-    net_.send(leader_, message(Kind::RecoveryDone, cfg_.self));
+    net_.send(leader_, message(Kind::RecoveryDone, cfg_.self, 0, 0, epoch_));
 }
 void ClientEngine::handle(const rdma::Completion& c) {
     if (cfg_.mu_recovery) {
@@ -435,10 +436,12 @@ void ClientEngine::handle(const rdma::Completion& c) {
             c.peer == cfg_.replicas[1] && c.message.sender == c.peer) {
             const auto kind = message_kind(c.message);
             if (kind == Kind::RecoveryBegin && c.lane == 0) {
+                if (c.message.epoch != kReplacementEpoch)
+                    throw std::runtime_error("invalid recovery begin epoch");
                 begin_mu_recovery(); return;
             }
             if (kind == Kind::RecoveryReady && c.lane == 0) {
-                if (!recovery_started_ || recovery_ready_)
+                if (!recovery_started_ || recovery_ready_ || c.message.epoch != epoch_)
                     throw std::runtime_error("invalid client recovery ready");
                 recovery_ready_ = true; recovery_paused_ = false;
                 recovery_ready_time_ = Clock::now();
@@ -453,6 +456,8 @@ void ClientEngine::handle(const rdma::Completion& c) {
         if (c.message.sender != c.peer)
             throw std::runtime_error("message sender mismatch");
         const Kind kind = message_kind(c.message);
+        if (c.message.epoch != epoch_)
+            throw std::runtime_error("unexpected client message epoch");
         if (c.peer == leader_) {
             const bool control = kind == Kind::Ready || kind == Kind::Stop;
             if (control) {
@@ -603,7 +608,7 @@ void ClientEngine::run() {
         for (const auto& e : completions) {
             if (e.kind == rdma::CompletionKind::Receive) {
                 if (e.peer != leader || e.message.sender != leader ||
-                    message_kind(e.message) != Kind::Ready)
+                    message_kind(e.message) != Kind::Ready || e.message.epoch != epoch_)
                     throw std::runtime_error("invalid start barrier");
                 barrier = true;
             }
@@ -638,7 +643,7 @@ void ClientEngine::run() {
             // Every read winner has consumed its normal HANDOFF, all local
             // DMA has completed, and all retirements have been reclaimed.
             // Keep the registered region alive until the all-client barrier.
-            net_.send(leader_, message(Kind::Stop, cfg_.self));
+            net_.send(leader_, message(Kind::Stop, cfg_.self, 0, 0, epoch_));
             stop_sent_ = true;
         }
         if (stop_sent_ && server_stopped_) break;

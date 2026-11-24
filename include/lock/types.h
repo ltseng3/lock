@@ -7,7 +7,10 @@ using NodeId = uint32_t;
 using LockId = uint32_t;
 using RequestId = uint64_t;
 using WorkId = uint64_t;
-constexpr uint32_t kWireVersion = 1;
+using Epoch = uint16_t;
+constexpr uint16_t kWireVersion = 2;
+constexpr Epoch kInitialEpoch = 0;
+constexpr Epoch kReplacementEpoch = 1;
 inline RequestId make_request_id(NodeId node, uint64_t sequence) {
     if (node == 0 || node > 65535 || sequence == 0 || sequence >= (1ULL << 48))
         throw std::invalid_argument("request ID out of range");
@@ -33,16 +36,19 @@ struct Message {
     uint32_t sender = 0;
     uint32_t flags = 0;
     uint32_t lane = 0;
-    uint32_t version = kWireVersion;
+    uint16_t version = kWireVersion;
+    Epoch epoch = kInitialEpoch;
 };
 static_assert(sizeof(Message) == 64);
 static_assert(std::is_trivially_copyable_v<Message>);
-inline Message message(Kind kind, NodeId sender, LockId lock_id = 0, RequestId request = 0) {
+inline Message message(Kind kind, NodeId sender, LockId lock_id = 0, RequestId request = 0,
+                       Epoch epoch = kInitialEpoch) {
     Message m;
     m.kind = static_cast<uint32_t>(kind);
     m.sender = sender;
     m.lock_id = lock_id;
     m.request = request;
+    m.epoch = epoch;
     return m;
 }
 inline Kind message_kind(const Message& m) {

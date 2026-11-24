@@ -1,5 +1,6 @@
 #pragma once
 #include "lock/locks/lane_layout.h"
+#include "lock/locks/epoch_boundary.h"
 #include "lock/locks/mu_encoding.h"
 #include "lock/locks/mu_state.h"
 #include "lock/rdma/transport.h"
@@ -14,10 +15,10 @@ namespace lock {
 // Raw mode uses the identical layout but assumes atomic aligned word DMA.
 // The ordinary no-recovery layout is unchanged.
 inline size_t mu_recovery_capacity(size_t memory) {
-    constexpr size_t reserve = 16ULL * 1024 * 1024;
-    if (memory <= rdma::kLogOffset + reserve)
+    const size_t end = epoch_boundary_base(memory);
+    if (end <= rdma::kLogOffset)
         throw std::invalid_argument("recovery log memory too small");
-    return (memory - reserve - rdma::kLogOffset) / 9;
+    return (end - rdma::kLogOffset) / 9;
 }
 inline size_t mu_recovery_marker_offset(size_t memory, uint64_t slot) {
     const size_t capacity = mu_recovery_capacity(memory);

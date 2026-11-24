@@ -154,7 +154,7 @@ void test_log(rdma::Transport& net) {
 void test_recovered_log() {
     rdma::Config cfg; cfg.self = 2;
     // Small fake MR: enough room for 128 words and their byte sidecar.
-    cfg.memory_bytes = rdma::kLogOffset + 16ULL * 1024 * 1024 + 128 * 9;
+    cfg.memory_bytes = rdma::kLogOffset + 16ULL * 1024 * 1024 + kEpochBoundaryBytes + 128 * 9;
     rdma::Transport net(cfg);
     MuLogView view(net, true);
     require(view.capacity() == 128);

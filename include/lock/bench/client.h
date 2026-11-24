@@ -80,6 +80,7 @@ private:
     rdma::Transport& net_;
     ClientConfig cfg_;
     NodeId leader_ = 0;
+    Epoch epoch_ = kInitialEpoch;
     bool recovery_paused_ = false, recovery_started_ = false, recovery_ready_ = false;
     Clock::time_point trace_start_{}, recovery_notice_{}, recovery_ready_time_{}, first_resumed_{},
         last_old_completion_{}, failure_pause_{};

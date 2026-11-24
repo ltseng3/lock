@@ -22,9 +22,10 @@ public:
     static constexpr size_t sq_credit = 512;
     LeaderResponseBatch(rdma::Transport& net, NodeId self,
                         const std::vector<NodeId>& clients, size_t lane,
-                        size_t lane_count, size_t batch_size, bool gc = false)
+                        size_t lane_count, size_t batch_size, bool gc = false,
+                        Epoch epoch = kInitialEpoch)
         : net_(net), self_(self), lane_(lane), lane_count_(lane_count),
-          batch_size_(batch_size), gc_(gc), peers_(clients.size()) {
+          batch_size_(batch_size), gc_(gc), epoch_(epoch), peers_(clients.size()) {
         if (!batch_size || batch_size > drain_limit)
             throw std::invalid_argument("invalid leader communication batch");
         index_.fill(-1);
@@ -53,6 +54,7 @@ public:
                 if (lock_lane(a.message.lock_id, lane_count_) != lane_)
                     throw std::runtime_error("leader response routed to wrong lane");
                 a.message.sender = self_;
+                a.message.epoch = epoch_;
                 auto& p = client(a.destination);
                 if (gc_ && message_kind(a.message) == Kind::ReleaseAck) {
                     if (request_node(a.message.request) != a.destination)
@@ -102,8 +104,9 @@ private:
     };
     void flush_gc(PeerState& p) {
         if (!p.gc_count) return;
-        p.messages.push_back(retirement_gc_message(
-            self_, lane_, {p.gc_ids.data(), p.gc_count}));
+        auto m = retirement_gc_message(self_, lane_, {p.gc_ids.data(), p.gc_count});
+        m.epoch = epoch_;
+        p.messages.push_back(m);
         p.gc_count = 0;
         ++staged_;
     }
@@ -116,6 +119,7 @@ private:
     NodeId self_;
     size_t lane_, lane_count_, batch_size_, staged_ = 0;
     bool gc_;
+    Epoch epoch_;
     std::array<int, 256> index_;
     std::vector<PeerState> peers_;
 };

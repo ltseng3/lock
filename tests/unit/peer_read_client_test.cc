@@ -330,7 +330,7 @@ struct ClientEngineTestAccess {
         e.handle(receive(message(Kind::Grant, 1, la, a)));
         e.finish_empty_sections();
         require(e.ops_[0].phase == ClientEngine::Phase::WaitRelease);
-        e.handle(receive(message(Kind::RecoveryBegin, 2)));
+        e.handle(receive(message(Kind::RecoveryBegin, 2, 0, 0, kReplacementEpoch)));
         require(e.recovery_paused_ && e.leader_ == 2);
         require(message_kind(posted[posted.size()-3].message) == Kind::RecoveryRelease);
         require(posted[posted.size()-3].message.request == a);
@@ -339,12 +339,12 @@ struct ClientEngineTestAccess {
         require(message_kind(posted.back().message) == Kind::RecoveryDone);
         e.handle(receive(message(Kind::Grant, 1, lb, b))); // stale response ignored
         require(e.ops_[1].phase == ClientEngine::Phase::WaitGrant);
-        e.handle(receive(message(Kind::RecoveryReady, 2)));
-        e.handle(receive(message(Kind::ReleaseAck, 2, la, a)));
-        e.handle(receive(message(Kind::Grant, 2, lb, b)));
+        e.handle(receive(message(Kind::RecoveryReady, 2, 0, 0, kReplacementEpoch)));
+        e.handle(receive(message(Kind::ReleaseAck, 2, la, a, kReplacementEpoch)));
+        e.handle(receive(message(Kind::Grant, 2, lb, b, kReplacementEpoch)));
         e.finish_empty_sections();
         require(posted.back().peer == 2 && posted.back().message.request == b);
-        e.handle(receive(message(Kind::ReleaseAck, 2, lb, b)));
+        e.handle(receive(message(Kind::ReleaseAck, 2, lb, b, kReplacementEpoch)));
         require(e.requests_.empty());
     }
     static void run() {

@@ -70,7 +70,7 @@ void run_mu_standby(rdma::Transport& net, const std::vector<NodeId>& replicas,
     const NodeId replacement = replicas[1], other = replicas[2];
     if (net.self() == other) {
         // Certify a stable contiguous length only after local fencing.
-        Message seal = message(Kind::RecoverySeal, other);
+        Message seal = message(Kind::RecoverySeal, other, 0, 0, kReplacementEpoch);
         seal.position = frontier;
         seal.value = shadow->applied();
         net.send(replacement, seal, 1);
@@ -91,6 +91,7 @@ void run_mu_standby(rdma::Transport& net, const std::vector<NodeId>& replicas,
         for (const auto& e : events) {
             if (e.kind != rdma::CompletionKind::Receive || e.peer != other ||
                 e.message.sender != other || message_kind(e.message) != Kind::RecoverySeal ||
+                e.message.epoch != kReplacementEpoch ||
                 e.message.position > view.capacity() || e.message.value > e.message.position ||
                 sealed)
                 throw std::runtime_error("invalid standby seal");
@@ -136,11 +137,22 @@ void run_mu_standby(rdma::Transport& net, const std::vector<NodeId>& replicas,
         i += count;
     }
     const auto repaired = Clock::now();
+    // Both surviving replicas now have the same immutable prefix. Establish
+    // the next epoch on that fixed majority before authorizing any client.
+    const auto boundary = encode_epoch_boundary({kReplacementEpoch, recovered});
+    const auto boundary_offset = epoch_boundary_offset(net.memory_bytes(), kReplacementEpoch);
+    auto* local_boundary = static_cast<uint64_t*>(net.at(boundary_offset, sizeof(uint64_t)));
+    if (*local_boundary != 0) throw std::runtime_error("epoch boundary already exists");
+    if (!net.write_inline(other, boundary, boundary_offset, work))
+        throw std::runtime_error("epoch boundary WRITE must be signaled");
+    wait_completion(net, other, work++, rdma::CompletionKind::Write, deadline);
+    *local_boundary = boundary;
+    const auto epoch_committed = Clock::now();
     replay_to(*shadow, view, recovered);
     const auto replayed = Clock::now();
     // All old requests and responses are uncertain until clients report
     // their actual phases. No normal new-leader traffic before Ready.
-    for (NodeId c : clients) net.send(c, message(Kind::RecoveryBegin, replacement));
+    for (NodeId c : clients) net.send(c, message(Kind::RecoveryBegin, replacement, 0, 0, kReplacementEpoch));
     std::set<NodeId> finished;
     std::unordered_set<RequestId> reported;
     size_t active_reported = 0;
@@ -152,7 +164,7 @@ void run_mu_standby(rdma::Transport& net, const std::vector<NodeId>& replicas,
             if (e.kind == rdma::CompletionKind::Send && e.work_id == 0) continue;
             if (e.kind != rdma::CompletionKind::Receive || e.lane != 0 ||
                 std::find(clients.begin(), clients.end(), e.peer) == clients.end() ||
-                e.message.sender != e.peer || finished.contains(e.peer))
+                e.message.sender != e.peer || e.message.epoch != kReplacementEpoch || finished.contains(e.peer))
                 throw std::runtime_error("invalid client recovery event");
             const auto& m = e.message;
             auto k = message_kind(m);
@@ -186,7 +198,7 @@ void run_mu_standby(rdma::Transport& net, const std::vector<NodeId>& replicas,
     MuPromotion promotion{shadow->take_state(), std::move(pending), std::move(responses)};
     shadow.reset();
     const auto reconciled = Clock::now();
-    for (NodeId c : clients) net.send(c, message(Kind::RecoveryReady, replacement));
+    for (NodeId c : clients) net.send(c, message(Kind::RecoveryReady, replacement, 0, 0, kReplacementEpoch));
     const auto ready = Clock::now();
     std::cout << "MU_RECOVERY {"
               << "\"node\":" << replacement << ",\"local_length\":" << frontier
@@ -198,7 +210,10 @@ void run_mu_standby(rdma::Transport& net, const std::vector<NodeId>& replicas,
               << ",\"scan_ns\":" << ns(scanned-fenced)
               << ",\"seal_wait_ns\":" << ns(sealed_at-scanned)
               << ",\"repair_ns\":" << ns(repaired-sealed_at)
-              << ",\"replay_ns\":" << ns(replayed-repaired)
+              << ",\"epoch\":" << kReplacementEpoch
+              << ",\"epoch_first_slot\":" << recovered
+              << ",\"epoch_commit_ns\":" << ns(epoch_committed-repaired)
+              << ",\"replay_ns\":" << ns(replayed-epoch_committed)
               << ",\"reconcile_ns\":" << ns(reconciled-replayed)
               << ",\"ready_send_ns\":" << ns(ready-reconciled)
               << ",\"recovery_ns\":" << ns(ready-begin) << "}" << std::endl;

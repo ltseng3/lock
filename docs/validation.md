@@ -246,7 +246,8 @@ proof validation, and shutdown barrier remain necessary in both workloads.
 
 This branch supports one externally designated crash-stop replacement only:
 three replicas, one lane, empty critical sections, surviving clients, no
-rejoin or election. The controller must terminate R1 and notify R2/R3.
+rejoin or election. The controller must terminate R1 and notify R2/R3 with SIGUSR1. The signal
+handler only sets a flag; there is no filesystem polling in the replay loop.
 Fencing destroys the old peer's QPs before the stable-tail scan. Verify on
 the actual RNIC that destruction quiesces inbound writes; software tests
 cannot establish this. Unexpected peer errors remain fatal.

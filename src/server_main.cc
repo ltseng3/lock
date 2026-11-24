@@ -78,7 +78,10 @@ int main(int argc, char** argv) {
         recovery.enabled = recover != 0;
         recovery.publication = publication != 0;
         recovery.replay = replay != 0;
-        if (recovery.enabled && !leader) cfg.recoverable_peer = replicas.front();
+        if (recovery.enabled && !leader) {
+            cfg.recoverable_peer = replicas.front();
+            lock::install_mu_recovery_trigger();
+        }
         if (backend == lock::Backend::Mu ||
             backend == lock::Backend::Handoff) {
             // Every replica must bootstrap identical per-lane QPs, including
@@ -107,7 +110,7 @@ int main(int argc, char** argv) {
             } else if (recovery.enabled) {
                 lock::run_mu_standby(net, replicas, clients, lock_count, mu_inflight_window,
                     profile_requested, replication_batch, cfg.communication_batch, recovery,
-                    opt.require("mu-recovery-trigger"), opt.number("watchdog-seconds", 90));
+                    opt.number("watchdog-seconds", 90));
             } else {
                 // Follower NICs accept one-sided header WRITEs autonomously.
                 // No application-side polling in the measured path.

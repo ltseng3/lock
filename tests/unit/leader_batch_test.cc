@@ -14,6 +14,7 @@ struct Write {
     size_t offset;
     WorkId end;
     size_t lane;
+    size_t marker_offset = 0;
 };
 struct Send {
     NodeId peer;
@@ -40,7 +41,8 @@ struct Transport::Impl {
     Config cfg;
     std::vector<uint64_t> words;
     explicit Impl(Config c) : cfg(std::move(c)),
-        words((kLogOffset + 4096) / sizeof(uint64_t)) {}
+        words((cfg.memory_bytes < kDefaultMemoryBytes ? cfg.memory_bytes :
+               kLogOffset + 4096) / sizeof(uint64_t)) {}
 };
 Transport::Transport(Config c) : impl_(std::make_unique<Impl>(std::move(c))) {}
 Transport::~Transport() = default;
@@ -58,8 +60,8 @@ void Transport::write_inline_words(NodeId peer, std::span<const uint64_t> words,
     writes.push_back({peer, {words.begin(), words.end()}, offset, end, lane});
 }
 void Transport::write_published_words(NodeId peer, std::span<const uint64_t> words,
-                                     size_t offset, size_t, WorkId end, size_t lane) {
-    write_inline_words(peer, words, offset, end, lane);
+                                     size_t offset, size_t marker_offset, WorkId end, size_t lane) {
+    writes.push_back({peer, {words.begin(), words.end()}, offset, end, lane, marker_offset});
 }
 void Transport::send_batch(NodeId peer, std::span<const Message> messages,
                            WorkId end, size_t lane) {
@@ -149,6 +151,46 @@ void test_log(rdma::Transport& net) {
     rejected([&] { log.on_write_complete(3, 7); });
     rejected([&] { log.on_write_complete(5, 7); });
 }
+void test_recovered_log() {
+    rdma::Config cfg; cfg.self = 2;
+    // Small fake MR: enough room for 128 words and their byte sidecar.
+    cfg.memory_bytes = rdma::kLogOffset + 16ULL * 1024 * 1024 + 128 * 9;
+    rdma::Transport net(cfg);
+    MuLogView view(net, true);
+    require(view.capacity() == 128);
+    auto* data = view.words(0, 8);
+    auto* marks = view.marks(0, 8);
+    for (uint64_t i = 0; i < 5; ++i) data[i] = pack_mu_command(acquire(i+1));
+    marks[0] = marks[1] = marks[2] = marks[4] = 1;
+    require(view.scan(0) == 3); // a later nonzero word cannot fill a hole
+    require(view.command(2).request == make_request_id(6, 3));
+    marks[3] = 1;
+    require(view.scan(3) == 5);
+    // A payload with no publication is not recoverable, even if nonzero.
+    data[5] = pack_mu_command(acquire(6));
+    require(view.scan(5) == 5);
+    MuLogView raw(net, false);
+    require(raw.scan(0) == 6);
+    MuRecoveryConfig cfg_recovery;
+    cfg_recovery.enabled = cfg_recovery.promoted = true;
+    cfg_recovery.recovered = 5;
+    MuCompactLog log(net, {2,3}, 2, 0, 0, 1, cfg_recovery);
+    require(log.inflight() == 0 && !log.next_committed());
+    writes.clear();
+    const std::array next{acquire(6), acquire(7)};
+    log.append_batch(next);
+    require(writes.size() == 1 && writes[0].peer == 3 && writes[0].end == 7);
+    require(writes[0].offset == rdma::kLogOffset + 5*8);
+    require(writes[0].marker_offset == mu_recovery_marker_offset(cfg.memory_bytes, 5));
+    require(log.available() == 0 && !log.next_committed());
+    log.on_write_complete(3, 7);
+    auto a = log.next_committed();
+    require(a && a->global_slot == 5 && a->command.request == next[0].request);
+    auto b = log.next_committed();
+    require(b && b->global_slot == 6 && b->command.request == next[1].request);
+    require(!log.next_committed() && log.available() == 2);
+    writes.clear();
+}
 void test_gc_responses(rdma::Transport& net) {
     sends.clear();
     LeaderResponseBatch batch(net, 1, {6,7}, 1, 2, 8, true);
@@ -207,6 +249,7 @@ int main() {
     lock::rdma::Transport net(cfg);
     test_progress();
     test_log(net);
+    test_recovered_log();
     test_gc_responses(net);
     test_responses(net);
 }

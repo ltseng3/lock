@@ -105,15 +105,11 @@ def process_command(topo: Topology, node, suite: dict, case: dict,
 def start_node(remote: Remote, node, remote_dir: str,
                run_name: str, argv: list[str]) -> None:
     folder = f"{remote_dir}/runs/{run_name}"
-    recovery = "--mu-recovery=1" in argv and node.role == "replica"
-    if recovery:
-        argv = [*argv, arg("mu-recovery-trigger", folder + "/promote")]
     cmd = shlex.join(argv)
     script = (f"mkdir -p {shlex.quote(folder)} && cd {shlex.quote(remote_dir)} && "
               f"nohup {cmd} > {shlex.quote(folder + '/node.log')} 2>&1 < /dev/null &")
     # Keep PID and background job in the same remote shell; do not rely on ssh job control.
     launch = (f"mkdir -p {shlex.quote(folder)}; cd {shlex.quote(remote_dir)}; "
-              f"rm -f {shlex.quote(folder + '/promote')}; "
               f"nohup {cmd} > {shlex.quote(folder + '/node.log')} 2>&1 < /dev/null "
               f"& echo $! > {shlex.quote(folder + '/pid')}")
     remote.command(node, launch)
@@ -195,7 +191,8 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
             remote.command(old, f"kill -KILL \"$(cat {shlex.quote(folder + '/pid')})\"")
             killed = time.monotonic_ns()
             remote.parallel(tuple(topo.by_id(n) for n in topo.replicas[1:]),
-                            lambda n: remote.command(n, f"touch {shlex.quote(folder + '/promote')}"))
+                            lambda n: remote.command(n,
+                                f"kill -USR1 \"$(cat {shlex.quote(folder + '/pid')})\""))
             notified = time.monotonic_ns()
             manifest["injection"] = {
                 "configured_delay_ms": suite["crash_after_ms"],

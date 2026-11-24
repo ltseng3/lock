@@ -337,7 +337,8 @@ ownership proof and does not change the local release-completion boundary.
 
 Only Mu, 3 replicas, one lane, and empty sections are supported initially.
 R1 is killed with SIGKILL by the controller; R2 is the designated leader,
-R3 is the remaining follower. All clients survive. No detection/election.
+R3 is the remaining follower. All clients survive. The controller signals
+R2/R3 with SIGUSR1 after killing R1. No detection/election.
 
     python3 experiments/run.py --suite=experiments/suites/mu_recovery.json --remote-dir=/tmp/lock-mu-recovery
 

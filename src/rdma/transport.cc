@@ -138,6 +138,7 @@ struct Transport::Impl {
         uint32_t unsignaled_posted = 0;
         bool client_lanes = false;
         bool fenced = false;
+        bool failed = false;
         std::vector<ExtraQp> extra_qps;
         Bootstrap remote{};
     };
@@ -729,21 +730,35 @@ void Transport::poll_on_cq(std::vector<Completion>& result, int batch,
     check(n >= 0, "poll CQ");
     result.clear();
     result.reserve(static_cast<size_t>(n));
+    // If any CQE in this poll reports failure of the designated old leader,
+    // discard all its CQEs in this poll, including previously queued
+    // responses. A recovery snapshot will reconcile them. In particular,
+    // never repost receives on an errored QP.
+    if (x.cfg.recoverable_peer && n) {
+        auto& old = x.conn(x.cfg.recoverable_peer);
+        if (!old.fenced && !old.failed) {
+            for (int i = 0; i < n; ++i) {
+                const auto peer = static_cast<NodeId>((wc[i].wr_id >> 48) & 0xff);
+                if (peer == x.cfg.recoverable_peer && wc[i].status != IBV_WC_SUCCESS) {
+                    old.failed = true;
+                    Completion failure{};
+                    failure.kind = CompletionKind::PeerFailed; failure.peer = peer;
+                    result.push_back(failure);
+                    break;
+                }
+            }
+        }
+    }
     for (int i = 0; i < n; ++i) {
         auto& w = wc[i];
         NodeId peer = static_cast<NodeId>((w.wr_id >> 48) & 0xff);
         // Destruction may leave already queued CQEs. Do not repost a receive
         // or dereference a destroyed QP. Only the designated failed peer is
         // recoverable; all other errors remain fatal.
-        if (peer == x.cfg.recoverable_peer && x.conn(peer).fenced) continue;
-        if (w.status != IBV_WC_SUCCESS) {
-            if (peer != x.cfg.recoverable_peer || !peer)
-                throw std::runtime_error(std::string("CQ failure: ") + ibv_wc_status_str(w.status));
-            Completion failed{};
-            failed.kind = CompletionKind::PeerFailed; failed.peer = peer;
-            result.push_back(failed);
-            continue;
-        }
+        if (peer == x.cfg.recoverable_peer && peer &&
+            (x.conn(peer).fenced || x.conn(peer).failed)) continue;
+        if (w.status != IBV_WC_SUCCESS)
+            throw std::runtime_error(std::string("CQ failure: ") + ibv_wc_status_str(w.status));
         uint64_t token = w.wr_id & kTokenMask;
         Tag tag = static_cast<Tag>(w.wr_id >> 56);
         Completion c{};

@@ -2,7 +2,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
-#include <filesystem>
+#include <csignal>
 #include <iostream>
 #include <set>
 #include <thread>
@@ -11,6 +11,8 @@
 namespace lock {
 namespace {
 using Clock = std::chrono::steady_clock;
+volatile std::sig_atomic_t promote_requested = 0;
+void request_promotion(int) { promote_requested = 1; }
 uint64_t ns(Clock::duration d) {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(d).count();
 }
@@ -36,12 +38,15 @@ void wait_completion(rdma::Transport& net, NodeId peer, WorkId id,
     }
 }
 }
+void install_mu_recovery_trigger() {
+    if (std::signal(SIGUSR1, request_promotion) == SIG_ERR)
+        throw std::runtime_error("cannot install recovery trigger");
+}
 void run_mu_standby(rdma::Transport& net, const std::vector<NodeId>& replicas,
                    const std::vector<NodeId>& clients, size_t locks, size_t window,
                    bool profile, size_t replication_batch, size_t communication_batch,
-                   MuRecoveryConfig recovery, const std::string& trigger,
-                   size_t watchdog_seconds) {
-    if (!recovery.enabled || replicas.size() != 3 || trigger.empty() ||
+                   MuRecoveryConfig recovery, size_t watchdog_seconds) {
+    if (!recovery.enabled || replicas.size() != 3 ||
         net.self() == replicas.front())
         throw std::invalid_argument("invalid Mu standby configuration");
     MuLogView view(net, recovery.publication);
@@ -50,7 +55,7 @@ void run_mu_standby(rdma::Transport& net, const std::vector<NodeId>& replicas,
     // Poll only the next contiguous slot. With background replay disabled,
     // maintain the same cheap frontier scan but defer all state application.
     // The trigger is a controller notification, not a failure detector.
-    while (!std::filesystem::exists(trigger)) {
+    while (!promote_requested) {
         frontier = view.scan(frontier, 256);
         if (recovery.replay)
             replay_to(*shadow, view, safe_replay_prefix(frontier, window));

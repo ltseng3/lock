@@ -55,6 +55,9 @@ def process_command(topo: Topology, node, suite: dict, case: dict,
         return ["./build/lock_rdma_smoke", *common]
     if node.role == "replica" and suite.get("profile_leader", False):
         common.append(arg("profile-leader", 1))
+    if node.role == "replica" and case["backend"] in ("mu", "handoff"):
+        common.extend([arg("replication-batch", suite.get("replication_batch", 8)),
+                       arg("leader-comm-batch", suite.get("leader_comm_batch", 64))])
     if node.role == "replica" and case["backend"] == "mu":
         common.append(arg("mu-inflight-window", suite.get("mu_inflight_window", 512)))
     if node.role == "client" and case["backend"] == "handoff":
@@ -258,6 +261,10 @@ def main() -> int:
                     help="Handoff leader log in-flight limit (1..512; default 512)")
     ap.add_argument("--handoff-peer-read", type=int, choices=(0, 1),
                     help="Race one bounded predecessor READ with HANDOFF (default 0)")
+    ap.add_argument("--replication-batch", type=int, choices=range(1, 17),
+                    help="Maximum opportunistic compact log entries per WRITE (default 8)")
+    ap.add_argument("--leader-comm-batch", type=int, choices=range(1, 65),
+                    help="Maximum per-QP SEND/receive repost chain (default 64)")
     ap.add_argument("--mu-lanes", type=int, choices=range(1, 9),
                     help="Independent Mu/handoff replication lanes (1..8; default 1)")
     args = ap.parse_args()
@@ -265,6 +272,13 @@ def main() -> int:
     suite = json.loads(args.suite.read_text())
     if args.profile_leader:
         suite["profile_leader"] = True
+    for key, maximum, default in (("replication_batch", 16, 8),
+                                  ("leader_comm_batch", 64, 64)):
+        override = getattr(args, key)
+        if override is not None:
+            suite[key] = override
+        if not 1 <= suite.get(key, default) <= maximum:
+            raise ValueError(f"{key} must be 1..{maximum}")
     if args.mu_inflight_window is not None:
         suite["mu_inflight_window"] = args.mu_inflight_window
     if not 1 <= suite.get("mu_inflight_window", 512) <= 512:

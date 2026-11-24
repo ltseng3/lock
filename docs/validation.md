@@ -28,14 +28,13 @@ log order, so it need not appear inside the word. In this failure-free prototype
 there is no replay/leader takeover; log contents alone are not evidence of a
 crash-recoverable service.
 
-The Mu leader has one communication thread and one replication/state-application
+Each Mu lane has one communication thread and one replication/state-application
 thread. Each owns distinct RC QPs and a distinct CQ; two bounded SPSC queues
-carry validated mutations and committed responses. Mu replication WRITEs are
-8-byte inline one-sided RDMA WRITEs to every follower; follower processes sleep
-after initialization and do not poll CQs or run application logic in the measured
-path. A local record plus enough signaled follower WRITE completions establishes
-a quorum; the commit prefix is applied in global slot order. Full source
-messages remain only in the leader's bounded in-flight ring.
+carry validated mutations and committed responses. Mu replicates contiguous
+batches of 8-byte records via inline one-sided RDMA WRITEs to every follower;
+followers sleep after initialization. Quorum progress uses completed follower
+prefixes, applied in increasing lane-local order. Full source messages remain
+only in the leader's bounded in-flight ring.
 
 This change has unit tests for the encoding and concurrent queue. It has NOT
 been hardware-tested or validated for performance on CloudLab. Successful
@@ -83,8 +82,9 @@ early-HANDOFF and late-NEXT handling.
 With `--mu-lanes=N`, each lock is assigned to exactly one lane by
 `lock_id % N`. The lane has an independent worker, quorum completion queue,
 and follower QPs; committed order is strict within a lane. Global log slots
-use `local_slot*N+lane` to preserve disjoint 8-byte header/marker sidecar
-addresses. There is no cross-lane global mutation order (distinct locks do
+use contiguous lane ranges of cache-line-aligned length:
+`global_slot = lane * lane_capacity + local_slot`. The same global slot
+identifies both the header and its marker sidecar entry. There is no cross-lane global mutation order (distinct locks do
 not depend on such an order in the common-path prototype). All replicas
 must bootstrap the same number of lane QPs before clients start. Followers
 remain CPU-passive for one-sided writes.
@@ -162,3 +162,56 @@ outstanding after retirement, mismatched proof, ring collision, local probe,
 and early HANDOFF. It also checks leader NEXT-before-ACK ordering.
 CI cannot establish coherent DMA visibility, remote READ progress,
 hardware exclusivity, or performance; physical testing remains required.
+
+## Compact batch replication invariants
+
+A lane owns a disjoint contiguous range of compact physical slots.
+The range length is rounded down to eight words; the final remainder
+is unused. All replicas must agree on memory size, lane count and
+layout. Handoff markers use the same physical slot index as their
+corresponding header. Neither log wraparound nor recovery is implemented.
+
+A batch is a nonempty contiguous range, copied into local log memory and
+posted inline to every follower. Every follower's signaled WRITE CQE
+identifies its exclusive end; validate completion against the FIFO of
+posted batch ends. The quorum prefix is the majority order statistic of
+follower prefixes (leader counts as one). Apply only entries below that
+prefix, once and in increasing lane-local order. No cross-lane total
+order is implied. The apply ring is bounded separately from the per-follower
+SQ credit (512 outstanding batches); a slow follower can exert backpressure
+even if a quorum is making progress. A partial verbs post or CQ error is
+fatal, not silently retried. A successful CQE is not a crash-persistent
+commit record, and recovery needs explicit epochs, fencing, a negotiated
+layout and a safe prefix reconstruction protocol.
+
+Communication batches group already available responses by destination
+without changing FIFO order on any client/lane QP. Copy received messages
+before reposting buffers. Tail SEND completions retire a bounded per-peer
+prefix of WR credits. A bounded staging batch retains responses when
+credits are unavailable; the existing inter-thread queue still fails
+closed on overflow. Barriers reserve SQ capacity and keep token zero.
+Do not add a delay waiting to fill a batch.
+
+### TODO: retirement reclamation outside the ordering hot path
+
+Keep the existing per-operation ReleaseAck for now. The client retires via
+one-sided marker WRITE and does not wait for ReleaseAck to complete an
+operation. ACKs reclaim client metadata and certify that any relevant
+NEXT precedes the ACK on that client's ordered lane QP. A future GC worker
+may batch/defer reclamation after the state owner removes retired heads;
+it must not mutate live lane state, race the QP owner, or send reclamation
+ahead of a queued NEXT. Use an ordered notification fence or explicit
+sequence watermark if moving delivery to a separate QP. Bound retained
+metadata, drain GC at shutdown, and specify how recovery fences stale
+notifications before changing the acknowledgment contract.
+
+Hardware-free leader_batch tests exercise the production compact log and
+response sender through a recording transport: singleton flush, contiguous
+payloads and offsets, ring reuse with a late non-quorum CQE, three/five-node
+majority progress, malformed completions, slow-follower credits, and
+NEXT-before-ACK ordering across interleaved destination batches. These tests
+do not substitute for real verbs and multi-lane hardware testing.
+
+Both replication and response posting use the same fixed-capacity per-QP
+completion-prefix tracker. This avoids heap allocations for completion
+bookkeeping and makes exact CQE validation independent of the protocol.

@@ -14,12 +14,20 @@ int main() {
         for (uint32_t lock_id = 0; lock_id < 1024; ++lock_id)
             assert(lock_lane(lock_id, lane_count) == lock_id % lane_count);
         for (size_t lane = 0; lane < lane_count; ++lane) {
+            CompactLaneLayout layout(handoff_log_capacity(bytes), lane, lane_count);
+            assert(layout.global_slot(0) % 8 == 0);
+            assert(layout.global_slot(layout.capacity() - 1) <
+                   handoff_log_capacity(bytes));
+            if (lane + 1 < lane_count) {
+                CompactLaneLayout next(handoff_log_capacity(bytes), lane + 1, lane_count);
+                assert(layout.global_slot(layout.capacity() - 1) + 1 == next.global_slot(0));
+            }
             uint64_t previous = 0;
             for (uint64_t local = 0; local < 100; ++local) {
-                const auto slot = compact_global_slot(local, lane, lane_count);
-                assert(slot % lane_count == lane);
+                const auto slot = layout.global_slot(local);
+                assert(slot / layout.capacity() == lane);
                 assert(assigned_slots.insert(slot).second);
-                if (local) assert(slot == previous + lane_count);
+                if (local) assert(slot == previous + 1);
                 previous = slot;
                 const auto header = handoff_header_offset(bytes, slot);
                 const auto marker = handoff_marker_offset(bytes, slot);
@@ -34,7 +42,7 @@ int main() {
     catch (const std::invalid_argument&) { invalid = true; }
     assert(invalid);
     invalid = false;
-    try { (void)compact_global_slot(UINT64_MAX, 3, 4); }
+    try { (void)CompactLaneLayout(1024, 3, 4).global_slot(UINT64_MAX); }
     catch (const std::out_of_range&) { invalid = true; }
     assert(invalid);
 }

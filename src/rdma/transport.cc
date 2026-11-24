@@ -159,6 +159,8 @@ struct Transport::Impl {
         if (cfg.replication_lanes < 1 || cfg.replication_lanes > 8)
             throw std::invalid_argument("replication lane count must be 1..8");
         scratch_next = cfg.memory_bytes - 16ULL * 1024 * 1024;
+        if (!cfg.communication_batch || cfg.communication_batch > 64)
+            throw std::invalid_argument("communication batch must be 1..64");
         if (cfg.receive_depth < 2 || cfg.receive_depth > 1024)
             throw std::invalid_argument("receive depth must be 2..1024");
         int count = 0;
@@ -246,6 +248,8 @@ struct Transport::Impl {
             attr.cap.max_inline_data = 128;
             conn.qp = ibv_create_qp(pd, &attr);
             check(conn.qp != nullptr, "ibv_create_qp");
+            if (attr.cap.max_inline_data < 128 || attr.cap.max_send_wr < kMaxSend)
+                throw std::runtime_error("QP lacks requested inline or send capacity");
             conn.psn = static_cast<uint32_t>((0x2345 + cfg.self * 7919 + peer.id * 131) & 0xffffff);
             ibv_qp_attr init{};
             init.qp_state = IBV_QPS_INIT; init.pkey_index = 0;
@@ -270,6 +274,9 @@ struct Transport::Impl {
                     ExtraQp extra;
                     extra.qp = ibv_create_qp(pd, &extra_attr);
                     check(extra.qp != nullptr, "ibv_create_qp extra lane");
+                    if (extra_attr.cap.max_inline_data < 128 ||
+                        extra_attr.cap.max_send_wr < kMaxSend)
+                        throw std::runtime_error("extra QP lacks inline or send capacity");
                     extra.psn = static_cast<uint32_t>((0x2345 + cfg.self * 7919 +
                                   peer.id * 131 + lane * 251) & 0xffffff);
                     check(!ibv_modify_qp(extra.qp, &init,
@@ -326,21 +333,29 @@ struct Transport::Impl {
         if (it == connections.end()) throw std::invalid_argument("unknown RDMA peer");
         return it->second;
     }
-    void post_recv(NodeId peer, uint32_t slot, size_t lane = 0) {
+    void post_recv_batch(NodeId peer, std::span<const uint32_t> slots, size_t lane) {
         auto& c = conn(peer);
-        if (lane && (!c.client_lanes || lane > c.extra_qps.size()))
-            throw std::invalid_argument("receive QP lane not configured");
+        if (slots.empty() || slots.size() > 64 ||
+            (lane && (!c.client_lanes || lane > c.extra_qps.size())))
+            throw std::invalid_argument("invalid receive batch or lane");
         ibv_qp* qp = lane ? c.extra_qps[lane - 1].qp : c.qp;
-        Message* buffer = lane ? c.extra_qps[lane - 1].receives.at(slot)
-                               : c.receives.at(slot);
-        ibv_sge sge{};
-        sge.addr = reinterpret_cast<uintptr_t>(buffer);
-        sge.length = sizeof(Message); sge.lkey = mr->lkey;
-        ibv_recv_wr wr{}, *bad = nullptr;
-        // RECEIVE WR identifiers carry the lane and per-QP receive index.
-        wr.wr_id = encode(Tag::Receive, peer, lane * cfg.receive_depth + slot);
-        wr.sg_list = &sge; wr.num_sge = 1;
-        check(!ibv_post_recv(qp, &wr, &bad), "post receive");
+        auto& receives = lane ? c.extra_qps[lane - 1].receives : c.receives;
+        std::array<ibv_sge, 64> sges;
+        std::array<ibv_recv_wr, 64> wrs;
+        for (size_t i = 0; i < slots.size(); ++i) {
+            auto& sge = sges[i]; sge = {};
+            sge.addr = reinterpret_cast<uintptr_t>(receives.at(slots[i]));
+            sge.length = sizeof(Message); sge.lkey = mr->lkey;
+            auto& wr = wrs[i]; wr = {};
+            wr.wr_id = encode(Tag::Receive, peer, lane * cfg.receive_depth + slots[i]);
+            wr.sg_list = &sge; wr.num_sge = 1;
+            wr.next = i + 1 < slots.size() ? &wrs[i + 1] : nullptr;
+        }
+        ibv_recv_wr* bad = nullptr;
+        check(!ibv_post_recv(qp, wrs.data(), &bad), "post receive batch");
+    }
+    void post_recv(NodeId peer, uint32_t slot, size_t lane = 0) {
+        post_recv_batch(peer, std::span<const uint32_t>(&slot, 1), lane);
     }
     void connect_qp(ibv_qp* qp, uint32_t local_psn, const Bootstrap& b) {
         ibv_qp_attr rtr{};
@@ -522,6 +537,54 @@ bool Transport::write_inline(NodeId peer, uint64_t value, size_t offset,
     unsignaled = signaled ? 0 : unsignaled + 1;
     return signaled;
 }
+void Transport::write_inline_words(NodeId peer, std::span<const uint64_t> words,
+                                   size_t offset, WorkId end, size_t lane) {
+    auto& x = *impl_;
+    if (words.empty() || words.size() > 16 || !end || offset % alignof(uint64_t))
+        throw std::invalid_argument("invalid compact inline WRITE batch");
+    x.verify_remote(peer, offset, words.size_bytes());
+    auto& c = x.conn(peer);
+    if (lane > c.extra_qps.size() || c.client_lanes)
+        throw std::invalid_argument("invalid replication batch QP");
+    ibv_qp* qp = lane ? c.extra_qps[lane - 1].qp : c.qp;
+    ibv_sge sge{};
+    sge.addr = reinterpret_cast<uintptr_t>(words.data());
+    sge.length = static_cast<uint32_t>(words.size_bytes());
+    ibv_send_wr wr{}, *bad = nullptr;
+    wr.wr_id = encode(Tag::Write, peer, end);
+    wr.sg_list = &sge; wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_WRITE;
+    wr.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
+    wr.wr.rdma.remote_addr = c.remote.base + offset;
+    wr.wr.rdma.rkey = c.remote.rkey;
+    check(!ibv_post_send(qp, &wr, &bad), "post compact WRITE batch");
+}
+void Transport::send_batch(NodeId peer, std::span<const Message> messages,
+                           WorkId end, size_t lane) {
+    auto& x = *impl_; auto& c = x.conn(peer);
+    if (!x.connected || !c.client_lanes || lane > c.extra_qps.size() ||
+        messages.empty() || messages.size() > 64 || !end)
+        throw std::invalid_argument("invalid client SEND batch");
+    ibv_qp* qp = lane ? c.extra_qps[lane - 1].qp : c.qp;
+    std::array<ibv_sge, 64> sges;
+    std::array<ibv_send_wr, 64> wrs;
+    for (size_t i = 0; i < messages.size(); ++i) {
+        auto& sge = sges[i]; sge = {};
+        sge.addr = reinterpret_cast<uintptr_t>(&messages[i]);
+        sge.length = sizeof(Message);
+        auto& wr = wrs[i]; wr = {};
+        const bool tail = i + 1 == messages.size();
+        wr.wr_id = encode(Tag::Send, peer, tail ? end : 0);
+        wr.sg_list = &sge; wr.num_sge = 1;
+        wr.opcode = IBV_WR_SEND;
+        wr.send_flags = IBV_SEND_INLINE | (tail ? IBV_SEND_SIGNALED : 0);
+        wr.next = tail ? nullptr : &wrs[i + 1];
+    }
+    ibv_send_wr* bad = nullptr;
+    // On partial posting, stop the run rather than retry and duplicate SENDs.
+    check(!ibv_post_send(qp, wrs.data(), &bad), "post client SEND batch");
+    (lane ? c.extra_qps[lane - 1].unsignaled_posted : c.unsignaled_posted) = 0;
+}
 void Transport::read_word(NodeId peer, uint64_t* result, size_t offset,
                           WorkId id) {
     auto& x = *impl_;
@@ -623,7 +686,10 @@ void Transport::poll_on_cq(std::vector<Completion>& result, int batch,
             c.kind = CompletionKind::Receive;
             c.lane = recv_lane;
             c.message = *receivers[recv_slot];
-            x.post_recv(peer, static_cast<uint32_t>(recv_slot), recv_lane);
+            if (group != PollGroup::Communication || x.cfg.communication_batch == 1)
+                x.post_recv(peer, static_cast<uint32_t>(recv_slot), recv_lane);
+            else if (recv_lane != lane)
+                throw std::runtime_error("receive on wrong communication CQ");
             break;
         }
         case Tag::Send: c.kind = CompletionKind::Send; break;
@@ -637,6 +703,26 @@ void Transport::poll_on_cq(std::vector<Completion>& result, int batch,
         default: throw std::runtime_error("unexpected CQ work ID tag");
         }
         result.push_back(c);
+    }
+    // Copy every message before returning its DMA buffer to the RNIC.
+    // This CQ belongs to one lane, so grouping by peer preserves QP ownership.
+    if (group == PollGroup::Communication && x.cfg.communication_batch > 1 && n) {
+        std::array<bool, 256> seen{};
+        std::array<uint32_t, 64> slots;
+        for (const auto& c : result) {
+            if (c.kind != CompletionKind::Receive || seen[c.peer]) continue;
+            seen[c.peer] = true;
+            size_t count = 0;
+            for (const auto& r : result) {
+                if (r.kind != CompletionKind::Receive || r.peer != c.peer) continue;
+                slots[count++] = static_cast<uint32_t>(r.work_id % x.cfg.receive_depth);
+                if (count == x.cfg.communication_batch) {
+                    x.post_recv_batch(c.peer, {slots.data(), count}, lane);
+                    count = 0;
+                }
+            }
+            if (count) x.post_recv_batch(c.peer, {slots.data(), count}, lane);
+        }
     }
 }
 std::vector<Completion> Transport::poll(int batch) {

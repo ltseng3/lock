@@ -1,46 +1,44 @@
 #pragma once
+#include "lock/locks/lane_layout.h"
 #include "lock/locks/mu_encoding.h"
 #include "lock/locks/replicated_log.h"
+#include "lock/locks/replication_progress.h"
 #include "lock/rdma/transport.h"
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace lock {
-// Eight-byte, inline-replicated append-only log for compact Acquire/Release
-// entries. Local bookkeeping is a bounded in-flight ring. A caller can limit
-// log capacity to leave a contiguous sidecar region for per-slot metadata.
-//
-// The leader writes to every follower but requires the completion of a fixed
-// majority subset. No follower CPU receives or applies log records in the
-// failure-free path; the NIC handles RDMA WRITEs.
+// Single-owner, append-only compact log for one lane. Headers are written
+// to all followers in contiguous inline batches. Quorum progress and applied
+// state are distinct prefixes; only next_committed exposes ordered commands.
 class MuCompactLog {
 public:
+    static constexpr size_t max_batch = 16;
     MuCompactLog(rdma::Transport& net, std::vector<NodeId> replicas,
                  size_t window, size_t capacity_limit = 0,
                  size_t lane = 0, size_t lane_count = 1);
-    uint64_t append(const Message& mutation);
+    // The caller gathers only work already available, up to this limit.
+    // Zero means backpressure from the commit ring or a follower SQ.
+    size_t available() const;
+    void append_batch(std::span<const Message> mutations);
     void on_write_complete(NodeId peer, WorkId work_id);
     std::optional<Committed> next_committed();
-    size_t inflight() const { return next_ - applied_; }
-    size_t capacity() const { return capacity_; }
+    size_t inflight() const { return progress_.posted() - applied_; }
+    size_t capacity() const { return layout_.capacity(); }
 private:
     struct Pending {
         uint64_t slot = 0;
         Message command{};
-        uint8_t quorum_mask = 0;
-        uint8_t seen_mask = 0;
-        uint8_t remaining = 0;
     };
     rdma::Transport& net_;
     std::vector<NodeId> followers_;
     std::vector<Pending> ring_;
-    size_t capacity_ = 0;
-    size_t quorum_followers_ = 0;
-    size_t lane_ = 0;
-    size_t lane_count_ = 1;
-    uint64_t next_ = 0;
+    CompactLaneLayout layout_;
+    ReplicationProgress progress_;
+    size_t lane_;
     uint64_t applied_ = 0;
 };
 } // namespace lock

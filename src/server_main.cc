@@ -58,6 +58,11 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("mu-lanes must be 1..8");
         if (backend == lock::Backend::Cas && mu_lanes != 1)
             throw std::invalid_argument("CAS does not use Mu lanes");
+        const size_t replication_batch = opt.number("replication-batch", 8);
+        cfg.communication_batch = opt.number("leader-comm-batch", 64);
+        if (!replication_batch || replication_batch > 16 ||
+            !cfg.communication_batch || cfg.communication_batch > 64)
+            throw std::invalid_argument("invalid leader batch size");
         const bool leader = cfg.self == replicas.front();
         if (backend == lock::Backend::Mu ||
             backend == lock::Backend::Handoff) {
@@ -76,12 +81,14 @@ int main(int argc, char** argv) {
                 if (backend == lock::Backend::Mu)
                     lock::run_mu_leader(net, cfg.self, replicas, clients,
                                         lock_count, mu_inflight_window,
-                                        profile_requested, mu_lanes);
+                                        profile_requested, mu_lanes, replication_batch,
+                                             cfg.communication_batch);
                 else
                     lock::run_handoff_leader(net, cfg.self, replicas, clients,
                                              lock_count, opt.number("prepared-window", 8),
                                              handoff_inflight_window,
-                                             profile_requested, mu_lanes);
+                                             profile_requested, mu_lanes, replication_batch,
+                                             cfg.communication_batch);
             } else {
                 // Follower NICs accept one-sided header WRITEs autonomously.
                 // No application-side polling in the measured path.

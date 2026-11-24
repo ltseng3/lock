@@ -1,90 +1,89 @@
 #include "lock/locks/mu_compact_log.h"
-#include "lock/locks/lane_layout.h"
 #include <algorithm>
+#include <array>
 #include <stdexcept>
 
 namespace lock {
+namespace {
+size_t log_capacity(size_t memory, size_t limit) {
+    constexpr size_t reserve = 16ULL * 1024 * 1024;
+    if (memory <= rdma::kLogOffset + reserve)
+        throw std::invalid_argument("compact log memory too small");
+    const size_t capacity = (memory - reserve - rdma::kLogOffset) / sizeof(uint64_t);
+    if (limit > capacity)
+        throw std::invalid_argument("compact log capacity exceeds registered region");
+    return limit ? limit : capacity;
+}
+std::vector<NodeId> follower_ids(NodeId self, std::vector<NodeId> replicas) {
+    if ((replicas.size() != 3 && replicas.size() != 5) ||
+        std::find(replicas.begin(), replicas.end(), self) == replicas.end())
+        throw std::invalid_argument("Mu requires three or five replicas including leader");
+    std::sort(replicas.begin(), replicas.end());
+    if (std::adjacent_find(replicas.begin(), replicas.end()) != replicas.end())
+        throw std::invalid_argument("duplicate replica");
+    replicas.erase(std::find(replicas.begin(), replicas.end(), self));
+    return replicas;
+}
+} // namespace
+
 MuCompactLog::MuCompactLog(rdma::Transport& net, std::vector<NodeId> replicas,
                            size_t window, size_t capacity_limit,
                            size_t lane, size_t lane_count)
-    : net_(net), ring_(window), lane_(lane), lane_count_(lane_count) {
-    if ((replicas.size() != 3 && replicas.size() != 5) ||
-        std::find(replicas.begin(), replicas.end(), net.self()) == replicas.end())
-        throw std::invalid_argument("Mu requires three or five replicas including leader");
-    if (window == 0 || window > 4096)
+    : net_(net), followers_(follower_ids(net.self(), std::move(replicas))),
+      ring_(window), layout_(log_capacity(net.memory_bytes(), capacity_limit),
+                            lane, lane_count),
+      progress_(followers_.size()), lane_(lane) {
+    if (!window || window > 4096)
         throw std::invalid_argument("invalid Mu log pipeline window");
-    if (lane_count_ == 0 || lane_count_ > 8 || lane_ >= lane_count_)
-        throw std::invalid_argument("invalid Mu log lane configuration");
-    for (NodeId id : replicas)
-        if (id != net.self()) followers_.push_back(id);
-    quorum_followers_ = replicas.size() / 2;
-    const size_t end = net.memory_bytes() - 16ULL * 1024 * 1024;
-    capacity_ = (end - rdma::kLogOffset) / sizeof(uint64_t);
-    if (capacity_limit) {
-        if (capacity_limit > capacity_)
-            throw std::invalid_argument("compact log capacity exceeds registered region");
-        capacity_ = capacity_limit;
-    }
+    // All participants must use identical physical offsets. Do not allow
+    // unequal MR sizes to create divergent lane partitions.
+    for (NodeId peer : followers_)
+        if (net_.remote_memory_bytes(peer) != net_.memory_bytes())
+            throw std::invalid_argument("replicas have different log memory sizes");
 }
-uint64_t MuCompactLog::append(const Message& mutation) {
-    if (inflight() >= ring_.size())
-        throw std::runtime_error("Mu log admission window full");
-    const uint64_t slot = compact_global_slot(next_, lane_, lane_count_);
-    if (slot >= capacity_)
-        throw std::runtime_error("Mu replicated log exhausted: fail closed");
-    const uint64_t word = pack_mu_command(mutation);
-    const uint64_t local_slot = next_++;
-    const size_t offset = rdma::kLogOffset + slot * sizeof(uint64_t);
-    *static_cast<uint64_t*>(net_.at(offset, sizeof(uint64_t))) = word;
-    auto& entry = ring_[local_slot % ring_.size()];
-    entry = {};
-    entry.slot = local_slot;
-    entry.command = mutation;
-    entry.remaining = static_cast<uint8_t>(quorum_followers_);
-    for (size_t i = 0; i < followers_.size(); ++i) {
-        // Rotate the majority subset to avoid always waiting on one follower.
-        const size_t relative = (i + followers_.size() -
-                                 local_slot % followers_.size()) % followers_.size();
-        const bool quorum = relative < quorum_followers_;
-        if (quorum) entry.quorum_mask |= static_cast<uint8_t>(1u << i);
-        // Source is copied by the inline WRITE before this call returns.
-        // WorkId is the log slot+1, well within the transport's 48-bit tag.
-        net_.write_inline(followers_[i], word, offset, local_slot + 1,
-                          quorum, lane_);
-    }
-    return slot;
+
+size_t MuCompactLog::available() const {
+    if (!progress_.can_post()) return 0;
+    return std::min(max_batch, ring_.size() - inflight());
 }
+
+void MuCompactLog::append_batch(std::span<const Message> mutations) {
+    if (mutations.empty() || mutations.size() > available())
+        throw std::runtime_error("invalid compact log batch size");
+    const uint64_t begin = progress_.posted();
+    const uint64_t end = begin + mutations.size();
+    const uint64_t first = layout_.global_slot(begin);
+    (void)layout_.global_slot(end - 1); // Validate the whole range before posting.
+    std::array<uint64_t, max_batch> words;
+    for (size_t i = 0; i < mutations.size(); ++i)
+        words[i] = pack_mu_command(mutations[i]);
+    const size_t offset = rdma::kLogOffset + first * sizeof(uint64_t);
+    auto* local = static_cast<uint64_t*>(net_.at(offset, mutations.size() * sizeof(uint64_t)));
+    for (size_t i = 0; i < mutations.size(); ++i) {
+        local[i] = words[i];
+        ring_[(begin + i) % ring_.size()] = {begin + i, mutations[i]};
+    }
+    // Every batch is signaled on every follower. Its exclusive end is the
+    // CQE token. RC ordering is per QP; never infer another lane's progress.
+    const auto payload = std::span<const uint64_t>(words.data(), mutations.size());
+    for (NodeId peer : followers_)
+        net_.write_inline_words(peer, payload, offset, end, lane_);
+    progress_.posted(end);
+}
+
 void MuCompactLog::on_write_complete(NodeId peer, WorkId id) {
-    if (id == 0) throw std::runtime_error("invalid Mu replication work ID");
-    const uint64_t slot = id - 1;
-    auto found = std::find(followers_.begin(), followers_.end(), peer);
+    const auto found = std::find(followers_.begin(), followers_.end(), peer);
     if (found == followers_.end())
-        throw std::runtime_error("Mu replication completion from non-follower");
-    const size_t index = static_cast<size_t>(found - followers_.begin());
-    const size_t relative = (index + followers_.size() -
-                             slot % followers_.size()) % followers_.size();
-    if (relative >= quorum_followers_) {
-        // A periodically signaled non-quorum WRITE may complete after the
-        // slot's local bookkeeping has already been reused.
-        return;
-    }
-    if (slot < applied_ || slot >= next_)
-        throw std::runtime_error("stale Mu quorum completion");
-    auto& entry = ring_[slot % ring_.size()];
-    const uint8_t bit = static_cast<uint8_t>(1u << index);
-    if (entry.slot != slot || !(entry.quorum_mask & bit) ||
-        (entry.seen_mask & bit) || entry.remaining == 0)
-        throw std::runtime_error("invalid or duplicate Mu quorum completion");
-    entry.seen_mask |= bit;
-    --entry.remaining;
+        throw std::runtime_error("compact log completion from non-follower");
+    progress_.completed(static_cast<size_t>(found - followers_.begin()), id);
 }
+
 std::optional<Committed> MuCompactLog::next_committed() {
-    if (applied_ == next_) return std::nullopt;
+    if (applied_ == progress_.committed()) return std::nullopt;
     auto& entry = ring_[applied_ % ring_.size()];
     if (entry.slot != applied_)
-        throw std::runtime_error("Mu log slot ordering violation");
-    if (entry.remaining != 0) return std::nullopt;
-    const uint64_t global = compact_global_slot(applied_, lane_, lane_count_);
+        throw std::runtime_error("compact log slot ordering violation");
+    const uint64_t global = layout_.global_slot(applied_);
     ++applied_;
     return Committed{global, entry.command};
 }

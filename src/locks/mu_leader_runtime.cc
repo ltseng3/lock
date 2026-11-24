@@ -63,6 +63,7 @@ void replication_loop(Shared& s, rdma::Transport& net,
         auto profile_start = Clock::now();
         uint64_t loops = 0, commits = 0, replication_cqe = 0, replication_batches = 0;
         size_t max_inflight = 0, max_pending = 0;
+        std::array<Message, MuCompactLog::max_batch> batch;
         while (!s.stopped.load(std::memory_order_acquire)) {
             // Only this thread touches the replica QPs and the replication CQ.
             net.poll_replication_into(completions, 64, lane);
@@ -80,7 +81,6 @@ void replication_loop(Shared& s, rdma::Transport& net,
                     if (!s.responses.try_push(action))
                         throw std::runtime_error("Mu response queue capacity exceeded");
             }
-            std::array<Message, MuCompactLog::max_batch> batch;
             max_pending = std::max(max_pending, s.requests.size());
             size_t admitted = 0;
             while (admitted < 64) {

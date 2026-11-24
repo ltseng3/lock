@@ -101,6 +101,7 @@ void replication_loop(Shared& s, rdma::Transport& net,
         // and check only the relevant lock before assigning a successor.
         constexpr auto kRetirementScanPeriod = std::chrono::microseconds(32);
         auto next_retirement_scan = Clock::now() + kRetirementScanPeriod;
+        std::array<Message, MuCompactLog::max_batch> batch;
         while (!s.stopped.load(std::memory_order_acquire)) {
             net.poll_replication_into(cqes, 64, lane);
             for (const auto& c : cqes) {
@@ -147,7 +148,6 @@ void replication_loop(Shared& s, rdma::Transport& net,
 
             max_pending = std::max(max_pending, append_pending.size() +
                                                  s.requests.size());
-            std::array<Message, MuCompactLog::max_batch> batch;
             while (!append_pending.empty()) {
                 const size_t count = std::min({log.available(), replication_batch,
                                                append_pending.size()});

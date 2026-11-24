@@ -204,3 +204,10 @@ ahead of a queued NEXT. Use an ordered notification fence or explicit
 sequence watermark if moving delivery to a separate QP. Bound retained
 metadata, drain GC at shutdown, and specify how recovery fences stale
 notifications before changing the acknowledgment contract.
+
+Hardware-free leader_batch tests exercise the production compact log and
+response sender through a recording transport: singleton flush, contiguous
+payloads and offsets, ring reuse with a late non-quorum CQE, three/five-node
+majority progress, malformed completions, slow-follower credits, and
+NEXT-before-ACK ordering across interleaved destination batches. These tests
+do not substitute for real verbs and multi-lane hardware testing.

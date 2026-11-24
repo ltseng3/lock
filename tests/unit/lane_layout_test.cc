@@ -15,6 +15,13 @@ int main() {
             assert(lock_lane(lock_id, lane_count) == lock_id % lane_count);
         for (size_t lane = 0; lane < lane_count; ++lane) {
             CompactLaneLayout layout(handoff_log_capacity(bytes), lane, lane_count);
+            assert(layout.global_slot(0) % 8 == 0);
+            assert(layout.global_slot(layout.capacity() - 1) <
+                   handoff_log_capacity(bytes));
+            if (lane + 1 < lane_count) {
+                CompactLaneLayout next(handoff_log_capacity(bytes), lane + 1, lane_count);
+                assert(layout.global_slot(layout.capacity() - 1) + 1 == next.global_slot(0));
+            }
             uint64_t previous = 0;
             for (uint64_t local = 0; local < 100; ++local) {
                 const auto slot = layout.global_slot(local);

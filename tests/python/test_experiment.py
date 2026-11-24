@@ -50,6 +50,15 @@ class TestExperiment(unittest.TestCase):
         self.assertIn("--profile-leader=1", server)
         self.assertNotIn("--profile-leader=1", client)
 
+    def test_latency_capacity_only_on_clients(self):
+        tuned = dict(self.suite, latency_sample_capacity=8000000)
+        for backend in ("cas", "mu", "handoff"):
+            case = dict(next(cases(tuned)), backend=backend)
+            for node in self.topo.nodes:
+                args = process_command(self.topo, node, tuned, case)
+                self.assertEqual("--latency-sample-capacity=8000000" in args,
+                                 node.role == "client")
+
     def test_mu_window_only_on_server(self):
         case = dict(next(cases(self.suite)), backend="mu")
         tuned = dict(self.suite, mu_inflight_window=256)

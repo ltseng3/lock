@@ -332,3 +332,15 @@ is no waiting for a full batch and no extra worker. Leader profile
 logical actions. Client counters `gc-next`, `gc-records` and `gc-messages`
 include warmup and drain, like HANDOFF counters. A GC packet is not a new
 ownership proof and does not change the local release-completion boundary.
+
+## Latency sample capacity
+
+Long runs formerly grew both latency vectors inside the client CQ loop,
+which can stall progress while copying and faulting pages. Clients now
+allocate and initialize a fixed sample budget before the start barrier.
+Default: 1.5M samples per measurement second per client. The optional
+--latency-sample-capacity (or suite latency_sample_capacity) sets a
+per-client limit of 1..64000000 samples. Two uint64_t arrays consume
+16 bytes per slot; 8000000 samples use about 122 MiB per client.
+Overflow invalidates the trial; raise the capacity and rerun. The actual
+sample count and capacity are recorded in each client RESULT.

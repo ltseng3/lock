@@ -241,3 +241,15 @@ prepared handoff chain, and a peer READ winner with a late redundant
 HANDOFF through the actual client state machine. No RDMA device is used
 by these tests. The one-sided markers and their CQEs, ReleaseAck reclamation,
 proof validation, and shutdown barrier remain necessary in both workloads.
+
+## Fixed latency sample budget
+
+Clients allocate and initialize two exact uint64_t latency arrays before
+sending Ready. Each measured completion records one acquisition and one
+total-latency sample by index; the measured path never grows these arrays.
+The default capacity is 1.5 million samples per measurement second per
+client, adjustable via --latency-sample-capacity. A trial fails rather
+than truncate or allocate on overflow. The runner checks completed pairs
+equal the number of stored samples. Exact nearest-rank p50/p99/p99.9
+percentiles are computed by sorting the populated ranges after the Stop
+barrier. This instrumentation is independent of the backend and recovery.

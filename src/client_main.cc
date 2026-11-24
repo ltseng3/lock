@@ -49,6 +49,8 @@ int main(int argc, char** argv) {
         cfg.seed = opt.number("seed", 2026);
         cfg.warmup_seconds = opt.number("warmup-seconds", 5);
         cfg.duration_seconds = opt.number("duration-seconds", 15);
+        cfg.latency_sample_capacity = lock::LatencySamples::capacity_for(
+            cfg.duration_seconds, opt.number("latency-sample-capacity", 0));
         cfg.watchdog_seconds = opt.number("watchdog-seconds", 90);
         cfg.cas_release_guarded = opt.number("cas-release-guarded", 0) != 0;
         cfg.handoff_peer_read = opt.number("handoff-peer-read", 0) != 0;

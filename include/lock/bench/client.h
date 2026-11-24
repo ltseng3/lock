@@ -1,5 +1,6 @@
 #pragma once
 #include "lock/bench/workload.h"
+#include "lock/bench/latency_samples.h"
 #include "lock/locks/backend.h"
 #include "lock/rdma/transport.h"
 #include "lock/locks/peer_completion.h"
@@ -23,6 +24,7 @@ struct ClientConfig {
     uint64_t seed = 2026;
     uint64_t warmup_seconds = 5;
     uint64_t duration_seconds = 15;
+    uint64_t latency_sample_capacity = 0; // auto: 1.5M samples per measurement second
     uint64_t watchdog_seconds = 90;
     bool cas_release_guarded = false;
     bool handoff_peer_read = false;
@@ -113,7 +115,7 @@ private:
     uint64_t next_work_ = 1;
     Clock::time_point measurement_begin_{}, measurement_end_{};
     size_t completed_ = 0;
-    std::vector<uint64_t> acquire_ns_, total_ns_;
+    LatencySamples latency_samples_;
     WorkId track(size_t slot, Purpose purpose);
     void submit(size_t slot);
     void post_cas(size_t slot);
@@ -130,6 +132,6 @@ private:
     void deliver_handoff(RequestId predecessor, const Retired& record);
     void publish_retirement(size_t slot);
     void handle(const rdma::Completion& c);
-    void print_result() const;
+    void print_result();
 };
 } // namespace lock

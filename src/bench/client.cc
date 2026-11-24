@@ -17,13 +17,6 @@ namespace {
 uint64_t nanos(std::chrono::steady_clock::duration d) {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(d).count();
 }
-uint64_t percentile(std::vector<uint64_t> values, double p) {
-    if (values.empty()) return 0;
-    std::sort(values.begin(), values.end());
-    const size_t index = std::min(values.size() - 1,
-                                 static_cast<size_t>(std::ceil(p * values.size())) - 1);
-    return values[index];
-}
 } // namespace
 ClientEngine::ClientEngine(rdma::Transport& net, ClientConfig cfg)
     : net_(net), cfg_(std::move(cfg)),
@@ -173,9 +166,8 @@ void ClientEngine::complete(size_t slot) {
     auto& op = ops_[slot];
     auto now = Clock::now();
     if (op.begun >= measurement_begin_ && now <= measurement_end_) {
+        latency_samples_.record(nanos(op.acquired - op.begun), nanos(now - op.begun));
         ++completed_;
-        acquire_ns_.push_back(nanos(op.acquired - op.begun));
-        total_ns_.push_back(nanos(now - op.begun));
     }
     requests_.erase(op.request);
     op.phase = Phase::Idle;
@@ -537,6 +529,8 @@ void ClientEngine::handle(const rdma::Completion& c) {
     }
 }
 void ClientEngine::run() {
+    latency_samples_.prepare(LatencySamples::capacity_for(
+        cfg_.duration_seconds, cfg_.latency_sample_capacity));
     const NodeId leader = cfg_.replicas.front();
     net_.send(leader, message(Kind::Ready, cfg_.self));
     auto barrier_deadline = Clock::now() + std::chrono::seconds(cfg_.watchdog_seconds);
@@ -590,7 +584,10 @@ void ClientEngine::run() {
     if (!awaited_.empty()) throw std::runtime_error("outstanding CQEs at completion");
     print_result();
 }
-void ClientEngine::print_result() const {
+void ClientEngine::print_result() {
+    if (latency_samples_.size() != completed_)
+        throw std::runtime_error("latency sample count mismatch");
+    const auto latency = latency_samples_.summarize();
     const char* name = cfg_.backend == Backend::Cas ? "cas" :
                        cfg_.backend == Backend::Mu ? "mu" : "handoff";
     std::cout << "RESULT {"
@@ -605,13 +602,15 @@ void ClientEngine::print_result() const {
               << ",\"workers\":" << cfg_.workers
               << ",\"outstanding_per_worker\":" << cfg_.outstanding
               << ",\"completed\":" << completed_
+              << ",\"latency_samples\":" << latency_samples_.size()
+              << ",\"latency_sample_capacity\":" << latency_samples_.capacity()
               << ",\"measurement_seconds\":" << cfg_.duration_seconds
-              << ",\"acquire_p50_ns\":" << percentile(acquire_ns_, 0.50)
-              << ",\"acquire_p99_ns\":" << percentile(acquire_ns_, 0.99)
-              << ",\"acquire_p999_ns\":" << percentile(acquire_ns_, 0.999)
-              << ",\"total_p50_ns\":" << percentile(total_ns_, 0.50)
-              << ",\"total_p99_ns\":" << percentile(total_ns_, 0.99)
-              << ",\"total_p999_ns\":" << percentile(total_ns_, 0.999)
+              << ",\"acquire_p50_ns\":" << latency.acquire.p50
+              << ",\"acquire_p99_ns\":" << latency.acquire.p99
+              << ",\"acquire_p999_ns\":" << latency.acquire.p999
+              << ",\"total_p50_ns\":" << latency.total.p50
+              << ",\"total_p99_ns\":" << latency.total.p99
+              << ",\"total_p999_ns\":" << latency.total.p999
               << ",\"handoffs_sent\":" << handoffs_sent_
               << ",\"handoffs_received\":" << handoffs_received_
               << ",\"late_next\":" << late_next_

@@ -249,11 +249,13 @@ the old single-lane configuration. Compare one, two, and four lanes on the
 same commit using the same single-case suite, and with profiling disabled.
 Real InfiniBand hardware testing is mandatory for this transport change.
 
-Handoff client release-marker buffers are now sized against the full
-`workers * outstanding` window, and when all marker buffers are in flight,
-the client retains a pending operation instead of terminating. Each buffer is
-reclaimed only after its local WRITE CQE. This is local backpressure, not a
-change to FIFO or the one-sided retirement-marker representation. Recheck
+Handoff client retirement markers are eight-byte inline WRITEs. The client
+no longer allocates registered marker buffers or tracks each marker in a
+hash table. The previous WR budget (128..512, based on the full
+`workers * outstanding` window) remains in force; a pending operation
+resumes when a marker CQE frees credit. All marker WRs remain signaled on
+the base QP. This is local backpressure, not a change to FIFO or the
+one-sided retirement-marker representation. Recheck
 8-worker/32-outstanding runs, including test completion and no missing
 release acknowledgments, before running a full sweep.
 

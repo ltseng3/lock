@@ -70,10 +70,9 @@ private:
         RequestId successor = 0;
         uint64_t successor_position = 0;
     };
-    struct Marker {
-        uint64_t* payload = nullptr;
-        bool occupied = false;
-    };
+    // Transport work IDs have 48 payload bits. Reserve bit 47 for the
+    // FIFO of signaled inline retirement WRITEs on the leader's base QP.
+    static constexpr WorkId kMarkerTokenBase = 1ULL << 47;
     rdma::Transport& net_;
     ClientConfig cfg_;
     std::vector<LockPicker> pickers_;
@@ -88,12 +87,12 @@ private:
     std::unordered_map<RequestId, Message> early_start_;
     std::unordered_map<RequestId, Message> early_handoff_;
     std::unordered_map<RequestId, Message> early_next_;
-    std::vector<Marker> markers_;
-    std::vector<size_t> free_markers_;
-    // A marker WRITE owns its buffer until its local CQE. If the pool is
-    // full, retain the operation slot and post its marker on the next CQE.
+    // Inline markers own no payload buffer, but still consume SQ credits.
+    // Every marker is signaled; their CQEs arrive in FIFO order on one QP.
+    size_t marker_credit_ = 0;
+    uint64_t markers_posted_ = 0, markers_completed_ = 0;
     std::deque<size_t> deferred_marker_slots_;
-    std::unordered_map<WorkId, size_t> marker_work_;
+    bool markers_drained() const { return markers_posted_ == markers_completed_; }
     uint64_t handoffs_sent_ = 0;
     uint64_t handoffs_received_ = 0;
     uint64_t late_next_ = 0;

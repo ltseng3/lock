@@ -5,6 +5,7 @@
 #include <cstddef>
 #include "lock/locks/mu_state.h"
 #include "lock/locks/mu_leader_runtime.h"
+#include "lock/locks/compact_recovery_runtime.h"
 #include "lock/locks/handoff_leader_runtime.h"
 #include <thread>
 #include "lock/locks/replicated_log.h"
@@ -67,7 +68,7 @@ int main(int argc, char** argv) {
             !cfg.communication_batch || cfg.communication_batch > 64)
             throw std::invalid_argument("invalid leader batch size");
         const bool leader = cfg.self == replicas.front();
-        lock::MuRecoveryConfig recovery;
+        lock::CompactRecoveryConfig recovery;
         const auto recover = opt.number("mu-recovery", 0);
         const auto publication = opt.number("mu-recovery-publication", 1);
         const auto replay = opt.number("mu-recovery-replay", 1);
@@ -80,7 +81,7 @@ int main(int argc, char** argv) {
         recovery.replay = replay != 0;
         if (recovery.enabled && !leader) {
             cfg.recoverable_peer = replicas.front();
-            lock::install_mu_recovery_trigger();
+            lock::install_recovery_trigger();
         }
         if (backend == lock::Backend::Mu ||
             backend == lock::Backend::Handoff) {

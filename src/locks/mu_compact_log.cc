@@ -28,7 +28,7 @@ std::vector<NodeId> follower_ids(NodeId self, std::vector<NodeId> replicas, bool
 
 MuCompactLog::MuCompactLog(rdma::Transport& net, std::vector<NodeId> replicas,
                            size_t window, size_t capacity_limit,
-                           size_t lane, size_t lane_count, MuRecoveryConfig recovery)
+                           size_t lane, size_t lane_count, CompactRecoveryConfig recovery)
     : net_(net), followers_(follower_ids(net.self(), std::move(replicas), recovery.promoted)),
       ring_(window), layout_(recovery.enabled ? compact_recovery_capacity(net.memory_bytes(), recovery.handoff) :
                              log_capacity(net.memory_bytes(), capacity_limit), lane, lane_count),

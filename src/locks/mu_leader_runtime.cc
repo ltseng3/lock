@@ -55,7 +55,7 @@ void replication_loop(Shared& s, rdma::Transport& net,
                       const std::vector<NodeId>& replicas,
                       size_t lock_count, size_t window, bool profile,
                       size_t lane, size_t lane_count, size_t replication_batch,
-                      MuRecoveryConfig recovery, MuPromotion* promotion) {
+                      CompactRecoveryConfig recovery, MuPromotion* promotion) {
     try {
         MuCompactLog log(net, replicas, window, 0, lane, lane_count, recovery);
         MuState state = promotion ? std::move(promotion->state) : MuState(lock_count);
@@ -217,7 +217,7 @@ void run_mu_leader(rdma::Transport& net, NodeId self,
                    const std::vector<NodeId>& clients, size_t lock_count,
                    size_t inflight_window, bool profile,
                    size_t lane_count, size_t replication_batch,
-                        size_t communication_batch, MuRecoveryConfig recovery, MuPromotion* promotion) {
+                        size_t communication_batch, CompactRecoveryConfig recovery, MuPromotion* promotion) {
     if (!replication_batch || replication_batch > MuCompactLog::max_batch ||
         !communication_batch || communication_batch > LeaderResponseBatch::drain_limit)
         throw std::invalid_argument("invalid leader batch size");

@@ -1,6 +1,6 @@
 #pragma once
 #include "lock/rdma/transport.h"
-#include "lock/locks/mu_recovery.h"
+#include "lock/locks/compact_recovery.h"
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>

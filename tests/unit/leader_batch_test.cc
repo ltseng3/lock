@@ -156,7 +156,7 @@ void test_recovered_log() {
     // Small fake MR: enough room for 128 words and their byte sidecar.
     cfg.memory_bytes = rdma::kLogOffset + 16ULL * 1024 * 1024 + kEpochBoundaryBytes + 128 * 9;
     rdma::Transport net(cfg);
-    MuLogView view(net, true);
+    CompactLogView view(net, true);
     require(view.capacity() == 128);
     auto* data = view.words(0, 8);
     auto* marks = view.marks(0, 8);
@@ -169,9 +169,9 @@ void test_recovered_log() {
     // A payload with no publication is not recoverable, even if nonzero.
     data[5] = pack_mu_command(acquire(6));
     require(view.scan(5) == 5);
-    MuLogView raw(net, false);
+    CompactLogView raw(net, false);
     require(raw.scan(0) == 6);
-    MuRecoveryConfig cfg_recovery;
+    CompactRecoveryConfig cfg_recovery;
     cfg_recovery.enabled = cfg_recovery.promoted = true;
     cfg_recovery.recovered = 5;
     MuCompactLog log(net, {2,3}, 2, 0, 0, 1, cfg_recovery);
@@ -181,7 +181,7 @@ void test_recovered_log() {
     log.append_batch(next);
     require(writes.size() == 1 && writes[0].peer == 3 && writes[0].end == 7);
     require(writes[0].offset == rdma::kLogOffset + 5*8);
-    require(writes[0].marker_offset == mu_recovery_marker_offset(cfg.memory_bytes, 5));
+    require(writes[0].marker_offset == compact_publication_offset(cfg.memory_bytes, 5));
     require(log.available() == 0 && !log.next_committed());
     log.on_write_complete(3, 7);
     auto a = log.next_committed();

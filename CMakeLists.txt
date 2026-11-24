@@ -68,6 +68,11 @@ if(LOCK_BUILD_TESTS)
   add_executable(lock_handoff_trace_test tests/unit/handoff_trace_test.cc)
   target_link_libraries(lock_handoff_trace_test PRIVATE lock_core)
   add_test(NAME handoff_trace COMMAND lock_handoff_trace_test)
+  # Compile the actual client engine with a deterministic fake transport.
+  add_executable(lock_peer_read_client_test tests/unit/peer_read_client_test.cc
+                 src/bench/client.cc)
+  target_link_libraries(lock_peer_read_client_test PRIVATE lock_core)
+  add_test(NAME peer_read_client COMMAND lock_peer_read_client_test)
   add_executable(lock_lane_layout_test tests/unit/lane_layout_test.cc)
   target_link_libraries(lock_lane_layout_test PRIVATE lock_core)
   add_test(NAME lane_layout COMMAND lock_lane_layout_test)

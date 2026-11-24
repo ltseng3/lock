@@ -17,7 +17,7 @@ struct Peer {
     NodeId id;
     std::string ip;
 };
-enum class CompletionKind { Receive, Send, Write, CompareSwap };
+enum class CompletionKind { Receive, Send, Write, CompareSwap, Read };
 struct Completion {
     CompletionKind kind;
     NodeId peer;
@@ -67,6 +67,9 @@ public:
     bool write_inline(NodeId peer, uint64_t value, size_t remote_offset,
                       WorkId work_id, bool signal = true,
                       size_t lane = 0);
+    // A signaled, eight-byte peer READ into registered, aligned storage.
+    void read_word(NodeId peer, uint64_t* result, size_t remote_offset,
+                   WorkId work_id);
     void compare_swap(NodeId peer, uint64_t* result, size_t remote_offset,
                       uint64_t expected, uint64_t desired, WorkId work_id);
     // Reuse the caller's completion storage on the hot path.

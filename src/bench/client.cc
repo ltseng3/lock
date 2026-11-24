@@ -1,5 +1,6 @@
 #include "lock/bench/client.h"
 #include <algorithm>
+#include <atomic>
 #include "lock/locks/replicated_log.h"
 #include "lock/locks/handoff_layout.h"
 #include "lock/locks/lane_layout.h"
@@ -42,11 +43,18 @@ ClientEngine::ClientEngine(rdma::Transport& net, ClientConfig cfg)
     if (cfg_.outstanding == 0 || cfg_.outstanding > 512 || cfg_.lock_count == 0 ||
         cfg_.lock_count > 1000)
         throw std::invalid_argument("invalid client window or lock count");
+    if (cfg_.handoff_peer_read) {
+        if (cfg_.backend != Backend::Handoff ||
+            net_.memory_bytes() < rdma::kScratchOffset + 16ULL * 1024 * 1024)
+            throw std::invalid_argument("peer READ requires the handoff client layout");
+    }
     for (auto& op : ops_) {
         op.cas_result = static_cast<uint64_t*>(net_.allocate(sizeof(uint64_t), 8));
         op.data_value = static_cast<uint64_t*>(net_.allocate(sizeof(uint64_t), 8));
         op.release_zero = static_cast<uint64_t*>(net_.allocate(sizeof(uint64_t), 8));
         *op.release_zero = 0;
+        if (cfg_.handoff_peer_read)
+            op.read_result = static_cast<uint64_t*>(net_.allocate(sizeof(uint64_t), 8));
     }
     if (cfg_.backend == Backend::Handoff) {
         // Include every logical worker, not just the per-worker outstanding
@@ -78,7 +86,8 @@ void ClientEngine::post_cas(size_t slot) {
 }
 void ClientEngine::submit(size_t slot) {
     auto& op = ops_.at(slot);
-    if (op.phase != Phase::Idle) throw std::logic_error("slot not idle");
+    if (op.phase != Phase::Idle || op.read_pending)
+        throw std::logic_error("slot not idle or READ still in flight");
     ++op.generation;
     op.request = make_request_id(cfg_.self, next_sequence_++);
     op.lock = pickers_.at(slot / cfg_.outstanding).next();
@@ -114,6 +123,13 @@ void ClientEngine::release(size_t slot) {
     auto& op = ops_[slot];
     op.phase = Phase::WaitRelease;
     if (cfg_.backend == Backend::Handoff) {
+        // Called only after the protected data WRITE CQE. Publish before
+        // either the leader marker or HANDOFF, even if marker posting stalls.
+        if (cfg_.handoff_peer_read) {
+            auto* word = static_cast<uint64_t*>(net_.at(
+                peer_completion_offset(op.request), sizeof(uint64_t)));
+            std::atomic_ref<uint64_t>(*word).store(op.request, std::memory_order_release);
+        }
         publish_retirement(slot);
     } else if (cfg_.backend == Backend::Mu) {
         net_.send(cfg_.replicas.front(),
@@ -173,14 +189,12 @@ void ClientEngine::publish_retirement(size_t slot) {
     }
     const size_t i = free_markers_.back();
     free_markers_.pop_back();
-    Retired record{op.lock, op.position, op.successor, op.successor_position, false};
+    Retired record{op.lock, op.position, op.successor, op.successor_position};
     auto [it, added] = retired_.emplace(op.request, record);
     if (!added) throw std::runtime_error("duplicate retirement");
     // Protected data work was completed before entering this function.
-    if (it->second.successor) {
+    if (it->second.successor)
         deliver_handoff(op.request, it->second);
-        it->second.sent = true;
-    }
     if (markers_[i].occupied)
         throw std::runtime_error("reused occupied release marker buffer");
     markers_[i].occupied = true;
@@ -237,9 +251,66 @@ void ClientEngine::handle_order(const rdma::Completion& c) {
         saved.peer = earlier.sender; saved.message = earlier;
         handle_activation(saved);
     }
+    if (cfg_.handoff_peer_read && !op.started && op.predecessor)
+        try_predecessor_read(it->second);
+}
+void ClientEngine::activate(size_t slot) {
+    auto& op = ops_.at(slot);
+    if (!op.ordered || op.started || op.phase != Phase::WaitOrder)
+        throw std::runtime_error("invalid activation state");
+    op.started = true;
+    post_data(slot);
+}
+void ClientEngine::try_predecessor_read(size_t slot) {
+    auto& op = ops_.at(slot);
+    if (!op.ordered || op.started || !op.predecessor || op.read_pending)
+        throw std::runtime_error("invalid predecessor READ state");
+    const NodeId peer = request_node(op.predecessor);
+    if (peer == 0 || peer >= peer_reads_.size() ||
+        std::find(cfg_.replicas.begin(), cfg_.replicas.end(), peer) != cfg_.replicas.end())
+        throw std::runtime_error("invalid predecessor client");
+    // Bound both pending READs and the receipt ledger. One remote READ per
+    // peer at a time (the transport negotiates max_rd_atomic=1). No polling
+    // loop and no queue of READ retries; HANDOFF remains the fallback.
+    if (read_receipts_.size() + reads_inflight_ >= PeerReadReceipts::limit ||
+        (peer != cfg_.self && peer_reads_[peer] != 0)) {
+        ++read_skipped_;
+        return;
+    }
+    const size_t offset = peer_completion_offset(op.predecessor);
+    if (peer == cfg_.self) {
+        ++local_probes_;
+        auto* word = static_cast<uint64_t*>(net_.at(offset, sizeof(uint64_t)));
+        observe_predecessor(slot, std::atomic_ref<uint64_t>(*word).load(
+            std::memory_order_acquire));
+        return;
+    }
+    ++read_attempts_;
+    ++peer_reads_[peer];
+    ++reads_inflight_;
+    op.read_pending = true;
+    net_.read_word(peer, op.read_result, offset, track(slot, Purpose::PredecessorRead));
+}
+void ClientEngine::observe_predecessor(size_t slot, uint64_t value) {
+    auto& op = ops_.at(slot);
+    if (!peer_completion_matches(op.predecessor, value)) {
+        ++read_misses_;
+        return;
+    }
+    if (op.started) return; // HANDOFF already won; no second protected WRITE.
+    read_receipts_.expect(op.request, op.lock, op.predecessor, op.position);
+    ++activation_by_read_;
+    activate(slot);
 }
 void ClientEngine::handle_activation(const rdma::Completion& c) {
     const Message& m = c.message;
+    // Match against the exact committed proof even after B's slot is reused.
+    if (cfg_.handoff_peer_read && message_kind(m) == Kind::Handoff &&
+        read_receipts_.consume(c.peer, m)) {
+        ++handoffs_received_;
+        ++redundant_handoffs_;
+        return;
+    }
     auto it = requests_.find(m.request);
     if (it == requests_.end()) throw std::runtime_error("activation for unknown request");
     auto& op = ops_.at(it->second);
@@ -264,9 +335,9 @@ void ClientEngine::handle_activation(const rdma::Completion& c) {
             c.peer != request_node(op.predecessor))
             throw std::runtime_error("unauthorized HANDOFF");
         ++handoffs_received_;
+        ++activation_by_handoff_;
     }
-    op.started = true;
-    post_data(it->second);
+    activate(it->second);
 }
 void ClientEngine::handle_next(const rdma::Completion& c) {
     const Message& m = c.message;
@@ -297,8 +368,6 @@ void ClientEngine::handle_next(const rdma::Completion& c) {
     it->second.successor_position = m.value;
     ++late_next_;
     deliver_handoff(m.request, it->second);
-    it->second.sent = true;
-    if (it->second.acknowledged) retired_.erase(it);
 }
 
 void ClientEngine::handle(const rdma::Completion& c) {
@@ -339,12 +408,9 @@ void ClientEngine::handle(const rdma::Completion& c) {
                 if (it == retired_.end() || it->second.lock != c.message.lock_id ||
                     it->second.position != c.message.position)
                     throw std::runtime_error("invalid retirement ACK");
-                if (it->second.acknowledged)
-                    throw std::runtime_error("duplicate retirement ACK");
-                it->second.acknowledged = true;
-                // If no successor exists yet, keep the retired predecessor
-                // alive for an ORDER/NEXT committed after its release.
-                if (it->second.sent) retired_.erase(it);
+                // NEXT (if any) precedes this ACK on the same ordered client
+                // QP; the retired predecessor is no longer in the leader queue.
+                retired_.erase(it);
                 return;
             }
             throw std::runtime_error("unexpected handoff control message");
@@ -389,6 +455,20 @@ void ClientEngine::handle(const rdma::Completion& c) {
     if (op.generation != wait.generation)
         throw std::runtime_error("stale completion generation");
     switch (wait.purpose) {
+    case Purpose::PredecessorRead: {
+        const NodeId peer = request_node(op.predecessor);
+        if (c.kind != rdma::CompletionKind::Read || c.peer != peer ||
+            peer >= peer_reads_.size() || !op.read_pending ||
+            !peer_reads_[peer] || !reads_inflight_)
+            throw std::runtime_error("invalid predecessor READ completion");
+        op.read_pending = false;
+        --peer_reads_[peer];
+        --reads_inflight_;
+        // HANDOFF may have won and the operation may have completed while
+        // the DMA result was outstanding. The slot cannot yet be reused.
+        observe_predecessor(wait.slot, *op.read_result);
+        break;
+    }
     case Purpose::AcquireCas:
         if (c.kind != rdma::CompletionKind::CompareSwap ||
             op.phase != Phase::WaitCas)
@@ -443,28 +523,20 @@ void ClientEngine::run() {
         if (now > watchdog) throw std::runtime_error("client watchdog timeout: fail closed");
         if (now < measurement_end_) {
             for (size_t i = 0; i < ops_.size(); ++i) {
-                if (ops_[i].phase == Phase::Idle) submit(i);
+                if (ops_[i].phase == Phase::Idle && !ops_[i].read_pending) submit(i);
             }
         }
         net_.poll_into(completions);
         for (auto& event : completions) handle(event);
         if (now >= measurement_end_ && requests_.empty() &&
             marker_work_.empty() && deferred_marker_slots_.empty() &&
+            retired_.empty() && awaited_.empty() && read_receipts_.empty() &&
             !stop_sent_) {
-            bool all_acknowledged = true;
-            for (const auto& [id, retired] : retired_) {
-                if (!retired.acknowledged) {
-                    all_acknowledged = false;
-                    break;
-                }
-            }
-            if (all_acknowledged) {
-                // A client is done issuing work but must keep serving late
-                // NEXT until every client has finished and the leader closes
-                // the shared queue. All marker writes have completed locally.
-                net_.send(leader, message(Kind::Stop, cfg_.self));
-                stop_sent_ = true;
-            }
+            // Every read winner has consumed its normal HANDOFF, all local
+            // DMA has completed, and all retirements have been acknowledged.
+            // Keep the registered region alive until the all-client barrier.
+            net_.send(leader, message(Kind::Stop, cfg_.self));
+            stop_sent_ = true;
         }
         if (stop_sent_ && server_stopped_) break;
     }
@@ -490,6 +562,13 @@ void ClientEngine::print_result() const {
               << ",\"handoffs_sent\":" << handoffs_sent_
               << ",\"handoffs_received\":" << handoffs_received_
               << ",\"late_next\":" << late_next_
+              << ",\"activation_by_read\":" << activation_by_read_
+              << ",\"activation_by_handoff\":" << activation_by_handoff_
+              << ",\"read_attempts\":" << read_attempts_
+              << ",\"local_probes\":" << local_probes_
+              << ",\"read_misses\":" << read_misses_
+              << ",\"read_skipped\":" << read_skipped_
+              << ",\"redundant_handoffs\":" << redundant_handoffs_
               << "}" << std::endl;
 }
 } // namespace lock

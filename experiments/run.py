@@ -57,6 +57,9 @@ def process_command(topo: Topology, node, suite: dict, case: dict,
         common.append(arg("profile-leader", 1))
     if node.role == "replica" and case["backend"] == "mu":
         common.append(arg("mu-inflight-window", suite.get("mu_inflight_window", 512)))
+    if node.role == "client" and case["backend"] == "handoff":
+        common.append(arg("handoff-peer-read",
+                          int(suite.get("handoff_peer_read", False))))
     if node.role == "replica" and case["backend"] == "handoff":
         common.append(arg("handoff-inflight-window",
                           suite.get("handoff_inflight_window", 512)))
@@ -253,6 +256,8 @@ def main() -> int:
                     help="Mu leader log in-flight limit (1..512; default 512)")
     ap.add_argument("--handoff-inflight-window", type=int,
                     help="Handoff leader log in-flight limit (1..512; default 512)")
+    ap.add_argument("--handoff-peer-read", type=int, choices=(0, 1),
+                    help="Race one bounded predecessor READ with HANDOFF (default 0)")
     ap.add_argument("--mu-lanes", type=int, choices=range(1, 9),
                     help="Independent Mu/handoff replication lanes (1..8; default 1)")
     args = ap.parse_args()
@@ -268,6 +273,10 @@ def main() -> int:
         suite["handoff_inflight_window"] = args.handoff_inflight_window
     if args.mu_lanes is not None:
         suite["mu_lanes"] = args.mu_lanes
+    if args.handoff_peer_read is not None:
+        suite["handoff_peer_read"] = bool(args.handoff_peer_read)
+    if suite.get("handoff_peer_read", False) not in (False, True):
+        raise ValueError("handoff_peer_read must be boolean")
     if not 1 <= suite.get("handoff_inflight_window", 512) <= 512:
         raise ValueError("handoff_inflight_window must be 1..512")
     for key in ("warmup_seconds", "duration_seconds", "repetitions"):

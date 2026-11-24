@@ -1,6 +1,7 @@
 #include "lock/config.h"
 #include "lock/rdma/transport.h"
 #include <chrono>
+#include <atomic>
 #include <iostream>
 #include <set>
 #include <stdexcept>
@@ -25,6 +26,13 @@ int main(int argc, char** argv) {
         net.connect();
         std::cout << "CONNECTED node=" << net.self() << std::endl;
         const auto leader = cfg.peers.front().id;
+        // Check that a CPU-published aligned word is visible through READ.
+        constexpr uint64_t kReadProof = 0xa50f29cc183be734ULL;
+        if (cfg.self == leader) {
+            auto* proof = static_cast<uint64_t*>(net.at(
+                lock::rdma::kLogOffset, sizeof(uint64_t)));
+            std::atomic_ref<uint64_t>(*proof).store(kReadProof, std::memory_order_release);
+        }
         std::set<lock::NodeId> ready;
         std::set<lock::NodeId> completed;
         const size_t peers = cfg.peers.size() - 1;
@@ -73,6 +81,22 @@ int main(int argc, char** argv) {
             }
             if (*cas_result != 0)
                 throw std::runtime_error("remote CAS did not observe the initial zero");
+            auto* read_result = static_cast<uint64_t*>(net.allocate(sizeof(uint64_t), 8));
+            *read_result = 0;
+            net.read_word(leader, read_result, lock::rdma::kLogOffset, 4);
+            bool read_ok = false;
+            while (!read_ok) {
+                deadline_check(deadline);
+                for (const auto& event : net.poll()) {
+                    if (event.kind == lock::rdma::CompletionKind::Read &&
+                        event.peer == leader && event.work_id == 4)
+                        read_ok = true;
+                    else if (event.kind == lock::rdma::CompletionKind::Receive)
+                        throw std::runtime_error("unexpected smoke message during READ");
+                }
+            }
+            if (*read_result != kReadProof)
+                throw std::runtime_error("remote READ did not observe CPU-published proof");
             net.send(leader, lock::message(lock::Kind::Release, cfg.self), 3);
             bool acknowledged = false;
             while (!acknowledged) {

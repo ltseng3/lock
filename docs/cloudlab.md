@@ -254,3 +254,29 @@ reclaimed only after its local WRITE CQE. This is local backpressure, not a
 change to FIFO or the one-sided retirement-marker representation. Recheck
 8-worker/32-outstanding runs, including test completion and no missing
 release acknowledgments, before running a full sweep.
+
+## Optional peer completion READ for handoff
+
+Use `--handoff-peer-read=1` to enable the client-only fast path; the
+default is 0 (normal NEXT/HANDOFF). Compare both on the same checkout:
+
+    python3 experiments/run.py --suite=/tmp/handoff-lane-compare.json --mu-lanes=1 --handoff-peer-read=0 --remote-dir=/tmp/lock-peer-read-off
+    python3 experiments/run.py --suite=/tmp/handoff-lane-compare.json --mu-lanes=1 --handoff-peer-read=1 --remote-dir=/tmp/lock-peer-read-on
+
+Each client exposes an 8 MiB completion ring at kLogOffset (unused log
+space on clients). It publishes the exact RequestId only after the protected
+WRITE completes, before notifying the successor or leader. Once ORDER is
+committed, the successor may issue one 8-byte READ to the predecessor (or
+local load for same-client handoff). The current negotiated READ depth is one
+per peer; busy peers or a full receipt ledger cause a skip, not a retry or
+polling storm. A miss falls back to ordinary HANDOFF. No extra leader READs
+or replicated-log changes. Both mechanisms remain enabled when READ is on.
+
+METRICS includes by-read, by-handoff, reads (remote attempts), local-probes,
+read-misses (both remote and local), read-skipped, and redundant-handoffs.
+These event counters span warmup, measurement, and drain like late-next;
+goodput/latencies use the measurement interval. The sender still delivers
+normal HANDOFF after NEXT, so late-next counts need not fall. At clean
+shutdown, by-read equals redundant-handoffs across all clients.
+Run the updated RDMA smoke first, which now checks CPU-published word READ
+visibility, then low-concurrency and contended hardware trials.

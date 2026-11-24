@@ -48,6 +48,9 @@ int main(int argc, char** argv) {
         cfg.duration_seconds = opt.number("duration-seconds", 15);
         cfg.watchdog_seconds = opt.number("watchdog-seconds", 90);
         cfg.cas_release_guarded = opt.number("cas-release-guarded", 0) != 0;
+        cfg.handoff_peer_read = opt.number("handoff-peer-read", 0) != 0;
+        if (cfg.handoff_peer_read && cfg.backend != lock::Backend::Handoff)
+            throw std::invalid_argument("peer READ is only supported by handoff");
         lock::rdma::Transport net(net_cfg);
         net.connect();
         std::cout << "READY node=" << cfg.self << std::endl;

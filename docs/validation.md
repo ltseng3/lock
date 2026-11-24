@@ -134,3 +134,31 @@ pending and resumes on a marker completion, rather than failing with
 progress when markers are delayed and that all marker WRs have completed
 before the client sends STOP. These are correctness requirements, not
 guaranteed by CI's hardware-free tests.
+
+## Peer READ activation safety boundary
+
+Only an ordered successor may probe its exact predecessor. An aligned word
+published after the protected data WRITE CQE is compared to the full
+RequestId, not a boolean; ring collisions cause misses, not false grants.
+This assumes coherent CPU/NIC memory and aligned 64-bit access on the
+target platform. No support is claimed for process restart, failover, or
+reusing request IDs inside a live session.
+
+The client event loop serializes READ CQEs and HANDOFF receives. A READ winner
+records the expected late HANDOFF identity (request, lock, predecessor,
+position); consume it exactly once without reactivation, even after slot
+reuse. A HANDOFF winner keeps its pending READ result buffer and generation
+until CQE, and ignores the later successful proof for activation. The ledger
+is bounded (4096 entries), and peer READ depth is bounded to one per peer.
+Shutdown waits for all expected HANDOFFs, outstanding READs, marker WRs
+and release ACKs before the all-client barrier; the completion region stays
+registered until all clients have drained. ACKs reclaim retirement records
+because the leader emits any NEXT before retirement ACK on the same
+ordered lane/client QP.
+
+The hardware-free fake transport test drives production client transitions:
+READ first, delayed HANDOFF after slot reuse, HANDOFF first with READ still
+outstanding after retirement, mismatched proof, ring collision, local probe,
+and early HANDOFF. It also checks leader NEXT-before-ACK ordering.
+CI cannot establish coherent DMA visibility, remote READ progress,
+hardware exclusivity, or performance; physical testing remains required.

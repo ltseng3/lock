@@ -16,9 +16,16 @@ namespace lock {
 class ReplicationProgress {
 public:
     static constexpr size_t max_outstanding_batches = 512;
-    explicit ReplicationProgress(size_t followers) : followers_(followers) {
-        if (followers != 2 && followers != 4)
-            throw std::invalid_argument("replication requires 2 or 4 followers");
+    // In a recovered three-replica configuration exactly one surviving
+    // follower remains. The original majority still requires one remote copy.
+    explicit ReplicationProgress(size_t followers, uint64_t recovered = 0,
+                                 size_t required = 0)
+        : followers_(followers, rdma::CompletionPrefix<max_outstanding_batches>(recovered)),
+          required_(required ? required : followers / 2),
+          posted_(recovered), committed_(recovered) {
+        if ((!required && followers != 2 && followers != 4) ||
+            (required && (followers != 1 || required != 1)))
+            throw std::invalid_argument("invalid fixed-membership replication quorum");
     }
     bool can_post() const {
         for (const auto& f : followers_)
@@ -42,12 +49,13 @@ public:
         // prefix is the largest contiguous prefix present on a majority.
         std::sort(prefixes.begin(), prefixes.end(),
                   std::greater<uint64_t>{});
-        committed_ = prefixes[followers_.size() / 2 - 1];
+        committed_ = prefixes[required_ - 1];
     }
     uint64_t committed() const { return committed_; }
     uint64_t posted() const { return posted_; }
 private:
     std::vector<rdma::CompletionPrefix<max_outstanding_batches>> followers_;
+    size_t required_;
     uint64_t posted_ = 0, committed_ = 0;
 };
 } // namespace lock

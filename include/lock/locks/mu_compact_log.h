@@ -3,6 +3,7 @@
 #include "lock/locks/mu_encoding.h"
 #include "lock/locks/replicated_log.h"
 #include "lock/locks/replication_progress.h"
+#include "lock/locks/mu_recovery.h"
 #include "lock/rdma/transport.h"
 #include <cstddef>
 #include <cstdint>
@@ -19,7 +20,8 @@ public:
     static constexpr size_t max_batch = 16;
     MuCompactLog(rdma::Transport& net, std::vector<NodeId> replicas,
                  size_t window, size_t capacity_limit = 0,
-                 size_t lane = 0, size_t lane_count = 1);
+                 size_t lane = 0, size_t lane_count = 1,
+                 MuRecoveryConfig recovery = {});
     // The caller gathers only work already available, up to this limit.
     // Zero means backpressure from the commit ring or a follower SQ.
     size_t available() const;
@@ -39,6 +41,7 @@ private:
     CompactLaneLayout layout_;
     ReplicationProgress progress_;
     size_t lane_;
+    MuRecoveryConfig recovery_;
     uint64_t applied_ = 0;
 };
 } // namespace lock

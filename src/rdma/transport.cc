@@ -137,6 +137,7 @@ struct Transport::Impl {
         uint32_t psn = 0;
         uint32_t unsignaled_posted = 0;
         bool client_lanes = false;
+        bool fenced = false;
         std::vector<ExtraQp> extra_qps;
         Bootstrap remote{};
     };
@@ -559,6 +560,72 @@ void Transport::write_inline_words(NodeId peer, std::span<const uint64_t> words,
     wr.wr.rdma.rkey = c.remote.rkey;
     check(!ibv_post_send(qp, &wr, &bad), "post compact WRITE batch");
 }
+void Transport::fence_peer(NodeId peer) {
+    auto& x = *impl_;
+    if (!peer || peer != x.cfg.recoverable_peer)
+        throw std::invalid_argument("cannot fence an undesignated peer");
+    auto& c = x.conn(peer);
+    if (c.fenced) return;
+    // Destroy all receive-side QPs before reading the stable crash log.
+    // Hardware validation of DMA quiescence is required on the target RNIC.
+    for (auto& extra : c.extra_qps) {
+        check(!ibv_destroy_qp(extra.qp), "destroy failed peer lane QP");
+        extra.qp = nullptr;
+    }
+    check(!ibv_destroy_qp(c.qp), "destroy failed peer base QP");
+    c.qp = nullptr;
+    c.fenced = true;
+}
+void Transport::write_published_words(NodeId peer, std::span<const uint64_t> words,
+                                     size_t offset, size_t marker_offset,
+                                     WorkId end, size_t lane) {
+    auto& x = *impl_;
+    if (words.empty() || words.size() > 16 || !end || offset % 8)
+        throw std::invalid_argument("invalid published replication batch");
+    x.verify_remote(peer, offset, words.size_bytes());
+    x.verify_remote(peer, marker_offset, words.size());
+    auto& c = x.conn(peer);
+    if (lane > c.extra_qps.size() || c.client_lanes)
+        throw std::invalid_argument("invalid published replication QP");
+    ibv_qp* qp = lane ? c.extra_qps[lane - 1].qp : c.qp;
+    std::array<uint8_t, 16> ones;
+    ones.fill(1);
+    ibv_sge sges[2]{};
+    sges[0].addr = reinterpret_cast<uintptr_t>(words.data());
+    sges[0].length = static_cast<uint32_t>(words.size_bytes());
+    sges[1].addr = reinterpret_cast<uintptr_t>(ones.data());
+    sges[1].length = static_cast<uint32_t>(words.size());
+    ibv_send_wr wrs[2]{}, *bad = nullptr;
+    for (size_t i = 0; i < 2; ++i) {
+        auto& wr = wrs[i];
+        wr.wr_id = encode(Tag::Write, peer, i ? end : 0);
+        wr.sg_list = &sges[i]; wr.num_sge = 1;
+        wr.opcode = IBV_WR_RDMA_WRITE;
+        wr.send_flags = IBV_SEND_INLINE | (i ? IBV_SEND_SIGNALED : 0);
+        wr.wr.rdma.remote_addr = c.remote.base + (i ? marker_offset : offset);
+        wr.wr.rdma.rkey = c.remote.rkey;
+    }
+    wrs[0].next = &wrs[1];
+    check(!ibv_post_send(qp, wrs, &bad), "post published compact batch");
+}
+void Transport::read_range(NodeId peer, void* result, size_t length,
+                           size_t offset, WorkId id) {
+    auto& x = *impl_;
+    if (!length || length > UINT32_MAX || !x.is_local(result, length))
+        throw std::invalid_argument("invalid recovery READ buffer");
+    x.verify_remote(peer, offset, length);
+    auto& c = x.conn(peer);
+    ibv_sge sge{};
+    sge.addr = reinterpret_cast<uintptr_t>(result);
+    sge.length = static_cast<uint32_t>(length); sge.lkey = x.mr->lkey;
+    ibv_send_wr wr{}, *bad = nullptr;
+    wr.wr_id = encode(Tag::Read, peer, id);
+    wr.sg_list = &sge; wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_READ; wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr.rdma.remote_addr = c.remote.base + offset;
+    wr.wr.rdma.rkey = c.remote.rkey;
+    check(!ibv_post_send(c.qp, &wr, &bad), "post recovery READ");
+}
 void Transport::send_batch(NodeId peer, std::span<const Message> messages,
                            WorkId end, size_t lane) {
     auto& x = *impl_; auto& c = x.conn(peer);
@@ -664,9 +731,19 @@ void Transport::poll_on_cq(std::vector<Completion>& result, int batch,
     result.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
         auto& w = wc[i];
-        if (w.status != IBV_WC_SUCCESS)
-            throw std::runtime_error(std::string("CQ failure: ") + ibv_wc_status_str(w.status));
         NodeId peer = static_cast<NodeId>((w.wr_id >> 48) & 0xff);
+        // Destruction may leave already queued CQEs. Do not repost a receive
+        // or dereference a destroyed QP. Only the designated failed peer is
+        // recoverable; all other errors remain fatal.
+        if (peer == x.cfg.recoverable_peer && x.conn(peer).fenced) continue;
+        if (w.status != IBV_WC_SUCCESS) {
+            if (peer != x.cfg.recoverable_peer || !peer)
+                throw std::runtime_error(std::string("CQ failure: ") + ibv_wc_status_str(w.status));
+            Completion failed{};
+            failed.kind = CompletionKind::PeerFailed; failed.peer = peer;
+            result.push_back(failed);
+            continue;
+        }
         uint64_t token = w.wr_id & kTokenMask;
         Tag tag = static_cast<Tag>(w.wr_id >> 56);
         Completion c{};

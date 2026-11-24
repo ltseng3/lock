@@ -18,7 +18,7 @@ struct Peer {
     NodeId id;
     std::string ip;
 };
-enum class CompletionKind { Receive, Send, Write, CompareSwap, Read };
+enum class CompletionKind { Receive, Send, Write, CompareSwap, Read, PeerFailed };
 struct Completion {
     CompletionKind kind;
     NodeId peer;
@@ -34,6 +34,7 @@ struct Config {
     std::string device;
     size_t memory_bytes = kDefaultMemoryBytes;
     uint32_t receive_depth = 128;
+    NodeId recoverable_peer = 0; // only the explicitly designated crash-stop peer
     // Leader-only Mu configuration: these peer QPs get a dedicated
     // replication CQ, separate from the client-communication CQ.
     std::vector<NodeId> replication_peers;
@@ -72,6 +73,12 @@ public:
     // A contiguous inline WRITE, always signaled. Up to 16 compact words.
     void write_inline_words(NodeId peer, std::span<const uint64_t> words,
                             size_t remote_offset, WorkId end, size_t lane);
+    // Same-QP payload + byte publication chain, one signaled tail CQE.
+    void write_published_words(NodeId peer, std::span<const uint64_t> words,
+                               size_t offset, size_t marker_offset, WorkId end, size_t lane);
+    // One-shot fencing. Call only from the sole owner with all peer users stopped.
+    void fence_peer(NodeId peer);
+    void read_range(NodeId peer, void* result, size_t length, size_t remote_offset, WorkId work_id);
     // Linked SEND WRs for one client QP, with only the tail signaled.
     // The caller owns SQ credits; end identifies the completed prefix.
     void send_batch(NodeId peer, std::span<const Message> messages,

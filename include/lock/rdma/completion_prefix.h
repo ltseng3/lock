@@ -13,6 +13,7 @@ template <size_t Capacity>
 class CompletionPrefix {
     static_assert(Capacity > 0);
 public:
+    explicit CompletionPrefix(uint64_t initial = 0) : posted_(initial), completed_(initial) {}
     bool full() const { return pending_ == Capacity; }
     uint64_t posted() const { return posted_; }
     uint64_t completed() const { return completed_; }

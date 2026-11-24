@@ -57,6 +57,10 @@ void Transport::write_inline_words(NodeId peer, std::span<const uint64_t> words,
                                    size_t offset, WorkId end, size_t lane) {
     writes.push_back({peer, {words.begin(), words.end()}, offset, end, lane});
 }
+void Transport::write_published_words(NodeId peer, std::span<const uint64_t> words,
+                                     size_t offset, size_t, WorkId end, size_t lane) {
+    write_inline_words(peer, words, offset, end, lane);
+}
 void Transport::send_batch(NodeId peer, std::span<const Message> messages,
                            WorkId end, size_t lane) {
     sends.push_back({peer, {messages.begin(), messages.end()}, end, lane});
@@ -82,6 +86,14 @@ void test_progress() {
     p.completed(3, 3);
     require(p.committed() == 9);
     rejected([&] { p.completed(3, 3); });
+
+    ReplicationProgress recovered(1, 17, 1);
+    require(recovered.committed() == 17 && recovered.posted() == 17);
+    recovered.posted(20);
+    require(recovered.committed() == 17);
+    recovered.completed(0, 20);
+    require(recovered.committed() == 20);
+    rejected([&] { recovered.completed(0, 20); });
 
     ReplicationProgress slow(2);
     for (uint64_t i = 1; i <= ReplicationProgress::max_outstanding_batches; ++i) {

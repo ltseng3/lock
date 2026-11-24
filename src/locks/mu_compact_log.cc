@@ -14,8 +14,8 @@ size_t log_capacity(size_t memory, size_t limit) {
         throw std::invalid_argument("compact log capacity exceeds registered region");
     return limit ? limit : capacity;
 }
-std::vector<NodeId> follower_ids(NodeId self, std::vector<NodeId> replicas) {
-    if ((replicas.size() != 3 && replicas.size() != 5) ||
+std::vector<NodeId> follower_ids(NodeId self, std::vector<NodeId> replicas, bool promoted) {
+    if ((promoted ? replicas.size() != 2 : (replicas.size() != 3 && replicas.size() != 5)) ||
         std::find(replicas.begin(), replicas.end(), self) == replicas.end())
         throw std::invalid_argument("Mu requires three or five replicas including leader");
     std::sort(replicas.begin(), replicas.end());
@@ -28,11 +28,16 @@ std::vector<NodeId> follower_ids(NodeId self, std::vector<NodeId> replicas) {
 
 MuCompactLog::MuCompactLog(rdma::Transport& net, std::vector<NodeId> replicas,
                            size_t window, size_t capacity_limit,
-                           size_t lane, size_t lane_count)
-    : net_(net), followers_(follower_ids(net.self(), std::move(replicas))),
-      ring_(window), layout_(log_capacity(net.memory_bytes(), capacity_limit),
-                            lane, lane_count),
-      progress_(followers_.size()), lane_(lane) {
+                           size_t lane, size_t lane_count, MuRecoveryConfig recovery)
+    : net_(net), followers_(follower_ids(net.self(), std::move(replicas), recovery.promoted)),
+      ring_(window), layout_(recovery.enabled ? mu_recovery_capacity(net.memory_bytes()) :
+                             log_capacity(net.memory_bytes(), capacity_limit), lane, lane_count),
+      progress_(followers_.size(), recovery.recovered, recovery.promoted ? 1 : 0),
+      lane_(lane), recovery_(recovery), applied_(recovery.recovered) {
+    if ((recovery.enabled && capacity_limit) ||
+        (recovery.promoted && !recovery.enabled) ||
+        recovery.recovered > layout_.capacity())
+        throw std::invalid_argument("invalid recovered compact log");
     if (!window || window > 4096)
         throw std::invalid_argument("invalid Mu log pipeline window");
     // All participants must use identical physical offsets. Do not allow
@@ -66,8 +71,12 @@ void MuCompactLog::append_batch(std::span<const Message> mutations) {
     // Every batch is signaled on every follower. Its exclusive end is the
     // CQE token. RC ordering is per QP; never infer another lane's progress.
     const auto payload = std::span<const uint64_t>(words.data(), mutations.size());
-    for (NodeId peer : followers_)
-        net_.write_inline_words(peer, payload, offset, end, lane_);
+    for (NodeId peer : followers_) {
+        if (recovery_.enabled && recovery_.publication)
+            net_.write_published_words(peer, payload, offset,
+                mu_recovery_marker_offset(net_.memory_bytes(), first), end, lane_);
+        else net_.write_inline_words(peer, payload, offset, end, lane_);
+    }
     progress_.posted(end);
 }
 

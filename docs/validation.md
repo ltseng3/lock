@@ -241,3 +241,47 @@ prepared handoff chain, and a peer READ winner with a late redundant
 HANDOFF through the actual client state machine. No RDMA device is used
 by these tests. The one-sided markers and their CQEs, ReleaseAck reclamation,
 proof validation, and shutdown barrier remain necessary in both workloads.
+
+## Experimental Mu leader replacement
+
+This branch supports one externally designated crash-stop replacement only:
+three replicas, one lane, empty critical sections, surviving clients, no
+rejoin or election. The controller must terminate R1 and notify R2/R3.
+Fencing destroys the old peer's QPs before the stable-tail scan. Verify on
+the actual RNIC that destruction quiesces inbound writes; software tests
+cannot establish this. Unexpected peer errors remain fatal.
+
+The original commit rule already exposes only a contiguous quorum-completed
+prefix. The posted-minus-applied window W bounds the uncommitted suffix:
+a follower observing contiguous published length L can replay through
+max(0,L-W) (exclusive length). Replay applies the same MuState transitions,
+discarding outgoing actions and retaining a dense request-status index.
+Followers never send ownership messages in the normal path.
+
+Publication mode (default) uses one byte per slot, written in a linked
+same-QP inline WR after the payload, with only the second WR signaled.
+This is an extra WRITE per batch, not another synchronous round. It relies
+on ordered RC placement and coherent DMA visibility without relaxed
+ordering, to be verified on hardware. A hole terminates the valid prefix.
+Raw mode (--mu-recovery-publication=0) keeps the original one-WR batch;
+it is conditional on aligned 8-byte DMA atomicity and ordered visibility
+and MUST NOT be treated as established safe merely because tests pass.
+Both recovery modes reserve the same byte sidecar; no-recovery layout
+and batching remain unchanged.
+
+R2 and R3 fence R1, exchange stable lengths, compare the overlapping tail,
+copy only the missing suffix, and establish the original two-of-three
+majority. R2 applies the remainder, then reconciles all live client IDs.
+WaitGrant absent -> retry same ID; queued -> wait; holder -> GRANT.
+WaitRelease holder -> retry RELEASE; released -> ACK. Invalid states,
+duplicate reports and omitted recovered active requests fail closed.
+Clients ignore stale old-leader messages and never re-execute an already
+completed critical section. The promoted leader initializes posted,
+committed, applied and per-follower credit prefixes to the repaired length.
+The original quorum threshold remains two nodes; no second failure is
+supported. R3 seals and remains passive after the one replacement.
+
+The tests cover window inference, request state, replay, FIFO resume,
+and stale old-leader client responses. They do not prove DMA atomicity
+or quiescence. Recovery latency starts at R2's observed external trigger;
+controller RPC timings and client-local completion gaps are separate.

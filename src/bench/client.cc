@@ -177,9 +177,12 @@ void ClientEngine::release(size_t slot) {
 void ClientEngine::complete(size_t slot) {
     auto& op = ops_[slot];
     auto now = Clock::now();
-    if (cfg_.mu_recovery && trace_start_ != Clock::time_point{} && now <= measurement_end_) {
-        const auto index = nanos(now - trace_start_) / trace_bucket_ns_;
-        if (index < trace_counts_.size()) ++trace_counts_[index];
+    if (cfg_.mu_recovery && trace_start_ != Clock::time_point{}) {
+        if (now <= measurement_end_) {
+            const auto index = nanos(now - trace_start_) / trace_bucket_ns_;
+            if (index < trace_counts_.size()) ++trace_counts_[index];
+        }
+        if (!recovery_started_) last_old_completion_ = now;
         if (recovery_ready_ && first_resumed_ == Clock::time_point{}) first_resumed_ = now;
     }
     if (op.begun >= measurement_begin_ && now <= measurement_end_) {
@@ -428,7 +431,10 @@ void ClientEngine::handle(const rdma::Completion& c) {
     if (cfg_.mu_recovery) {
         if (c.kind == rdma::CompletionKind::PeerFailed) {
             if (c.peer != cfg_.replicas.front()) throw std::runtime_error("unexpected peer failure");
-            if (!recovery_started_) recovery_paused_ = true;
+            if (!recovery_started_) {
+                recovery_paused_ = true;
+                if (failure_pause_ == Clock::time_point{}) failure_pause_ = Clock::now();
+            }
             return;
         }
         if ((recovery_started_ || recovery_paused_) && c.peer == cfg_.replicas.front())
@@ -653,6 +659,8 @@ void ClientEngine::print_recovery_trace() const {
         return t == Clock::time_point{} ? 0 : nanos(t - trace_start_);
     };
     std::cout << "MU_RECOVERY_CLIENT {\"node\":" << cfg_.self
+              << ",\"last_old_completion_ns\":" << relative(last_old_completion_)
+              << ",\"failure_pause_ns\":" << relative(failure_pause_)
               << ",\"notice_ns\":" << relative(recovery_notice_)
               << ",\"ready_ns\":" << relative(recovery_ready_time_)
               << ",\"first_completion_ns\":" << relative(first_resumed_)

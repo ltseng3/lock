@@ -70,6 +70,11 @@ def process_command(topo: Topology, node, suite: dict, case: dict,
                        arg("leader-comm-batch", suite.get("leader_comm_batch", 64))])
     if node.role == "replica" and case["backend"] == "mu":
         common.append(arg("mu-inflight-window", suite.get("mu_inflight_window", 512)))
+    if case["backend"] == "mu" and suite.get("mu_recovery", False):
+        common.append(arg("mu-recovery", 1))
+        if node.role == "replica":
+            common.extend([arg("mu-recovery-publication", int(suite.get("mu_recovery_publication", True))),
+                           arg("mu-recovery-replay", int(suite.get("mu_recovery_replay", True)))])
     if case["backend"] == "handoff":
         common.append(arg("handoff-gc", int(suite.get("handoff_gc", False))))
     if node.role == "client" and case["backend"] == "handoff":
@@ -100,11 +105,15 @@ def process_command(topo: Topology, node, suite: dict, case: dict,
 def start_node(remote: Remote, node, remote_dir: str,
                run_name: str, argv: list[str]) -> None:
     folder = f"{remote_dir}/runs/{run_name}"
+    recovery = "--mu-recovery=1" in argv and node.role == "replica"
+    if recovery:
+        argv = [*argv, arg("mu-recovery-trigger", folder + "/promote")]
     cmd = shlex.join(argv)
     script = (f"mkdir -p {shlex.quote(folder)} && cd {shlex.quote(remote_dir)} && "
               f"nohup {cmd} > {shlex.quote(folder + '/node.log')} 2>&1 < /dev/null &")
     # Keep PID and background job in the same remote shell; do not rely on ssh job control.
     launch = (f"mkdir -p {shlex.quote(folder)}; cd {shlex.quote(remote_dir)}; "
+              f"rm -f {shlex.quote(folder + '/promote')}; "
               f"nohup {cmd} > {shlex.quote(folder + '/node.log')} 2>&1 < /dev/null "
               f"& echo $! > {shlex.quote(folder + '/pid')}")
     remote.command(node, launch)
@@ -172,6 +181,28 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
             remote, node, remote_dir, name, process_command(topo, node, suite, case, smoke)))
         wait_for(remote, topo.nodes, folder, "RDMA_SMOKE_OK" if smoke else "READY node=",
                  min(120, suite.get("watchdog_seconds", 90)))
+        if not smoke and suite.get("crash_after_ms") is not None:
+            # The controller is the failure oracle. No graceful drain, no
+            # election, no assumption of synchronized host clocks.
+            old = topo.by_id(topo.replicas[0])
+            wait_for(remote, (old,), folder, "MU_SERVICE_STARTED",
+                     min(120, suite.get("watchdog_seconds", 90)))
+            delay = suite["crash_after_ms"] / 1000
+            # Sleep on the controller after observing the start barrier.
+            # SSH injection/notification time is separate from R2's timer.
+            time.sleep(delay)
+            t0 = time.monotonic_ns()
+            remote.command(old, f"kill -KILL \"$(cat {shlex.quote(folder + '/pid')})\"")
+            killed = time.monotonic_ns()
+            remote.parallel(tuple(topo.by_id(n) for n in topo.replicas[1:]),
+                            lambda n: remote.command(n, f"touch {shlex.quote(folder + '/promote')}"))
+            notified = time.monotonic_ns()
+            manifest["injection"] = {
+                "configured_delay_ms": suite["crash_after_ms"],
+                "controller_kill_rpc_ns": killed - t0,
+                "controller_notification_rpc_ns": notified - killed,
+                "failed": old.id, "replacement": topo.replicas[1],
+            }
         if not smoke:
             duration = (suite["warmup_seconds"] + suite["duration_seconds"] +
                         suite["watchdog_seconds"])
@@ -210,6 +241,32 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
                     raise ValueError(f"no completed pairs from node {node_id}")
                 results.append(record)
             manifest["client_results"] = results
+            if suite.get("mu_recovery", False):
+                def exactly_one(log, prefix):
+                    values = [json.loads(line[len(prefix):]) for line in log.splitlines()
+                              if line.startswith(prefix)]
+                    if len(values) != 1:
+                        raise RuntimeError(f"expected one {prefix.strip()} record")
+                    return values[0]
+                traces = [exactly_one(logs[n], "MU_RECOVERY_CLIENT ") for n in topo.clients]
+                manifest["recovery_clients"] = traces
+                if suite.get("crash_after_ms") is not None:
+                    recovery = exactly_one(logs[topo.replicas[1]], "MU_RECOVERY ")
+                    for tr in traces:
+                        if not (0 < tr["last_old_completion_ns"] <= tr["notice_ns"] <=
+                                tr["ready_ns"] <= tr["first_completion_ns"] <=
+                                (suite["warmup_seconds"] + suite["duration_seconds"]) * 10**9):
+                            raise RuntimeError("client did not resume during measurement")
+                    if recovery["recovered_length"] != max(recovery["local_length"],
+                                                           recovery["remote_length"]):
+                        raise RuntimeError("invalid recovered length")
+                    manifest["recovery"] = recovery
+                    manifest["recovery"]["max_client_gap_ns"] = max(
+                        tr["first_completion_ns"] - tr["last_old_completion_ns"] for tr in traces)
+                    manifest["recovery"]["max_notice_to_completion_ns"] = max(
+                        tr["first_completion_ns"] - tr["notice_ns"] for tr in traces)
+                elif any(tr["notice_ns"] for tr in traces):
+                    raise RuntimeError("unexpected recovery in no-crash trial")
             if suite.get("profile_leader", False) and case["backend"] in ("mu", "handoff"):
                 prefix = ("LEADER_PROFILE " if case["backend"] == "mu"
                           else "HANDOFF_PROFILE ")
@@ -276,6 +333,14 @@ def main() -> int:
                     help="Print per-client throughput and latency details")
     ap.add_argument("--profile-leader", action="store_true",
                     help="Print one-second Mu leader diagnostics during the trial")
+    ap.add_argument("--mu-recovery", type=int, choices=(0, 1),
+                    help="One externally triggered Mu leader replacement")
+    ap.add_argument("--mu-recovery-publication", type=int, choices=(0, 1),
+                    help="Ordered byte publication (1, default); raw word experiment (0)")
+    ap.add_argument("--mu-recovery-replay", type=int, choices=(0, 1),
+                    help="Background follower replay (1, default)")
+    ap.add_argument("--crash-after-ms", type=int,
+                    help="Kill initial leader this long after observing start barrier")
     ap.add_argument("--mu-inflight-window", type=int,
                     help="Mu leader log in-flight limit (1..512; default 512)")
     ap.add_argument("--handoff-inflight-window", type=int,
@@ -335,6 +400,27 @@ def main() -> int:
             suite[key] = override
     if suite["warmup_seconds"] < 0 or suite["duration_seconds"] < 1 or suite["repetitions"] < 1:
         raise ValueError("warmup must be >=0; duration and repetitions must be >=1")
+    for key, default in (("mu_recovery", False), ("mu_recovery_publication", True),
+                         ("mu_recovery_replay", True)):
+        override = getattr(args, key)
+        if override is not None:
+            suite[key] = bool(override)
+        suite.setdefault(key, default)
+        if type(suite[key]) is not bool:
+            raise ValueError(f"{key} must be boolean")
+    if args.crash_after_ms is not None:
+        suite["crash_after_ms"] = args.crash_after_ms
+    if suite.get("crash_after_ms") is not None:
+        delay = suite["crash_after_ms"]
+        if (not suite["mu_recovery"] or type(delay) is not int or delay <= 0 or
+                delay >= (suite["warmup_seconds"] + suite["duration_seconds"] - 1) * 1000):
+            raise ValueError("crash requires recovery, positive delay and >1s post-crash budget")
+    if suite["mu_recovery"] and (args.smoke or
+            (args.only_backend or "") not in ("", "mu") or
+            (args.only_backend != "mu" and suite["backends"] != ["mu"]) or
+            suite.get("mu_lanes", 1) != 1 or len(topo.replicas) != 3 or
+            suite["critical_section_ops"] != 0 or len(topo.clients) > 15):
+        raise ValueError("Mu recovery requires Mu only, three replicas, one lane, empty CS")
     if suite["replicas"] != len(topo.replicas):
         raise ValueError("suite replica count does not match topology")
     if not 1 <= suite.get("mu_lanes", 1) <= 8:
@@ -390,9 +476,18 @@ def main() -> int:
                 print("METRICS", format_summary(record["summary"]), flush=True)
                 for line in record.get("leader_profile", []):
                     print(line, flush=True)
+                if "recovery" in record:
+                    print("RECOVERY", json.dumps(record["recovery"]), flush=True)
                 if args.show_clients:
                     for client in record["client_results"]:
                         print("  CLIENT", format_client(client), flush=True)
+    recovery_rows = [dict(**r["case"], **r["recovery"]) for r in valid if "recovery" in r]
+    if recovery_rows:
+        with (output_dir / "recovery.csv").open("w", newline="") as out:
+            writer = csv.DictWriter(out, fieldnames=list(recovery_rows[0]))
+            writer.writeheader()
+            writer.writerows(recovery_rows)
+        print("RECOVERY_CSV", output_dir / "recovery.csv")
     print("SUMMARY_CSV", output_dir / "summary.csv")
     print("OUTPUT", output_dir)
     print("VALID_TRIALS", len(valid))

@@ -332,3 +332,35 @@ is no waiting for a full batch and no extra worker. Leader profile
 logical actions. Client counters `gc-next`, `gc-records` and `gc-messages`
 include warmup and drain, like HANDOFF counters. A GC packet is not a new
 ownership proof and does not change the local release-completion boundary.
+
+## Experimental Mu crash-stop recovery (recovery branch)
+
+Only Mu, 3 replicas, one lane, and empty sections are supported initially.
+R1 is killed with SIGKILL by the controller; R2 is the designated leader,
+R3 is the remaining follower. All clients survive. No detection/election.
+
+    python3 experiments/run.py --suite=experiments/suites/mu_recovery.json --remote-dir=/tmp/lock-mu-recovery
+
+The configured crash delay begins when the controller observes the start
+barrier, not precisely at the original barrier instant. R2 times fencing,
+tail scan, seal wait, repair, remaining replay, reconciliation and ready
+posting using its own monotonic clock. SSH injection/notification RPC times
+are recorded separately. A trial is invalid if any client fails to resume
+before the measurement ends. Each manifest includes recovery data and
+10-ms completion bins on each client (local start-barrier origin).
+Plot an archived manifest with:
+
+    python3 experiments/plot_recovery.py results/<run>/<trial>/manifest.json
+
+This uses matplotlib and exports the plotted rate CSV as well. Clocks
+are not synchronized; aggregate time bins are approximate.
+
+Use --mu-recovery-replay=0 to compare full replay at takeover. Use a
+suite with mu_recovery=true but without crash_after_ms for no-crash
+overhead. --mu-recovery=0 with a suite without crash_after_ms retains
+the original failure-free path. Default publication mode uses a same-QP
+byte publication WRITE per replication batch, with one tail CQE. Raw
+--mu-recovery-publication=0 uses the original single WRITE per batch but
+is an experimental hardware-assumption mode, not a validated safety claim.
+Run the publication mode first. Do not infer DMA atomicity or fencing
+safety from a successful throughput run.

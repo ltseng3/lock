@@ -3,6 +3,7 @@
 #include <atomic>
 #include "lock/locks/replicated_log.h"
 #include "lock/locks/handoff_layout.h"
+#include "lock/locks/handoff_recovery.h"
 #include "lock/locks/lane_layout.h"
 #include "lock/locks/retirement_gc.h"
 #include <cstddef>
@@ -44,6 +45,10 @@ ClientEngine::ClientEngine(rdma::Transport& net, ClientConfig cfg)
     if (cfg_.mu_recovery && (cfg_.backend != Backend::Mu || cfg_.replicas.size() != 3 ||
                              cfg_.mu_lanes != 1 || cfg_.critical_section_ops != 0))
         throw std::invalid_argument("Mu recovery initially requires empty critical sections, 3 replicas, 1 lane");
+    if (cfg_.handoff_recovery && (cfg_.mu_recovery || cfg_.backend != Backend::Handoff ||
+        cfg_.replicas.size() != 3 || cfg_.mu_lanes != 1 || cfg_.critical_section_ops != 0 ||
+        cfg_.handoff_gc || cfg_.handoff_peer_read))
+        throw std::invalid_argument("handoff recovery requires empty CS, 3 replicas, 1 lane, no GC/READ");
     if (cfg_.handoff_gc && cfg_.backend != Backend::Handoff)
         throw std::invalid_argument("retirement GC requires handoff");
     if (cfg_.handoff_peer_read) {
@@ -101,8 +106,8 @@ void ClientEngine::submit(size_t slot) {
                   0, true, lock_lane(op.lock, cfg_.mu_lanes));
     } else {
         op.phase = Phase::WaitOrder;
-        net_.send(cfg_.replicas.front(),
-                  message(Kind::Acquire, cfg_.self, op.lock, op.request),
+        net_.send(leader_,
+                  message(Kind::Acquire, cfg_.self, op.lock, op.request, epoch_),
                   0, true, lock_lane(op.lock, cfg_.mu_lanes));
     }
 }
@@ -139,6 +144,7 @@ void ClientEngine::release(size_t slot) {
     if (op.phase != Phase::Writing && op.phase != Phase::EmptyCriticalSection)
         throw std::runtime_error("release before critical section completion");
     op.phase = Phase::WaitRelease;
+    if (recovery_paused_) return; // quiesced CS, report completion instead of old release
     if (cfg_.backend == Backend::Handoff) {
         // The protected WRITE has completed, or no data work was issued.
         // Publish before
@@ -150,7 +156,6 @@ void ClientEngine::release(size_t slot) {
         }
         publish_retirement(slot);
     } else if (cfg_.backend == Backend::Mu) {
-        if (recovery_paused_) return; // preserve WaitRelease for reconciliation
         net_.send(leader_,
                   message(Kind::Release, cfg_.self, op.lock, op.request, epoch_),
                   0, true, lock_lane(op.lock, cfg_.mu_lanes));
@@ -170,7 +175,7 @@ void ClientEngine::release(size_t slot) {
 void ClientEngine::complete(size_t slot) {
     auto& op = ops_[slot];
     auto now = Clock::now();
-    if (cfg_.mu_recovery && trace_start_ != Clock::time_point{}) {
+    if (cfg_.recovery_enabled() && trace_start_ != Clock::time_point{}) {
         if (now <= measurement_end_) {
             const auto index = nanos(now - trace_start_) / trace_bucket_ns_;
             if (index < trace_counts_.size()) ++trace_counts_[index];
@@ -188,7 +193,7 @@ void ClientEngine::complete(size_t slot) {
 
 void ClientEngine::deliver_handoff(RequestId predecessor, const Retired& record) {
     if (!record.successor) return;
-    Message m = message(Kind::Handoff, cfg_.self, record.lock, record.successor);
+    Message m = message(Kind::Handoff, cfg_.self, record.lock, record.successor, epoch_);
     m.other = predecessor;
     m.position = record.successor_position;
     ++handoffs_sent_;
@@ -227,9 +232,9 @@ void ClientEngine::publish_retirement(size_t slot) {
         if (cfg_.handoff_gc) ++gc_next_reclaimed_;
     }
     const size_t remote_offset = handoff_marker_offset(
-        net_.remote_memory_bytes(cfg_.replicas.front()), op.log_slot);
+        net_.remote_memory_bytes(leader_), op.log_slot, cfg_.handoff_recovery);
     const WorkId work = kMarkerTokenBase + markers_posted_ + 1;
-    if (!net_.write_inline(cfg_.replicas.front(), op.request, remote_offset, work))
+    if (!net_.write_inline(leader_, op.request, remote_offset, work))
         throw std::runtime_error("marker WRITE must be signaled");
     ++markers_posted_;
     complete(slot); // Local release is not blocked on marker completion.
@@ -250,22 +255,25 @@ void ClientEngine::handle_order(const rdma::Completion& c) {
         early_next_.erase(found);
         rdma::Completion saved{};
         saved.kind = rdma::CompletionKind::Receive;
-        saved.peer = cfg_.replicas.front(); saved.message = earlier;
+        saved.peer = leader_; saved.message = earlier;
         handle_next(saved);
     }
+    // During installation, ORDER/NEXT only populate the new chain.
+    // A peer may resume earlier than us, so defer any activation to Ready.
+    if (cfg_.handoff_recovery && recovery_paused_) return;
     if (auto found = early_start_.find(m.request); found != early_start_.end()) {
         Message earlier = found->second;
         early_start_.erase(found);
         rdma::Completion saved{};
         saved.kind = rdma::CompletionKind::Receive;
-        saved.peer = cfg_.replicas.front(); saved.message = earlier;
+        saved.peer = leader_; saved.message = earlier;
         handle_activation(saved);
     } else if (op.predecessor == 0) {
         // A committed predecessor-free ORDER acts as the start signal.
         rdma::Completion synthetic{};
         synthetic.kind = rdma::CompletionKind::Receive;
-        synthetic.peer = cfg_.replicas.front();
-        synthetic.message = message(Kind::Start, cfg_.replicas.front(),
+        synthetic.peer = leader_;
+        synthetic.message = message(Kind::Start, leader_,
                                     op.lock, op.request);
         synthetic.message.position = op.position;
         handle_activation(synthetic);
@@ -355,7 +363,7 @@ void ClientEngine::handle_activation(const rdma::Completion& c) {
     if (op.phase != Phase::WaitOrder || op.started || m.position != op.position)
         throw std::runtime_error("duplicate or mismatched activation");
     if (kind == Kind::Start) {
-        if (c.peer != cfg_.replicas.front() || op.predecessor != 0)
+        if (c.peer != leader_ || op.predecessor != 0)
             throw std::runtime_error("unauthorized START");
     } else {
         if (!op.predecessor || m.other != op.predecessor ||
@@ -368,7 +376,7 @@ void ClientEngine::handle_activation(const rdma::Completion& c) {
 }
 void ClientEngine::handle_next(const rdma::Completion& c) {
     const Message& m = c.message;
-    if (c.peer != cfg_.replicas.front() || message_kind(m) != Kind::Next ||
+    if (c.peer != leader_ || message_kind(m) != Kind::Next ||
         !m.other || m.request == m.other || m.value != m.position + 1)
         throw std::runtime_error("invalid NEXT");
     if (auto it = requests_.find(m.request); it != requests_.end()) {
@@ -420,8 +428,78 @@ void ClientEngine::begin_mu_recovery() {
     }
     net_.send(leader_, message(Kind::RecoveryDone, cfg_.self, 0, 0, epoch_));
 }
+void ClientEngine::begin_handoff_recovery() {
+    if (!cfg_.handoff_recovery || recovery_started_ || stop_sent_ ||
+        !awaited_.empty() || !empty_sections_.empty() || !read_receipts_.empty())
+        throw std::runtime_error("invalid handoff recovery transition");
+    recovery_started_ = true;
+    recovery_paused_ = true;
+    recovery_notice_ = Clock::now();
+    net_.fence_peer(leader_);
+    leader_ = cfg_.replicas[1];
+    epoch_ = kReplacementEpoch;
+    // Old marker CQEs cannot consume new credits after old-QP fencing.
+    markers_completed_ = markers_posted_;
+    deferred_marker_slots_.clear();
+    retired_.clear();
+    early_next_.clear();
+    early_start_.clear();
+    early_handoff_.clear();
+    size_t count = 0;
+    for (auto& op : ops_) {
+        if (op.phase == Phase::Idle) continue;
+        HandoffReportPhase phase;
+        if (op.phase == Phase::WaitRelease && op.started && op.ordered)
+            phase = HandoffReportPhase::Finished;
+        else if (op.phase == Phase::WaitOrder && !op.started)
+            phase = op.ordered ? HandoffReportPhase::Ordered : HandoffReportPhase::Pending;
+        else throw std::runtime_error("nonquiescent handoff recovery request");
+        auto m = message(Kind::RecoveryHandoffRequest, cfg_.self, op.lock, op.request, epoch_);
+        m.flags = static_cast<uint32_t>(phase);
+        if (op.ordered) { m.position = op.position; m.value = op.log_slot; }
+        net_.send(leader_, m);
+        ++count;
+        if (phase != HandoffReportPhase::Finished) {
+            op.ordered = false;
+            op.started = false;
+            op.predecessor = op.successor = 0;
+            op.position = op.successor_position = op.log_slot = 0;
+        }
+    }
+    auto done = message(Kind::RecoveryDone, cfg_.self, 0, 0, epoch_);
+    done.position = next_sequence_ - 1;
+    done.value = count;
+    net_.send(leader_, done);
+}
+
+void ClientEngine::resume_handoff_recovery() {
+    if (!early_next_.empty() || !early_start_.empty())
+        throw std::runtime_error("incomplete handoff relationship installation");
+    for (size_t slot = 0; slot < ops_.size(); ++slot) {
+        auto& op = ops_[slot];
+        if (op.phase == Phase::WaitRelease) {
+            // CS already completed in the old epoch; the new queue excludes
+            // it. Count completion once without reexecuting or writing a marker.
+            complete(slot);
+        } else if (op.phase == Phase::WaitOrder && op.ordered) {
+            if (!op.predecessor) {
+                if (early_handoff_.contains(op.request))
+                    throw std::runtime_error("unexpected handoff to recovered head");
+                activate(slot);
+            } else if (auto found = early_handoff_.find(op.request); found != early_handoff_.end()) {
+                rdma::Completion saved{};
+                saved.kind = rdma::CompletionKind::Receive;
+                saved.peer = found->second.sender;
+                saved.message = found->second;
+                early_handoff_.erase(found);
+                handle_activation(saved);
+            }
+        }
+    }
+}
+
 void ClientEngine::handle(const rdma::Completion& c) {
-    if (cfg_.mu_recovery) {
+    if (cfg_.recovery_enabled()) {
         if (c.kind == rdma::CompletionKind::PeerFailed) {
             if (c.peer != cfg_.replicas.front()) throw std::runtime_error("unexpected peer failure");
             if (!recovery_started_) {
@@ -438,16 +516,20 @@ void ClientEngine::handle(const rdma::Completion& c) {
             if (kind == Kind::RecoveryBegin && c.lane == 0) {
                 if (c.message.epoch != kReplacementEpoch)
                     throw std::runtime_error("invalid recovery begin epoch");
-                begin_mu_recovery(); return;
+                if (cfg_.handoff_recovery) begin_handoff_recovery();
+                else begin_mu_recovery();
+                return;
             }
             if (kind == Kind::RecoveryReady && c.lane == 0) {
                 if (!recovery_started_ || recovery_ready_ || c.message.epoch != epoch_)
                     throw std::runtime_error("invalid client recovery ready");
                 recovery_ready_ = true; recovery_paused_ = false;
                 recovery_ready_time_ = Clock::now();
+                if (cfg_.handoff_recovery) resume_handoff_recovery();
                 return;
             }
-            if (!recovery_ready_)
+            if (!recovery_ready_ && !(cfg_.handoff_recovery && recovery_started_ &&
+                (kind == Kind::Order || kind == Kind::Next)))
                 throw std::runtime_error("new leader response before recovery ready");
         }
     }
@@ -456,6 +538,19 @@ void ClientEngine::handle(const rdma::Completion& c) {
         if (c.message.sender != c.peer)
             throw std::runtime_error("message sender mismatch");
         const Kind kind = message_kind(c.message);
+        if (cfg_.handoff_recovery && kind == Kind::Handoff) {
+            if (c.message.epoch < epoch_ || (recovery_paused_ && !recovery_started_))
+                return; // old peer proof is no longer authoritative
+            if (recovery_paused_ && c.message.epoch == epoch_) {
+                const auto it = requests_.find(c.message.request);
+                if (it == requests_.end() || ops_[it->second].phase != Phase::WaitOrder ||
+                    c.peer != request_node(c.message.other) ||
+                    ops_[it->second].lock != c.message.lock_id ||
+                    !early_handoff_.emplace(c.message.request, c.message).second)
+                    throw std::runtime_error("invalid early new-epoch handoff");
+                return;
+            }
+        }
         if (c.message.epoch != epoch_)
             throw std::runtime_error("unexpected client message epoch");
         if (c.peer == leader_) {
@@ -484,7 +579,7 @@ void ClientEngine::handle(const rdma::Completion& c) {
                 handle_activation(c);
                 return;
             }
-            if (c.peer != cfg_.replicas.front())
+            if (c.peer != leader_)
                 throw std::runtime_error("handoff control from non-leader");
             if (kind == Kind::Order) { handle_order(c); return; }
             if (kind == Kind::Start) { handle_activation(c); return; }
@@ -533,7 +628,7 @@ void ClientEngine::handle(const rdma::Completion& c) {
     }
     if (c.work_id >= kMarkerTokenBase) {
         if (cfg_.backend != Backend::Handoff ||
-            c.kind != rdma::CompletionKind::Write || c.peer != cfg_.replicas.front() ||
+            c.kind != rdma::CompletionKind::Write || c.peer != leader_ ||
             markers_drained() || c.work_id != kMarkerTokenBase + markers_completed_ + 1)
             throw std::runtime_error("invalid inline marker completion");
         ++markers_completed_;
@@ -595,7 +690,7 @@ void ClientEngine::handle(const rdma::Completion& c) {
 void ClientEngine::run() {
     latency_samples_.prepare(LatencySamples::capacity_for(
         cfg_.duration_seconds, cfg_.latency_sample_capacity));
-    if (cfg_.mu_recovery)
+    if (cfg_.recovery_enabled())
         trace_counts_.resize((cfg_.warmup_seconds + cfg_.duration_seconds) * 100 + 1);
     const NodeId leader = cfg_.replicas.front();
     net_.send(leader, message(Kind::Ready, cfg_.self));
@@ -616,7 +711,7 @@ void ClientEngine::run() {
     }
     if (!barrier) throw std::runtime_error("client start barrier timeout");
     const auto start = Clock::now();
-    if (cfg_.mu_recovery) trace_start_ = start;
+    if (cfg_.recovery_enabled()) trace_start_ = start;
     measurement_begin_ = start + std::chrono::seconds(cfg_.warmup_seconds);
     measurement_end_ = measurement_begin_ + std::chrono::seconds(cfg_.duration_seconds);
     auto watchdog = measurement_end_ + std::chrono::seconds(cfg_.watchdog_seconds);
@@ -649,14 +744,15 @@ void ClientEngine::run() {
         if (stop_sent_ && server_stopped_) break;
     }
     if (!awaited_.empty()) throw std::runtime_error("outstanding CQEs at completion");
-    if (cfg_.mu_recovery) print_recovery_trace();
+    if (cfg_.recovery_enabled()) print_recovery_trace();
     print_result();
 }
 void ClientEngine::print_recovery_trace() const {
     const auto relative = [&](Clock::time_point t) -> uint64_t {
         return t == Clock::time_point{} ? 0 : nanos(t - trace_start_);
     };
-    std::cout << "MU_RECOVERY_CLIENT {\"node\":" << cfg_.self
+    std::cout << (cfg_.handoff_recovery ? "HANDOFF_RECOVERY_CLIENT" : "MU_RECOVERY_CLIENT")
+              << " {\"node\":" << cfg_.self
               << ",\"last_old_completion_ns\":" << relative(last_old_completion_)
               << ",\"failure_pause_ns\":" << relative(failure_pause_)
               << ",\"notice_ns\":" << relative(recovery_notice_)

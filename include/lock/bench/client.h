@@ -30,6 +30,8 @@ struct ClientConfig {
     bool handoff_peer_read = false;
     bool handoff_gc = false;
     bool mu_recovery = false;
+    bool handoff_recovery = false;
+    bool recovery_enabled() const { return mu_recovery || handoff_recovery; }
 };
 class ClientEngine {
 public:
@@ -87,6 +89,8 @@ private:
     static constexpr uint64_t trace_bucket_ns_ = 10000000; // 10 ms
     std::vector<uint64_t> trace_counts_;
     void begin_mu_recovery();
+    void begin_handoff_recovery();
+    void resume_handoff_recovery();
     void print_recovery_trace() const;
     std::vector<LockPicker> pickers_;
     std::vector<Operation> ops_;

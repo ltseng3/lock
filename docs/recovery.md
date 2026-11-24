@@ -4,8 +4,8 @@
 
 The initial implementation supports one controller-triggered leader crash,
 three replicas, a predetermined replacement, one replication lane and
-surviving clients with empty critical sections. Mu recovery is implemented;
-Handoff recovery is being developed separately. Neither election, repeated
+surviving clients with empty critical sections. Mu and Handoff leader-only recovery are implemented on this branch;
+Handoff hardware validation is pending. Neither election, repeated
 failure, client exclusion, leases nor replica rejoin is implemented yet.
 Never treat a missing client's watchdog timeout as proof of safe expiration.
 
@@ -40,7 +40,7 @@ commands whose predecessors are known committed. The remaining suffix is
 applied after repair. Client reconciliation matches request identities and
 actual execution phase, not whether an ACK was sent by the failed leader.
 
-## Handoff design (planned integration)
+## Handoff recovery
 
 Handoff logs acquisition headers only. Retirement markers and direct
 HANDOFFs do not appear in the replicated acquisition history. Recover
@@ -100,3 +100,24 @@ headers. The physical log stays unchanged. Unlogged pending IDs are
 returned separately for normal admission. The recovery-only Handoff
 layout uses 8-byte headers, 8-byte retirement words, 1-byte publication
 marks and the shared 4-KiB boundary table. Failure-free layouts are unchanged.
+
+### Runtime and client snapshot
+
+Both backends call the same compact-prefix recovery routine: seal, repair,
+establish the epoch boundary, then finish replay. Handoff clients preconnect
+to the designated replacement. RecoveryBegin fences the old leader QP,
+discards obsolete marker credits only after fencing, and freezes activation.
+RecoveryHandoffRequest carries Pending, Ordered or Finished (completed CS
+with deferred marker), plus original slot/position for ordered requests.
+RecoveryDone carries the highest issued sequence and report count. Old
+peer HANDOFFs are ignored even if their sender remains alive.
+
+The replacement installs all ORDER/NEXT relationships with bounded per-peer
+SEND batches and drains their CQEs before sending RecoveryReady. Clients
+only install relationships while paused. A new-epoch peer HANDOFF that
+arrives before Ready is buffered and validated on resume. A finished
+deferred retirement is completed once locally without a new marker or CS.
+Only the unlogged pending IDs are admitted again. The promoted runtime
+owns the restored HandoffState and resumes appending at the recovered length.
+The first implementation requires all clients and empty critical sections;
+no leases or client exclusion are claimed.

@@ -347,7 +347,64 @@ struct ClientEngineTestAccess {
         e.handle(receive(message(Kind::ReleaseAck, 2, lb, b, kReplacementEpoch)));
         require(e.requests_.empty());
     }
+    static void test_handoff_recovery_client() {
+        rdma::Config nc; nc.self = 5;
+        rdma::Transport net(nc);
+        ClientConfig cfg; cfg.self = 5; cfg.replicas = {1,2,3};
+        cfg.backend = Backend::Handoff; cfg.handoff_recovery = true;
+        cfg.critical_section_ops = 0; cfg.outstanding = 3; cfg.lock_count = 1;
+        ClientEngine e(net, cfg);
+        posted.clear(); e.submit(0); e.submit(1); e.submit(2);
+        const auto a = e.ops_[0].request, b = e.ops_[1].request, c = e.ops_[2].request;
+        // Force a deferred retirement: A has executed but never posted its marker.
+        e.marker_credit_ = 0;
+        auto order = message(Kind::Order, 1, 0, a);
+        order.value = 10; e.handle(receive(order)); e.finish_empty_sections();
+        require(e.ops_[0].phase == ClientEngine::Phase::WaitRelease);
+        order = message(Kind::Order, 1, 0, b);
+        order.other = a; order.position = 1; order.value = 11;
+        e.handle(receive(order));
+        e.handle(receive(message(Kind::RecoveryBegin, 2, 0, 0, kReplacementEpoch)));
+        require(e.recovery_paused_ && e.epoch_ == 1 && e.markers_drained());
+        require(e.deferred_marker_slots_.empty() && e.retired_.empty());
+        require(posted.back().message.value == 3 && posted.back().message.position == 3);
+        // New order for B depends on a different, still-live predecessor.
+        const auto pred = make_request_id(4,9);
+        auto stale = message(Kind::Handoff, 5, 0, b);
+        stale.other = a; stale.position = 1;
+        e.handle(receive(stale));
+        require(!e.ops_[1].started && e.early_handoff_.empty());
+        auto new_order = message(Kind::Order, 2, 0, b, 1);
+        new_order.other = pred; new_order.position = 1; new_order.value = 11;
+        e.handle(receive(new_order));
+        auto next = message(Kind::Next, 2, 0, b, 1);
+        next.other = c; next.position = 1; next.value = 2;
+        e.handle(receive(next));
+        auto early = message(Kind::Handoff, 4, 0, b, 1);
+        early.other = pred; early.position = 1;
+        e.handle(receive(early));
+        require(!e.ops_[1].started && e.empty_sections_.empty());
+        new_order = message(Kind::Order, 2, 0, c, 1);
+        new_order.other = b; new_order.position = 2; new_order.value = 12;
+        e.handle(receive(new_order));
+        e.marker_credit_ = 128;
+        e.handle(receive(message(Kind::RecoveryReady, 2, 0, 0, 1)));
+        require(e.ops_[0].phase == ClientEngine::Phase::Idle && e.ops_[1].started);
+        e.finish_empty_sections();
+        require(e.requests_.empty() && e.early_handoff_.empty() && writes() == 2);
+        for (const auto& p : posted) if (p.kind == rdma::CompletionKind::Write) {
+            require(p.peer == 2 && (p.inline_value == b || p.inline_value == c));
+            e.handle(done(p));
+        }
+        auto ack = message(Kind::ReleaseAck, 2, 0, b, 1); ack.position = 1;
+        e.handle(receive(ack));
+        ack = message(Kind::ReleaseAck, 2, 0, c, 1); ack.position = 2;
+        e.handle(receive(ack));
+        require(e.retired_.empty() && e.markers_drained());
+        e.handle(receive(stale)); // stale old proof after completion is ignored
+    }
     static void run() {
+        test_handoff_recovery_client();
         test_empty_sections();
         test_mu_recovery_client();
         test_retirement_gc();

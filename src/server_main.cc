@@ -70,13 +70,17 @@ int main(int argc, char** argv) {
         const bool leader = cfg.self == replicas.front();
         lock::CompactRecoveryConfig recovery;
         const auto recover = opt.number("mu-recovery", 0);
+        const auto handoff_recover = opt.number("handoff-recovery", 0);
         const auto publication = opt.number("mu-recovery-publication", 1);
         const auto replay = opt.number("mu-recovery-replay", 1);
-        if (recover > 1 || publication > 1 || replay > 1 ||
-            (recover && (backend != lock::Backend::Mu || replicas.size() != 3 ||
-                         mu_lanes != 1 || clients.size() > 15)))
-            throw std::invalid_argument("Mu recovery requires 3 replicas, one lane, <=15 clients");
-        recovery.enabled = recover != 0;
+        if (recover > 1 || handoff_recover > 1 || publication > 1 || replay > 1 ||
+            (recover && backend != lock::Backend::Mu) ||
+            (handoff_recover && (backend != lock::Backend::Handoff || gc)) ||
+            ((recover || handoff_recover) &&
+             (replicas.size() != 3 || mu_lanes != 1 || clients.size() > 15)))
+            throw std::invalid_argument("recovery requires 3 replicas, one lane, <=15 clients and compatible backend");
+        recovery.enabled = recover || handoff_recover;
+        recovery.handoff = handoff_recover != 0;
         recovery.publication = publication != 0;
         recovery.replay = replay != 0;
         if (recovery.enabled && !leader) {
@@ -107,7 +111,12 @@ int main(int argc, char** argv) {
                                              lock_count, opt.number("prepared-window", 8),
                                              handoff_inflight_window,
                                              profile_requested, mu_lanes, replication_batch,
-                                             cfg.communication_batch, gc != 0);
+                                             cfg.communication_batch, gc != 0, recovery);
+            } else if (recovery.handoff) {
+                lock::run_handoff_standby(net, replicas, clients, lock_count,
+                    opt.number("prepared-window", 8), handoff_inflight_window,
+                    profile_requested, replication_batch, cfg.communication_batch, recovery,
+                    opt.number("watchdog-seconds", 90));
             } else if (recovery.enabled) {
                 lock::run_mu_standby(net, replicas, clients, lock_count, mu_inflight_window,
                     profile_requested, replication_batch, cfg.communication_batch, recovery,

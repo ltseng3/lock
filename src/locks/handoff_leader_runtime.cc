@@ -60,14 +60,17 @@ void replication_loop(Shared& s, rdma::Transport& net,
                       const std::vector<NodeId>& replicas,
                       size_t lock_count, size_t prepared_window,
                       size_t window, bool profile,
-                      size_t lane, size_t lane_count, size_t replication_batch, bool gc) {
+                      size_t lane, size_t lane_count, size_t replication_batch, bool gc,
+                      CompactRecoveryConfig recovery, HandoffPromotion* promotion) {
     try {
         // Half the registered log area holds 8-byte replicated headers. The
         // adjacent half holds one 8-byte marker per slot, written by the
         // completed client to the leader's NIC-exposed memory.
-        const size_t capacity = handoff_log_capacity(net.memory_bytes());
-        MuCompactLog log(net, replicas, window, capacity, lane, lane_count);
-        HandoffState state(lock_count, prepared_window, gc);
+        const size_t capacity = handoff_log_capacity(net.memory_bytes(), recovery.enabled);
+        MuCompactLog log(net, replicas, window, recovery.enabled ? 0 : capacity,
+                         lane, lane_count, recovery);
+        HandoffState state = promotion ? std::move(promotion->state) :
+            HandoffState(lock_count, prepared_window, gc);
         std::deque<Message> append_pending;
         std::vector<rdma::Completion> cqes;
         cqes.reserve(64);
@@ -78,7 +81,7 @@ void replication_loop(Shared& s, rdma::Transport& net,
         // The sidecar marker region is contiguous; compute its base once
         // rather than checking offset arithmetic for every DMA-visible load.
         auto* marker_base = static_cast<uint64_t*>(net.at(
-            handoff_marker_offset(net.memory_bytes(), 0),
+            handoff_marker_offset(net.memory_bytes(), 0, recovery.enabled),
             capacity * sizeof(uint64_t)));
         const std::function<uint64_t(uint64_t)> read_marker =
             [&](uint64_t slot) {
@@ -204,13 +207,13 @@ void handoff_communication_loop(
     rdma::Transport& net, NodeId self,
     const std::vector<NodeId>& clients, size_t lock_count,
     bool profile, size_t lane, size_t lane_count,
-    std::atomic<bool>& started, size_t communication_batch, bool gc) {
+    std::atomic<bool>& started, size_t communication_batch, bool gc, Epoch epoch) {
     // Each worker owns client-facing QPs and CQ for exactly one lane.
     // Only lane zero runs Ready/Stop barriers.
     std::vector<rdma::Completion> completions;
     completions.reserve(64);
     std::set<NodeId> ready, finished;
-    LeaderResponseBatch responses(net, self, clients, lane, lane_count, communication_batch, gc);
+    LeaderResponseBatch responses(net, self, clients, lane, lane_count, communication_batch, gc, epoch);
     while (!s.stopped.load(std::memory_order_acquire)) {
         if (lane == 0) {
             for (const auto& shard : lanes)
@@ -230,6 +233,7 @@ void handoff_communication_loop(
             if (m.sender != c.peer)
                 throw std::runtime_error("handoff client sender mismatch");
             const Kind kind = message_kind(m);
+            if (m.epoch != epoch) throw std::runtime_error("handoff request epoch mismatch");
             if (kind == Kind::Ready && lane == 0 &&
                 !started.load(std::memory_order_acquire)) {
                 if (std::find(clients.begin(), clients.end(), c.peer) == clients.end() ||
@@ -237,8 +241,9 @@ void handoff_communication_loop(
                     throw std::runtime_error("invalid handoff readiness");
                 if (ready.size() == clients.size()) {
                     started.store(true, std::memory_order_release);
+                    std::cout << "HANDOFF_SERVICE_STARTED" << std::endl;
                     for (NodeId id : clients)
-                        net.send(id, message(Kind::Ready, self), 0, true, 0);
+                        net.send(id, message(Kind::Ready, self, 0, 0, epoch), 0, true, 0);
                 }
             } else if (kind == Kind::Stop && lane == 0 &&
                        started.load(std::memory_order_acquire)) {
@@ -247,7 +252,7 @@ void handoff_communication_loop(
                     throw std::runtime_error("invalid handoff shutdown");
                 if (finished.size() == clients.size())
                     for (NodeId id : clients)
-                        net.send(id, message(Kind::Stop, self), 0, true, 0);
+                        net.send(id, message(Kind::Stop, self, 0, 0, epoch), 0, true, 0);
             } else if ((kind == Kind::Acquire) &&
                        started.load(std::memory_order_acquire)) {
                 if (std::find(clients.begin(), clients.end(), c.peer) == clients.end() ||
@@ -274,7 +279,8 @@ void run_handoff_leader(rdma::Transport& net, NodeId self,
                         size_t lock_count, size_t prepared_window,
                         size_t inflight_window, bool profile,
                         size_t lane_count, size_t replication_batch,
-                        size_t communication_batch, bool gc) {
+                        size_t communication_batch, bool gc,
+                        CompactRecoveryConfig recovery, HandoffPromotion* promotion) {
     if (!replication_batch || replication_batch > MuCompactLog::max_batch ||
         !communication_batch || communication_batch > LeaderResponseBatch::drain_limit)
         throw std::invalid_argument("invalid leader batch size");
@@ -286,14 +292,21 @@ void run_handoff_leader(rdma::Transport& net, NodeId self,
     workers.reserve(2 * lane_count - 1);
     for (size_t lane = 0; lane < lane_count; ++lane)
         lanes.push_back(std::make_unique<Shared>());
-    std::atomic<bool> started{false};
+    if (recovery.promoted != (promotion != nullptr) ||
+        (recovery.enabled && (!recovery.handoff || lane_count != 1 || gc)))
+        throw std::invalid_argument("invalid handoff recovery runtime");
+    if (promotion) for (const auto& m : promotion->pending)
+        if (!lanes.front()->requests.try_push(m))
+            throw std::runtime_error("handoff recovery pending overflow");
+    const Epoch epoch = recovery.promoted ? kReplacementEpoch : kInitialEpoch;
+    std::atomic<bool> started{promotion != nullptr};
     // Join workers before destroying their shared start flag.
     JoinWorkers join{lanes, workers};
     for (size_t lane = 0; lane < lane_count; ++lane) {
         Shared* shard = lanes[lane].get();
         workers.emplace_back([&, shard, lane] {
             replication_loop(*shard, net, replicas, lock_count, prepared_window,
-                             inflight_window, profile, lane, lane_count, replication_batch, gc);
+                             inflight_window, profile, lane, lane_count, replication_batch, gc, recovery, promotion);
         });
     }
     for (size_t lane = 1; lane < lane_count; ++lane) {
@@ -301,7 +314,7 @@ void run_handoff_leader(rdma::Transport& net, NodeId self,
         workers.emplace_back([&, shard, lane] {
             try {
                 handoff_communication_loop(*shard, lanes, net, self,
-                    clients, lock_count, profile, lane, lane_count, started, communication_batch, gc);
+                    clients, lock_count, profile, lane, lane_count, started, communication_batch, gc, epoch);
             } catch (...) {
                 shard->report_failure(std::current_exception());
             }
@@ -309,6 +322,6 @@ void run_handoff_leader(rdma::Transport& net, NodeId self,
     }
     // Lane zero's control loop owns the start/stop barrier.
     handoff_communication_loop(*lanes.front(), lanes, net, self, clients,
-                    lock_count, profile, 0, lane_count, started, communication_batch, gc);
+                    lock_count, profile, 0, lane_count, started, communication_batch, gc, epoch);
 }
 } // namespace lock

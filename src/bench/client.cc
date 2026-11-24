@@ -60,21 +60,14 @@ ClientEngine::ClientEngine(rdma::Transport& net, ClientConfig cfg)
             op.read_result = static_cast<uint64_t*>(net_.allocate(sizeof(uint64_t), 8));
     }
     if (cfg_.backend == Backend::Handoff) {
-        // Include every logical worker, not just the per-worker outstanding
-        // window. Bound the pool by 512 for the 1024-entry client send QP.
-        // No marker may reuse a buffer before its local WRITE completion.
-        const size_t count = std::max<size_t>(
+        // Retain the existing marker WR budget; only remove buffer ownership.
+        marker_credit_ = std::max<size_t>(
             128, std::min<size_t>(512, ops_.size() * 2));
-        markers_.resize(count);
-        free_markers_.reserve(count);
-        for (size_t i = 0; i < count; ++i) {
-            markers_[i].payload = static_cast<uint64_t*>(
-                net_.allocate(sizeof(uint64_t), 8));
-            free_markers_.push_back(i);
-        }
     }
 }
 WorkId ClientEngine::track(size_t slot, Purpose purpose) {
+    if (next_work_ >= kMarkerTokenBase)
+        throw std::runtime_error("client work ID exhausted");
     WorkId id = next_work_++;
     awaited_.emplace(id, Awaited{slot, ops_.at(slot).generation, purpose});
     return id;
@@ -206,30 +199,26 @@ void ClientEngine::publish_retirement(size_t slot) {
     auto& op = ops_.at(slot);
     if (!op.ordered || op.phase != Phase::WaitRelease)
         throw std::runtime_error("release before ordered, quiesced ownership");
-    // Keep the in-flight operation alive rather than failing or recycling
-    // a buffer still owned by an outstanding RDMA WRITE.
-    if (free_markers_.empty()) {
+    // Inline data needs no registered buffer, but the WR must still fit
+    // within the bounded marker budget. Preserve deferred-slot backpressure.
+    if (markers_posted_ - markers_completed_ >= marker_credit_) {
         deferred_marker_slots_.push_back(slot);
         return;
     }
-    const size_t i = free_markers_.back();
-    free_markers_.pop_back();
+    if (markers_posted_ + 1 >= kMarkerTokenBase)
+        throw std::runtime_error("marker work ID exhausted");
     Retired record{op.lock, op.position, op.successor, op.successor_position};
     auto [it, added] = retired_.emplace(op.request, record);
     if (!added) throw std::runtime_error("duplicate retirement");
     // Protected data work is quiescent before entering this function.
     if (it->second.successor)
         deliver_handoff(op.request, it->second);
-    if (markers_[i].occupied)
-        throw std::runtime_error("reused occupied release marker buffer");
-    markers_[i].occupied = true;
-    *markers_[i].payload = op.request;
-    WorkId work = next_work_++;
-    marker_work_.emplace(work, i);
     const size_t remote_offset = handoff_marker_offset(
         net_.remote_memory_bytes(cfg_.replicas.front()), op.log_slot);
-    net_.write(cfg_.replicas.front(), markers_[i].payload, sizeof(uint64_t),
-               remote_offset, work);
+    const WorkId work = kMarkerTokenBase + markers_posted_ + 1;
+    if (!net_.write_inline(cfg_.replicas.front(), op.request, remote_offset, work))
+        throw std::runtime_error("marker WRITE must be signaled");
+    ++markers_posted_;
     complete(slot); // Local release is not blocked on marker completion.
 }
 void ClientEngine::handle_order(const rdma::Completion& c) {
@@ -456,15 +445,12 @@ void ClientEngine::handle(const rdma::Completion& c) {
             throw std::runtime_error("unexpected response or phase");
         return;
     }
-    if (auto marker = marker_work_.find(c.work_id); marker != marker_work_.end()) {
-        if (c.kind != rdma::CompletionKind::Write)
-            throw std::runtime_error("release marker completion not WRITE");
-        const size_t freed = marker->second;
-        if (!markers_[freed].occupied)
-            throw std::runtime_error("duplicate marker buffer completion");
-        markers_[freed].occupied = false;
-        marker_work_.erase(marker);
-        free_markers_.push_back(freed);
+    if (c.work_id >= kMarkerTokenBase) {
+        if (cfg_.backend != Backend::Handoff ||
+            c.kind != rdma::CompletionKind::Write || c.peer != cfg_.replicas.front() ||
+            markers_drained() || c.work_id != kMarkerTokenBase + markers_completed_ + 1)
+            throw std::runtime_error("invalid inline marker completion");
+        ++markers_completed_;
         if (!deferred_marker_slots_.empty()) {
             const size_t slot = deferred_marker_slots_.front();
             deferred_marker_slots_.pop_front();
@@ -557,7 +543,7 @@ void ClientEngine::run() {
             if (!empty_sections_.empty()) finish_empty_sections();
         }
         if (now >= measurement_end_ && requests_.empty() &&
-            marker_work_.empty() && deferred_marker_slots_.empty() &&
+            markers_drained() && deferred_marker_slots_.empty() &&
             retired_.empty() && awaited_.empty() && read_receipts_.empty() &&
             empty_sections_.empty() &&
             !stop_sent_) {

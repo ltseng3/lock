@@ -127,10 +127,11 @@ client/leader-peer relationships. Each extra client QP has its own receive
 buffers; completion WR IDs encode the receive-QP lane and slot so reposting
 is directed to the same QP. Only one thread posts/polls each leader QP/CQ.
 
-Handoff client marker buffers are bounded and cannot be reused before the
-corresponding WRITE CQE. If all are occupied, the complete operation remains
-pending and resumes on a marker completion, rather than failing with
-`marker-buffer pool exhausted`. Verify that direct handoffs still make
+Handoff client markers are posted inline and use a bounded WR credit
+window, not registered payload buffers. All are signaled on the leader's
+base QP and checked against a monotonically increasing FIFO completion
+token in a separate work-ID namespace. If credits are exhausted, the
+operation remains pending and resumes on a marker completion. Verify that direct handoffs still make
 progress when markers are delayed and that all marker WRs have completed
 before the client sends STOP. These are correctness requirements, not
 guaranteed by CI's hardware-free tests.

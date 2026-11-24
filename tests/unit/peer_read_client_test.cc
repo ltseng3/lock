@@ -1,5 +1,6 @@
 #include "lock/bench/client.h"
 #include "lock/locks/handoff_state.h"
+#include "lock/locks/handoff_layout.h"
 #include <cassert>
 #include <algorithm>
 #include <memory>
@@ -17,6 +18,7 @@ struct Posted {
     uint64_t* result;
     Message message;
     size_t offset = 0;
+    uint64_t inline_value = 0;
 };
 std::vector<Posted> posted;
 }
@@ -48,6 +50,12 @@ void Transport::send(NodeId peer, const Message& m, WorkId id, bool, size_t) {
 }
 bool Transport::write(NodeId peer, const void*, size_t, size_t offset, WorkId id, bool signal) {
     posted.push_back({CompletionKind::Write, peer, id, nullptr, {}, offset});
+    return signal;
+}
+bool Transport::write_inline(NodeId peer, uint64_t value, size_t offset,
+                             WorkId id, bool signal, size_t lane) {
+    if (!signal || lane != 0) throw std::runtime_error("unexpected inline marker mode");
+    posted.push_back({CompletionKind::Write, peer, id, nullptr, {}, offset, value});
     return signal;
 }
 void Transport::read_word(NodeId peer, uint64_t* result, size_t, WorkId id) {
@@ -154,10 +162,11 @@ struct ClientEngineTestAccess {
             for (const auto& p : posted) {
                 if (p.kind != rdma::CompletionKind::Write) continue;
                 ++markers;
-                require(p.offset != rdma::kDataOffset);
+                require(p.offset == handoff_marker_offset(net.memory_bytes(), markers));
+                require(p.inline_value == requests[markers-1]);
                 e.handle(done(p));
             }
-            require(markers == 3 && e.marker_work_.empty());
+            require(markers == 3 && e.markers_drained());
             for (size_t i = 0; i < requests.size(); ++i) {
                 auto ack = message(Kind::ReleaseAck, 1, 0, requests[i]);
                 ack.position = i+1; e.handle(receive(ack));
@@ -190,8 +199,54 @@ struct ClientEngineTestAccess {
                     e.requests_.empty() && e.awaited_.empty());
         }
     }
+    static void test_inline_marker_backpressure() {
+        rdma::Config nc; nc.self = 5;
+        rdma::Transport net(nc);
+        ClientConfig cfg;
+        cfg.self = 5; cfg.replicas = {1,2,3}; cfg.backend = Backend::Handoff;
+        cfg.critical_section_ops = 0; cfg.lock_count = 1;
+        ClientEngine e(net, cfg);
+        posted.clear();
+        const size_t budget = e.marker_credit_;
+        std::vector<RequestId> ids;
+        std::vector<Posted> markers;
+        for (size_t i = 0; i <= budget; ++i) {
+            e.submit(0);
+            ids.push_back(e.ops_[0].request);
+            auto order = message(Kind::Order, 1, 0, ids.back());
+            order.position = i+1; order.value = i;
+            e.handle(receive(order));
+            e.finish_empty_sections();
+            if (i < budget) {
+                auto p = last(rdma::CompletionKind::Write);
+                require(p.inline_value == ids.back());
+                markers.push_back(p);
+            }
+        }
+        require(writes() == budget && e.deferred_marker_slots_.size() == 1);
+        require(e.requests_.size() == 1 && !e.markers_drained());
+        bool threw = false;
+        try { e.handle(done(markers[1])); } catch (const std::runtime_error&) { threw = true; }
+        require(threw && e.markers_completed_ == 0);
+        e.handle(done(markers.front()));
+        require(writes() == budget + 1 && e.deferred_marker_slots_.empty());
+        require(e.requests_.empty());
+        markers.push_back(last(rdma::CompletionKind::Write));
+        require(markers.back().inline_value == ids.back());
+        threw = false;
+        try { e.handle(done(markers.front())); } catch (const std::runtime_error&) { threw = true; }
+        require(threw);
+        for (size_t i = 1; i < markers.size(); ++i) e.handle(done(markers[i]));
+        require(e.markers_drained());
+        for (size_t i = 0; i < ids.size(); ++i) {
+            auto ack = message(Kind::ReleaseAck, 1, 0, ids[i]);
+            ack.position = i+1; e.handle(receive(ack));
+        }
+        require(e.retired_.empty() && e.awaited_.empty());
+    }
     static void run() {
         test_empty_sections();
+        test_inline_marker_backpressure();
         rdma::Config nc; nc.self = 5;
         rdma::Transport net(nc);
         ClientConfig cfg;

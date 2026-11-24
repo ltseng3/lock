@@ -1,5 +1,6 @@
 #pragma once
 #include "lock/rdma/transport.h"
+#include "lock/locks/mu_recovery.h"
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -15,7 +16,8 @@ namespace lock {
 // Both addresses are 8-byte aligned. Header slots are append-only; marker
 // slots begin zeroed and are written exactly once by the holder.
 constexpr size_t kHandoffScratchReserve = 16ULL * 1024 * 1024;
-inline size_t handoff_log_capacity(size_t server_memory_bytes) {
+inline size_t handoff_log_capacity(size_t server_memory_bytes, bool recovery = false) {
+    if (recovery) return compact_recovery_capacity(server_memory_bytes, true);
     if (server_memory_bytes <= rdma::kLogOffset + kHandoffScratchReserve + 16)
         throw std::invalid_argument("handoff server memory is too small");
     return (server_memory_bytes - kHandoffScratchReserve - rdma::kLogOffset) /
@@ -26,8 +28,9 @@ inline size_t handoff_header_offset(size_t server_memory_bytes, uint64_t slot) {
         throw std::out_of_range("handoff header slot out of range");
     return rdma::kLogOffset + static_cast<size_t>(slot) * sizeof(uint64_t);
 }
-inline size_t handoff_marker_offset(size_t server_memory_bytes, uint64_t slot) {
-    const size_t capacity = handoff_log_capacity(server_memory_bytes);
+inline size_t handoff_marker_offset(size_t server_memory_bytes, uint64_t slot,
+                                    bool recovery = false) {
+    const size_t capacity = handoff_log_capacity(server_memory_bytes, recovery);
     if (slot >= capacity)
         throw std::out_of_range("handoff marker slot out of range");
     return rdma::kLogOffset + (capacity + static_cast<size_t>(slot)) *

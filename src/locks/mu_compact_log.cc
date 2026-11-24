@@ -30,7 +30,7 @@ MuCompactLog::MuCompactLog(rdma::Transport& net, std::vector<NodeId> replicas,
                            size_t window, size_t capacity_limit,
                            size_t lane, size_t lane_count, MuRecoveryConfig recovery)
     : net_(net), followers_(follower_ids(net.self(), std::move(replicas), recovery.promoted)),
-      ring_(window), layout_(recovery.enabled ? mu_recovery_capacity(net.memory_bytes()) :
+      ring_(window), layout_(recovery.enabled ? compact_recovery_capacity(net.memory_bytes(), recovery.handoff) :
                              log_capacity(net.memory_bytes(), capacity_limit), lane, lane_count),
       progress_(followers_.size(), recovery.recovered, recovery.promoted ? 1 : 0),
       lane_(lane), recovery_(recovery), applied_(recovery.recovered) {
@@ -74,7 +74,7 @@ void MuCompactLog::append_batch(std::span<const Message> mutations) {
     for (NodeId peer : followers_) {
         if (recovery_.enabled && recovery_.publication)
             net_.write_published_words(peer, payload, offset,
-                mu_recovery_marker_offset(net_.memory_bytes(), first), end, lane_);
+                compact_publication_offset(net_.memory_bytes(), first, recovery_.handoff), end, lane_);
         else net_.write_inline_words(peer, payload, offset, end, lane_);
     }
     progress_.posted(end);

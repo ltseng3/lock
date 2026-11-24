@@ -85,3 +85,18 @@ retirement, inconsistent ownership reports, and queue reconstruction.
 CloudLab is needed to verify DMA visibility, fencing and end-to-end
 recovery. Timing starts at the external recovery trigger; report the
 injection/process cleanup and client completion gap separately.
+
+### Queue reconstruction implementation
+
+The hardware-independent HandoffRecoveryIndex records each acquisition's
+slot, lock and original per-lock ordinal. It retains only the index and
+per-lock counts, not a second copy of each lock's historical queue. Given
+complete quiesced snapshots from all configured clients, it validates
+identity, issued-through bounds, original ORDER metadata and the prepared
+window. Unfinished logged requests must form a suffix for each lock; a
+hole is an invariant violation. The reconstructed HandoffState uses the
+normal reservation/commit transitions without re-appending recovered
+headers. The physical log stays unchanged. Unlogged pending IDs are
+returned separately for normal admission. The recovery-only Handoff
+layout uses 8-byte headers, 8-byte retirement words, 1-byte publication
+marks and the shared 4-KiB boundary table. Failure-free layouts are unchanged.

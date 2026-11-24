@@ -342,11 +342,23 @@ R2/R3 with SIGUSR1 after killing R1. No detection/election.
 
     python3 experiments/run.py --suite=experiments/suites/mu_recovery.json --remote-dir=/tmp/lock-mu-recovery
 
-The configured crash delay begins when the controller observes the start
-barrier, not precisely at the original barrier instant. R2 times fencing,
-tail scan, seal wait, repair, remaining replay, reconciliation and ready
-posting using its own monotonic clock. SSH injection/notification RPC times
-are recorded separately. A trial is invalid if any client fails to resume
+The runner starts a small supervisor on each replica over SSH during
+setup. Supervisors establish a one-shot TCP control channel to the
+controller's topology IP on an ephemeral port before server startup.
+The old leader's supervisor observes the local MU_SERVICE_STARTED log
+marker (1-ms polling only until startup), waits the configured delay,
+SIGKILLs and reaps its child. The controller then sends promotion on
+the two existing sockets; supervisors signal their own children.
+No SSH, remote log polling, election or failure detection is involved
+at the crash boundary. This models process crash-stop, not machine loss.
+
+R2 times fencing, tail scan, seal wait, repair, remaining replay,
+reconciliation and ready posting on its own monotonic clock.
+INJECTION records local timer duration, SIGKILL syscall, process-exit
+wait, controller dispatch and notification ACK time separately.
+The exit wait may include kernel/RDMA teardown; it is outside the
+protocol timer but can contribute to client downtime. There is no
+cross-host clock subtraction. Supervisor logs are also archived. A trial is invalid if any client fails to resume
 before the measurement ends. Each manifest includes recovery data and
 10-ms completion bins on each client (local start-barrier origin).
 Plot an archived manifest with:

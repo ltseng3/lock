@@ -16,6 +16,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from cluster import Remote, Topology
+from recovery_control import RecoveryControl
 from metrics import SUMMARY_FIELDS, summarize, format_summary, format_client
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -103,8 +104,18 @@ def process_command(topo: Topology, node, suite: dict, case: dict,
             *common]
 
 def start_node(remote: Remote, node, remote_dir: str,
-               run_name: str, argv: list[str]) -> None:
+               run_name: str, argv: list[str], control=None) -> None:
     folder = f"{remote_dir}/runs/{run_name}"
+    if control is not None and node.role == "replica":
+        # Supervisor owns the child and publishes its real PID. Its own
+        # diagnostics and PID are separate from the server log and PID.
+        cmd = shlex.join(control.agent_command(node.id, folder, argv))
+        launch = (f"mkdir -p {shlex.quote(folder)}; cd {shlex.quote(remote_dir)}; "
+                  f"rm -f {shlex.quote(folder + '/pid')} {shlex.quote(folder + '/node.log')}; "
+                  f"nohup {cmd} > {shlex.quote(folder + '/control.log')} 2>&1 < /dev/null "
+                  f"& echo $! > {shlex.quote(folder + '/control.pid')}")
+        remote.command(node, launch)
+        return
     cmd = shlex.join(argv)
     script = (f"mkdir -p {shlex.quote(folder)} && cd {shlex.quote(remote_dir)} && "
               f"nohup {cmd} > {shlex.quote(folder + '/node.log')} 2>&1 < /dev/null &")
@@ -155,6 +166,13 @@ def kill_node(remote: Remote, node, folder: str) -> None:
               f"kill \"$pid\" 2>/dev/null || true; fi")
     remote.command(node, script, check=False)
 
+def kill_supervisor(remote: Remote, node, folder: str) -> None:
+    pid = shlex.quote(folder + "/control.pid")
+    # The supervisor terminates/reaps its child on SIGTERM if still active.
+    remote.command(node, f"if test -f {pid}; then "
+                   f"kill \"$(cat {pid})\" 2>/dev/null || true; rm -f {pid}; fi",
+                   check=False)
+
 def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
              remote_dir: str, output_dir: pathlib.Path, smoke: bool = False) -> dict:
     name = ("smoke" if smoke else
@@ -172,34 +190,27 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
         manifest["dry_run"] = True
         (result_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         return manifest
+    control = None
     try:
+        crash = not smoke and suite.get("crash_after_ms") is not None
+        if crash:
+            # Listener is on the controller's existing topology address.
+            # All replica supervisors connect before any server starts.
+            address = topo.by_id(topo.controller_node_id).rdma_ip
+            control = RecoveryControl(address, topo.replicas, suite["crash_after_ms"],
+                                      min(120, suite.get("watchdog_seconds", 90)))
         remote.parallel(topo.nodes, lambda node: start_node(
-            remote, node, remote_dir, name, process_command(topo, node, suite, case, smoke)))
-        wait_for(remote, topo.nodes, folder, "RDMA_SMOKE_OK" if smoke else "READY node=",
-                 min(120, suite.get("watchdog_seconds", 90)))
-        if not smoke and suite.get("crash_after_ms") is not None:
-            # The controller is the failure oracle. No graceful drain, no
-            # election, no assumption of synchronized host clocks.
-            old = topo.by_id(topo.replicas[0])
-            wait_for(remote, (old,), folder, "MU_SERVICE_STARTED",
+            remote, node, remote_dir, name, process_command(topo, node, suite, case, smoke),
+            control))
+        if control is not None:
+            control.arm()
+            # The local leader timer observes the actual service-start
+            # marker. Do not SSH-poll readiness across the crash boundary.
+            manifest["injection"] = control.crash_and_promote()
+            control.close()
+        else:
+            wait_for(remote, topo.nodes, folder, "RDMA_SMOKE_OK" if smoke else "READY node=",
                      min(120, suite.get("watchdog_seconds", 90)))
-            delay = suite["crash_after_ms"] / 1000
-            # Sleep on the controller after observing the start barrier.
-            # SSH injection/notification time is separate from R2's timer.
-            time.sleep(delay)
-            t0 = time.monotonic_ns()
-            remote.command(old, f"kill -KILL \"$(cat {shlex.quote(folder + '/pid')})\"")
-            killed = time.monotonic_ns()
-            remote.parallel(tuple(topo.by_id(n) for n in topo.replicas[1:]),
-                            lambda n: remote.command(n,
-                                f"kill -USR1 \"$(cat {shlex.quote(folder + '/pid')})\""))
-            notified = time.monotonic_ns()
-            manifest["injection"] = {
-                "configured_delay_ms": suite["crash_after_ms"],
-                "controller_kill_rpc_ns": killed - t0,
-                "controller_notification_rpc_ns": notified - killed,
-                "failed": old.id, "replacement": topo.replicas[1],
-            }
         if not smoke:
             duration = (suite["warmup_seconds"] + suite["duration_seconds"] +
                         suite["watchdog_seconds"])
@@ -279,6 +290,8 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
         manifest["error"] = str(exc)
         raise
     finally:
+        if control is not None:
+            control.close()
         # Parallelize collection and cleanup across hosts to keep fast sweeps fast.
         with ThreadPoolExecutor(max_workers=len(topo.nodes)) as pool:
             tasks = [(node, pool.submit(remote.collect, node, folder + "/node.log",
@@ -299,6 +312,18 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
                 except Exception as exc:
                     manifest.setdefault("cleanup_errors", []).append(
                         f"node {node.id}: {exc}")
+        if control is not None:
+            # Preserve supervisor diagnostics even when bootstrapping failed.
+            def collect_supervisor(node):
+                try:
+                    remote.collect(node, folder + "/control.log",
+                                   result_dir / f"control-{node.id}.log")
+                finally:
+                    kill_supervisor(remote, node, folder)
+            try:
+                remote.parallel(tuple(topo.by_id(n) for n in topo.replicas), collect_supervisor)
+            except Exception as exc:
+                manifest.setdefault("cleanup_errors", []).append(str(exc))
         if manifest.get("collection_errors") or manifest.get("cleanup_errors"):
             manifest["valid"] = False
         (result_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -337,7 +362,7 @@ def main() -> int:
     ap.add_argument("--mu-recovery-replay", type=int, choices=(0, 1),
                     help="Background follower replay (1, default)")
     ap.add_argument("--crash-after-ms", type=int,
-                    help="Kill initial leader this long after observing start barrier")
+                    help="Kill initial leader this long after its local service-start marker")
     ap.add_argument("--mu-inflight-window", type=int,
                     help="Mu leader log in-flight limit (1..512; default 512)")
     ap.add_argument("--handoff-inflight-window", type=int,
@@ -475,6 +500,7 @@ def main() -> int:
                     print(line, flush=True)
                 if "recovery" in record:
                     print("RECOVERY", json.dumps(record["recovery"]), flush=True)
+                    print("INJECTION", json.dumps(record["injection"]), flush=True)
                 if args.show_clients:
                     for client in record["client_results"]:
                         print("  CLIENT", format_client(client), flush=True)

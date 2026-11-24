@@ -285,4 +285,7 @@ supported. R3 seals and remains passive after the one replacement.
 The tests cover window inference, request state, replay, FIFO resume,
 and stale old-leader client responses. They do not prove DMA atomicity
 or quiescence. Recovery latency starts at R2's observed external trigger;
-controller RPC timings and client-local completion gaps are separate.
+controller injection timings and client-local completion gaps are separate.
+In crash trials only, preconnected TCP supervisors confirm SIGKILL and
+child exit before either surviving replica receives a promotion signal.
+The ordinary no-crash runner and RDMA data path are unchanged.

@@ -7,7 +7,8 @@ from __future__ import annotations
 
 SUMMARY_FIELDS = (
     "backend", "distribution", "workers", "outstanding", "repeat",
-    "locks", "critical_section_ops",
+    "locks", "critical_section_ops", "handoff_gc",
+    "gc_next_reclaimed", "gc_ack_records", "gc_ack_messages",
     "clients", "completed", "aggregate_pairs_per_second",
     "min_client_pairs_per_second", "max_client_pairs_per_second",
     "acquire_p50_min_us", "acquire_p50_max_us", "acquire_p99_worst_us",
@@ -30,6 +31,9 @@ def summarize(case: dict, results: list[dict]) -> dict:
         **{key: case[key] for key in
            ("backend", "distribution", "workers", "outstanding", "repeat",
             "locks", "critical_section_ops")},
+        "handoff_gc": case.get("handoff_gc", 0),
+        **{key: sum(r.get(key, 0) for r in results) for key in
+           ("gc_next_reclaimed", "gc_ack_records", "gc_ack_messages")},
         "clients": len(results),
         "completed": sum(r["completed"] for r in results),
         "aggregate_pairs_per_second": sum(rates),
@@ -73,6 +77,8 @@ def format_summary(s: dict) -> str:
             f" reads={s['read_attempts']} local-probes={s['local_probes']}"
             f" read-misses={s['read_misses']} read-skipped={s['read_skipped']}"
             f" redundant-handoffs={s['redundant_handoffs']}"
+            f" gc={s['handoff_gc']} gc-next={s['gc_next_reclaimed']}"
+            f" gc-records={s['gc_ack_records']} gc-messages={s['gc_ack_messages']}"
         )
     return message
 

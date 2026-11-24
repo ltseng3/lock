@@ -13,7 +13,7 @@ struct HandoffStep {
 };
 class HandoffState {
 public:
-    HandoffState(size_t locks, size_t prepared_window);
+    HandoffState(size_t locks, size_t prepared_window, bool gc = false);
     HandoffStep admit(const Message& acquire);
     std::vector<Action> committed(const Committed& item);
     HandoffStep retire(const std::function<uint64_t(uint64_t)>& read_marker);
@@ -32,6 +32,7 @@ private:
         size_t active_index = static_cast<size_t>(-1);
     };
     size_t window_;
+    bool gc_;
     std::vector<State> locks_;
     // Only locks with committed, not-yet-retired entries need marker polling.
     // The replication thread exclusively owns this list and every State.

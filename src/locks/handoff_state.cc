@@ -1,8 +1,8 @@
 #include "lock/locks/handoff_state.h"
 #include <stdexcept>
 namespace lock {
-HandoffState::HandoffState(size_t locks, size_t window)
-    : window_(window), locks_(locks) {
+HandoffState::HandoffState(size_t locks, size_t window, bool gc)
+    : window_(window), gc_(gc), locks_(locks) {
     if (!locks || !window) throw std::invalid_argument("empty handoff locks or window");
 }
 void HandoffState::admit_waiting(State& state, HandoffStep& out) {
@@ -77,9 +77,13 @@ void HandoffState::retire_one(
         if (!marker) break;
         if (marker != head.request)
             throw std::runtime_error("release-marker request mismatch: fail closed");
-        Message ack = message(Kind::ReleaseAck, 0, lock_id, head.request);
-        ack.position = head.position;
-        out.actions.push_back({request_node(head.request), ack});
+        // A committed successor already caused a unique NEXT to be queued.
+        // Only the last prepared owner needs explicit no-successor proof.
+        if (!gc_ || state.prepared.size() == 1) {
+            Message ack = message(Kind::ReleaseAck, 0, lock_id, head.request);
+            ack.position = head.position;
+            out.actions.push_back({request_node(head.request), ack});
+        }
         state.prepared.pop_front();
     }
     admit_waiting(state, out);

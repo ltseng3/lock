@@ -1,5 +1,6 @@
 #pragma once
 #include "lock/locks/lane_layout.h"
+#include "lock/locks/retirement_gc.h"
 #include "lock/locks/mu_state.h"
 #include "lock/locks/spsc_queue.h"
 #include "lock/rdma/transport.h"
@@ -21,9 +22,9 @@ public:
     static constexpr size_t sq_credit = 512;
     LeaderResponseBatch(rdma::Transport& net, NodeId self,
                         const std::vector<NodeId>& clients, size_t lane,
-                        size_t lane_count, size_t batch_size)
+                        size_t lane_count, size_t batch_size, bool gc = false)
         : net_(net), self_(self), lane_(lane), lane_count_(lane_count),
-          batch_size_(batch_size), peers_(clients.size()) {
+          batch_size_(batch_size), gc_(gc), peers_(clients.size()) {
         if (!batch_size || batch_size > drain_limit)
             throw std::invalid_argument("invalid leader communication batch");
         index_.fill(-1);
@@ -46,13 +47,26 @@ public:
         // keep the unsent suffix and poll CQ again; never reorder its actions.
         if (!staged_) {
             Action a{};
-            while (staged_ < drain_limit && queue.try_pop(a)) {
+            size_t consumed = 0;
+            while (consumed < drain_limit && queue.try_pop(a)) {
+                ++consumed;
                 if (lock_lane(a.message.lock_id, lane_count_) != lane_)
                     throw std::runtime_error("leader response routed to wrong lane");
                 a.message.sender = self_;
-                client(a.destination).messages.push_back(a.message);
-                ++staged_;
+                auto& p = client(a.destination);
+                if (gc_ && message_kind(a.message) == Kind::ReleaseAck) {
+                    if (request_node(a.message.request) != a.destination)
+                        throw std::runtime_error("GC action destination mismatch");
+                    p.gc_ids[p.gc_count++] = a.message.request;
+                    if (p.gc_count == p.gc_ids.size()) flush_gc(p);
+                } else {
+                    p.messages.push_back(a.message);
+                    ++staged_;
+                }
             }
+            // Flush even singletons. A GC packet never overtakes an earlier
+            // NEXT on its QP and only contains no-successor retirements.
+            if (gc_) for (auto& p : peers_) flush_gc(p);
         }
         if (!staged_) return 0;
         size_t sent = 0;
@@ -83,7 +97,16 @@ private:
         std::vector<Message> messages;
         size_t cursor = 0;
         rdma::CompletionPrefix<sq_credit> progress;
+        GcIds gc_ids{};
+        size_t gc_count = 0;
     };
+    void flush_gc(PeerState& p) {
+        if (!p.gc_count) return;
+        p.messages.push_back(retirement_gc_message(
+            self_, lane_, {p.gc_ids.data(), p.gc_count}));
+        p.gc_count = 0;
+        ++staged_;
+    }
     PeerState& client(NodeId peer) {
         if (peer >= index_.size() || index_[peer] == -1)
             throw std::runtime_error("response or completion for unknown client");
@@ -92,6 +115,7 @@ private:
     rdma::Transport& net_;
     NodeId self_;
     size_t lane_, lane_count_, batch_size_, staged_ = 0;
+    bool gc_;
     std::array<int, 256> index_;
     std::vector<PeerState> peers_;
 };

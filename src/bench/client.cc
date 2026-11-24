@@ -4,6 +4,7 @@
 #include "lock/locks/replicated_log.h"
 #include "lock/locks/handoff_layout.h"
 #include "lock/locks/lane_layout.h"
+#include "lock/locks/retirement_gc.h"
 #include <cstddef>
 #include <chrono>
 #include <cmath>
@@ -46,6 +47,8 @@ ClientEngine::ClientEngine(rdma::Transport& net, ClientConfig cfg)
     if (cfg_.outstanding == 0 || cfg_.outstanding > 512 || cfg_.lock_count == 0 ||
         cfg_.lock_count > 1000)
         throw std::invalid_argument("invalid client window or lock count");
+    if (cfg_.handoff_gc && cfg_.backend != Backend::Handoff)
+        throw std::invalid_argument("retirement GC requires handoff");
     if (cfg_.handoff_peer_read) {
         if (cfg_.backend != Backend::Handoff ||
             net_.memory_bytes() < rdma::kScratchOffset + 16ULL * 1024 * 1024)
@@ -208,11 +211,16 @@ void ClientEngine::publish_retirement(size_t slot) {
     if (markers_posted_ + 1 >= kMarkerTokenBase)
         throw std::runtime_error("marker work ID exhausted");
     Retired record{op.lock, op.position, op.successor, op.successor_position};
-    auto [it, added] = retired_.emplace(op.request, record);
-    if (!added) throw std::runtime_error("duplicate retirement");
-    // Protected data work is quiescent before entering this function.
-    if (it->second.successor)
-        deliver_handoff(op.request, it->second);
+    // A unique validated NEXT is sufficient to reclaim after HANDOFF.
+    // A predecessor without NEXT still needs an explicit GC notification.
+    if (!cfg_.handoff_gc || !record.successor) {
+        if (!retired_.emplace(op.request, record).second)
+            throw std::runtime_error("duplicate retirement");
+    }
+    if (record.successor) {
+        deliver_handoff(op.request, record);
+        if (cfg_.handoff_gc) ++gc_next_reclaimed_;
+    }
     const size_t remote_offset = handoff_marker_offset(
         net_.remote_memory_bytes(cfg_.replicas.front()), op.log_slot);
     const WorkId work = kMarkerTokenBase + markers_posted_ + 1;
@@ -382,6 +390,10 @@ void ClientEngine::handle_next(const rdma::Completion& c) {
     it->second.successor_position = m.value;
     ++late_next_;
     deliver_handoff(m.request, it->second);
+    if (cfg_.handoff_gc) {
+        retired_.erase(it);
+        ++gc_next_reclaimed_;
+    }
 }
 
 void ClientEngine::handle(const rdma::Completion& c) {
@@ -395,6 +407,10 @@ void ClientEngine::handle(const rdma::Completion& c) {
             if (control) {
                 if (c.lane != 0)
                     throw std::runtime_error("barrier reply arrived on data lane");
+            } else if (kind == Kind::RetirementGc) {
+                if (!cfg_.handoff_gc || c.lane >= cfg_.mu_lanes ||
+                    c.message.lane != c.lane)
+                    throw std::runtime_error("GC on wrong client lane");
             } else if (cfg_.backend != Backend::Cas &&
                        c.lane != lock_lane(c.message.lock_id, cfg_.mu_lanes)) {
                 throw std::runtime_error("leader reply arrived on wrong client lane");
@@ -417,7 +433,21 @@ void ClientEngine::handle(const rdma::Completion& c) {
             if (kind == Kind::Order) { handle_order(c); return; }
             if (kind == Kind::Start) { handle_activation(c); return; }
             if (kind == Kind::Next) { handle_next(c); return; }
-            if (kind == Kind::ReleaseAck) {
+            if (kind == Kind::RetirementGc && cfg_.handoff_gc) {
+                const auto ids = decode_retirement_gc(c.message, cfg_.self, c.lane);
+                // Validate all IDs before erasing any record.
+                for (size_t i = 0; i < c.message.flags; ++i) {
+                    const auto it = retired_.find(ids[i]);
+                    if (it == retired_.end() || it->second.successor ||
+                        lock_lane(it->second.lock, cfg_.mu_lanes) != c.lane)
+                        throw std::runtime_error("GC for unknown or wrong-lane retirement");
+                }
+                for (size_t i = 0; i < c.message.flags; ++i) retired_.erase(ids[i]);
+                gc_ack_records_ += c.message.flags;
+                ++gc_ack_messages_;
+                return;
+            }
+            if (kind == Kind::ReleaseAck && !cfg_.handoff_gc) {
                 auto it = retired_.find(c.message.request);
                 if (it == retired_.end() || it->second.lock != c.message.lock_id ||
                     it->second.position != c.message.position)
@@ -534,6 +564,8 @@ void ClientEngine::run() {
         if (now > watchdog) throw std::runtime_error("client watchdog timeout: fail closed");
         if (now < measurement_end_) {
             for (size_t i = 0; i < ops_.size(); ++i) {
+                if (cfg_.handoff_gc &&
+                    retired_.size() + requests_.size() >= kGcRetainedLimit) break;
                 if (ops_[i].phase == Phase::Idle && !ops_[i].read_pending) submit(i);
             }
         }
@@ -548,7 +580,7 @@ void ClientEngine::run() {
             empty_sections_.empty() &&
             !stop_sent_) {
             // Every read winner has consumed its normal HANDOFF, all local
-            // DMA has completed, and all retirements have been acknowledged.
+            // DMA has completed, and all retirements have been reclaimed.
             // Keep the registered region alive until the all-client barrier.
             net_.send(leader, message(Kind::Stop, cfg_.self));
             stop_sent_ = true;
@@ -566,6 +598,10 @@ void ClientEngine::print_result() const {
               << ",\"backend\":\"" << name << "\""
               << ",\"locks\":" << cfg_.lock_count
               << ",\"critical_section_ops\":" << cfg_.critical_section_ops
+              << ",\"handoff_gc\":" << (cfg_.handoff_gc ? 1 : 0)
+              << ",\"gc_next_reclaimed\":" << gc_next_reclaimed_
+              << ",\"gc_ack_records\":" << gc_ack_records_
+              << ",\"gc_ack_messages\":" << gc_ack_messages_
               << ",\"workers\":" << cfg_.workers
               << ",\"outstanding_per_worker\":" << cfg_.outstanding
               << ",\"completed\":" << completed_

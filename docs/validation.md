@@ -215,3 +215,19 @@ do not substitute for real verbs and multi-lane hardware testing.
 Both replication and response posting use the same fixed-capacity per-QP
 completion-prefix tracker. This avoids heap allocations for completion
 bookkeeping and makes exact CQE validation independent of the protocol.
+
+## Empty critical-section workload
+
+Zero application operations do not skip ordering or ownership checks.
+After validated activation, the client queues its slot for a local release
+at the end of the current event handler, before handling another CQE or
+submitting new work. A same-client HANDOFF can append another ready slot;
+the iterative drain avoids recursion and prevents nested release from
+invalidating request-map iterators. No new request is submitted during the
+drain, so its storage is bounded by the operation window. The ordinary
+nonempty critical section still releases only after a protected WRITE CQE.
+Regression tests drive CAS unlock, Mu replicated release, a same-client
+prepared handoff chain, and a peer READ winner with a late redundant
+HANDOFF through the actual client state machine. No RDMA device is used
+by these tests. The one-sided markers and their CQEs, ReleaseAck reclamation,
+proof validation, and shutdown barrier remain necessary in both workloads.

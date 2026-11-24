@@ -10,7 +10,8 @@ from metrics import SUMMARY_FIELDS, format_client, format_summary, summarize
 class TestMetrics(unittest.TestCase):
     def setUp(self):
         self.case = dict(backend="cas", distribution="uniform",
-                         workers=1, outstanding=1, repeat=0)
+                         workers=1, outstanding=1, repeat=0,
+                         locks=1000, critical_section_ops=1)
         self.results = [
             dict(node=4, completed=300, measurement_seconds=3,
                  acquire_p50_ns=2000, acquire_p99_ns=12000,
@@ -26,6 +27,9 @@ class TestMetrics(unittest.TestCase):
         s = summarize(self.case, self.results)
         self.assertEqual(set(s), set(SUMMARY_FIELDS))
         self.assertEqual(s["completed"], 900)
+        self.assertEqual(s["locks"], 1000)
+        self.assertEqual(s["critical_section_ops"], 1)
+        self.assertIn("locks=1000 cs-ops=1", format_summary(s))
         self.assertEqual(s["aggregate_pairs_per_second"], 300)
         self.assertEqual(s["min_client_pairs_per_second"], 100)
         self.assertEqual(s["max_client_pairs_per_second"], 200)

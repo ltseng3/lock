@@ -7,6 +7,7 @@ from __future__ import annotations
 
 SUMMARY_FIELDS = (
     "backend", "distribution", "workers", "outstanding", "repeat",
+    "locks", "critical_section_ops",
     "clients", "completed", "aggregate_pairs_per_second",
     "min_client_pairs_per_second", "max_client_pairs_per_second",
     "acquire_p50_min_us", "acquire_p50_max_us", "acquire_p99_worst_us",
@@ -27,7 +28,8 @@ def summarize(case: dict, results: list[dict]) -> dict:
 
     return {
         **{key: case[key] for key in
-           ("backend", "distribution", "workers", "outstanding", "repeat")},
+           ("backend", "distribution", "workers", "outstanding", "repeat",
+            "locks", "critical_section_ops")},
         "clients": len(results),
         "completed": sum(r["completed"] for r in results),
         "aggregate_pairs_per_second": sum(rates),
@@ -59,7 +61,8 @@ def format_summary(s: dict) -> str:
         f"{s['acquire_p50_max_us']:.1f}]us "
         f"acq-p99-worst-node={s['acquire_p99_worst_us']:.1f}us "
         f"total-p99-worst-node={s['total_p99_worst_us']:.1f}us "
-        f"completed={s['completed']}"
+        f"completed={s['completed']} locks={s['locks']}"
+        f" cs-ops={s['critical_section_ops']}"
     )
     if s["backend"] == "handoff":
         message += (

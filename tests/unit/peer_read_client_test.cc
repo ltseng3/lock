@@ -16,6 +16,7 @@ struct Posted {
     WorkId id;
     uint64_t* result;
     Message message;
+    size_t offset = 0;
 };
 std::vector<Posted> posted;
 }
@@ -45,15 +46,16 @@ size_t Transport::remote_memory_bytes(NodeId) const { return memory_bytes(); }
 void Transport::send(NodeId peer, const Message& m, WorkId id, bool, size_t) {
     posted.push_back({CompletionKind::Send, peer, id, nullptr, m});
 }
-bool Transport::write(NodeId peer, const void*, size_t, size_t, WorkId id, bool signal) {
-    posted.push_back({CompletionKind::Write, peer, id, nullptr, {}});
+bool Transport::write(NodeId peer, const void*, size_t, size_t offset, WorkId id, bool signal) {
+    posted.push_back({CompletionKind::Write, peer, id, nullptr, {}, offset});
     return signal;
 }
 void Transport::read_word(NodeId peer, uint64_t* result, size_t, WorkId id) {
     posted.push_back({CompletionKind::Read, peer, id, result, {}});
 }
-void Transport::compare_swap(NodeId, uint64_t*, size_t, uint64_t, uint64_t, WorkId) {
-    throw std::runtime_error("unexpected fake CAS");
+void Transport::compare_swap(NodeId peer, uint64_t* result, size_t offset,
+                             uint64_t, uint64_t, WorkId id) {
+    posted.push_back({CompletionKind::CompareSwap, peer, id, result, {}, offset});
 }
 void Transport::poll_into(std::vector<Completion>& out, int) { out.clear(); }
 } // namespace lock::rdma
@@ -83,7 +85,113 @@ struct ClientEngineTestAccess {
             return p.kind == rdma::CompletionKind::Write;
         });
     }
+    static void require(bool ok) {
+        if (!ok) throw std::runtime_error("empty critical section regression failed");
+    }
+    static void test_empty_sections() {
+        rdma::Config nc; nc.self = 5;
+        rdma::Transport net(nc);
+        ClientConfig cfg;
+        cfg.self = 5; cfg.replicas = {1,2,3};
+        cfg.critical_section_ops = 0; cfg.lock_count = 1;
+        // CAS still waits for the actual unlock CQE; no data WRITE.
+        {
+            cfg.backend = Backend::Cas;
+            ClientEngine e(net, cfg);
+            posted.clear(); e.submit(0);
+            auto cas = last(rdma::CompletionKind::CompareSwap);
+            *cas.result = 0; e.handle(done(cas));
+            require(writes() == 0);
+            e.finish_empty_sections();
+            require(writes() == 1);
+            auto unlock = last(rdma::CompletionKind::Write);
+            require(unlock.offset == rdma::kFlagOffset && !e.requests_.empty());
+            e.handle(done(unlock));
+            require(e.requests_.empty() && e.awaited_.empty());
+        }
+        // Mu still requires its replicated RELEASE and server ACK.
+        {
+            cfg.backend = Backend::Mu;
+            ClientEngine e(net, cfg);
+            posted.clear(); e.submit(0);
+            const auto request = e.ops_[0].request;
+            e.handle(receive(message(Kind::Grant, 1, 0, request)));
+            e.finish_empty_sections();
+            require(writes() == 0 && !e.requests_.empty());
+            require(message_kind(last(rdma::CompletionKind::Send).message) == Kind::Release);
+            e.handle(receive(message(Kind::ReleaseAck, 1, 0, request)));
+            require(e.requests_.empty());
+        }
+        // A prepared same-client successor chain must drain iteratively,
+        // never re-enter a releasing predecessor or issue a protected WRITE.
+        {
+            cfg.backend = Backend::Handoff; cfg.outstanding = 3;
+            cfg.handoff_peer_read = false;
+            ClientEngine e(net, cfg);
+            posted.clear();
+            std::array<RequestId, 3> requests{};
+            const RequestId predecessor = make_request_id(4, 99);
+            for (size_t i = 0; i < requests.size(); ++i) {
+                e.submit(i); requests[i] = e.ops_[i].request;
+                auto order = message(Kind::Order, 1, 0, requests[i]);
+                order.other = i ? requests[i-1] : predecessor;
+                order.position = i + 1; order.value = i + 1;
+                e.handle(receive(order));
+            }
+            for (size_t i = 0; i + 1 < requests.size(); ++i) {
+                auto next = message(Kind::Next, 1, 0, requests[i]);
+                next.other = requests[i+1]; next.position = i+1; next.value = i+2;
+                e.handle(receive(next));
+            }
+            auto first = message(Kind::Handoff, 4, 0, requests[0]);
+            first.other = predecessor; first.position = 1;
+            e.handle(receive(first));
+            require(writes() == 0 && e.empty_sections_.size() == 1);
+            e.finish_empty_sections();
+            require(e.empty_sections_.empty() && e.requests_.empty());
+            require(writes() == 3 && e.handoffs_sent_ == 2 && e.handoffs_received_ == 3);
+            size_t markers = 0;
+            for (const auto& p : posted) {
+                if (p.kind != rdma::CompletionKind::Write) continue;
+                ++markers;
+                require(p.offset != rdma::kDataOffset);
+                e.handle(done(p));
+            }
+            require(markers == 3 && e.marker_work_.empty());
+            for (size_t i = 0; i < requests.size(); ++i) {
+                auto ack = message(Kind::ReleaseAck, 1, 0, requests[i]);
+                ack.position = i+1; e.handle(receive(ack));
+            }
+            require(e.retired_.empty() && e.awaited_.empty());
+        }
+        // Zero-work peer READ winner publishes a proof and still consumes
+        // the redundant normal HANDOFF after local retirement.
+        {
+            cfg.outstanding = 1; cfg.handoff_peer_read = true;
+            ClientEngine e(net, cfg);
+            posted.clear(); e.submit(0);
+            const auto request = e.ops_[0].request;
+            const auto predecessor = make_request_id(4, 100);
+            auto order = message(Kind::Order, 1, 0, request);
+            order.other = predecessor; order.position = 1; order.value = 1;
+            e.handle(receive(order));
+            auto read = last(rdma::CompletionKind::Read);
+            *read.result = predecessor; e.handle(done(read));
+            require(writes() == 0);
+            e.finish_empty_sections();
+            require(writes() == 1 && e.read_receipts_.size() == 1);
+            require(*static_cast<uint64_t*>(net.at(peer_completion_offset(request), 8)) == request);
+            e.handle(done(last(rdma::CompletionKind::Write)));
+            auto late = message(Kind::Handoff, 4, 0, request);
+            late.other = predecessor; late.position = 1; e.handle(receive(late));
+            auto ack = message(Kind::ReleaseAck, 1, 0, request);
+            ack.position = 1; e.handle(receive(ack));
+            require(e.read_receipts_.empty() && e.retired_.empty() &&
+                    e.requests_.empty() && e.awaited_.empty());
+        }
+    }
     static void run() {
+        test_empty_sections();
         rdma::Config nc; nc.self = 5;
         rdma::Transport net(nc);
         ClientConfig cfg;

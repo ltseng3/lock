@@ -40,6 +40,9 @@ int main(int argc, char** argv) {
             net_cfg.client_lane_peers = {cfg.replicas.front()};
         }
         cfg.lock_count = opt.number("locks", 1000);
+        cfg.critical_section_ops = opt.number("critical-section-ops", 1);
+        if (cfg.critical_section_ops > 1)
+            throw std::invalid_argument("critical-section-ops must be 0 or 1");
         cfg.outstanding = opt.number("outstanding", 1);
         cfg.workers = opt.number("workers", 1);
         cfg.distribution = opt.get("distribution", "uniform");

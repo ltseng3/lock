@@ -15,6 +15,7 @@ struct ClientConfig {
     NodeId self = 0;
     std::vector<NodeId> replicas;
     size_t lock_count = 1000;
+    size_t critical_section_ops = 1; // 0: empty; 1: one completed 8-byte WRITE
     size_t outstanding = 1;
     size_t workers = 1;
     size_t mu_lanes = 1;
@@ -34,7 +35,7 @@ private:
     // Hardware-free event-order regression tests drive the real client state machine.
     friend struct ClientEngineTestAccess;
     using Clock = std::chrono::steady_clock;
-    enum class Phase { Idle, WaitGrant, WaitOrder, WaitCas, Writing, WaitRelease, WaitCasRelease };
+    enum class Phase { Idle, WaitGrant, WaitOrder, WaitCas, Writing, EmptyCriticalSection, WaitRelease, WaitCasRelease };
     enum class Purpose { AcquireCas, DataWrite, ReleaseCas, ReleaseWrite, PredecessorRead };
     struct Operation {
         Phase phase = Phase::Idle;
@@ -77,6 +78,10 @@ private:
     ClientConfig cfg_;
     std::vector<LockPicker> pickers_;
     std::vector<Operation> ops_;
+    // Empty sections complete synchronously in the event loop, after the
+    // current receive/CQE handler returns. Local handoffs can append more
+    // ready slots; the iterative drain prevents recursive release chains.
+    std::vector<size_t> empty_sections_;
     std::unordered_map<RequestId, size_t> requests_;
     std::unordered_map<WorkId, Awaited> awaited_;
     std::unordered_map<RequestId, Retired> retired_;
@@ -109,7 +114,8 @@ private:
     WorkId track(size_t slot, Purpose purpose);
     void submit(size_t slot);
     void post_cas(size_t slot);
-    void post_data(size_t slot);
+    void begin_critical_section(size_t slot);
+    void finish_empty_sections();
     void release(size_t slot);
     void complete(size_t slot);
     void handle_order(const rdma::Completion& event);

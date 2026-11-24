@@ -30,6 +30,9 @@ ClientEngine::ClientEngine(rdma::Transport& net, ClientConfig cfg)
     if (cfg_.workers < 1 || cfg_.workers > 16 ||
         cfg_.outstanding * cfg_.workers > 512)
         throw std::invalid_argument("workers * outstanding must be 1..512");
+    if (cfg_.critical_section_ops > 1)
+        throw std::invalid_argument("critical-section-ops must be 0 or 1");
+    if (cfg_.critical_section_ops == 0) empty_sections_.reserve(ops_.size());
     pickers_.reserve(cfg_.workers);
     for (size_t worker = 0; worker < cfg_.workers; ++worker) {
         pickers_.emplace_back(cfg_.lock_count, cfg_.distribution,
@@ -110,20 +113,42 @@ void ClientEngine::submit(size_t slot) {
                   0, true, lock_lane(op.lock, cfg_.mu_lanes));
     }
 }
-void ClientEngine::post_data(size_t slot) {
+void ClientEngine::begin_critical_section(size_t slot) {
     auto& op = ops_[slot];
     op.acquired = Clock::now();
+    if (cfg_.critical_section_ops == 0) {
+        op.phase = Phase::EmptyCriticalSection;
+        empty_sections_.push_back(slot);
+        return;
+    }
     op.phase = Phase::Writing;
     *op.data_value = op.request;
     net_.write(cfg_.replicas.front(), op.data_value, sizeof(uint64_t),
                rdma::kDataOffset + op.lock * sizeof(uint64_t),
                track(slot, Purpose::DataWrite));
 }
+void ClientEngine::finish_empty_sections() {
+    // Run before handling the next network event or submitting more work.
+    // A local HANDOFF can append another slot, but cannot recursively release
+    // it or reuse a slot in this drain. Every operation activates at most once.
+    for (size_t i = 0; i < empty_sections_.size(); ++i) {
+        if (empty_sections_.size() > ops_.size())
+            throw std::runtime_error("empty critical section queue overflow");
+        const size_t slot = empty_sections_[i];
+        if (ops_.at(slot).phase != Phase::EmptyCriticalSection)
+            throw std::runtime_error("invalid empty critical section state");
+        release(slot);
+    }
+    empty_sections_.clear();
+}
 void ClientEngine::release(size_t slot) {
     auto& op = ops_[slot];
+    if (op.phase != Phase::Writing && op.phase != Phase::EmptyCriticalSection)
+        throw std::runtime_error("release before critical section completion");
     op.phase = Phase::WaitRelease;
     if (cfg_.backend == Backend::Handoff) {
-        // Called only after the protected data WRITE CQE. Publish before
+        // The protected WRITE has completed, or no data work was issued.
+        // Publish before
         // either the leader marker or HANDOFF, even if marker posting stalls.
         if (cfg_.handoff_peer_read) {
             auto* word = static_cast<uint64_t*>(net_.at(
@@ -192,7 +217,7 @@ void ClientEngine::publish_retirement(size_t slot) {
     Retired record{op.lock, op.position, op.successor, op.successor_position};
     auto [it, added] = retired_.emplace(op.request, record);
     if (!added) throw std::runtime_error("duplicate retirement");
-    // Protected data work was completed before entering this function.
+    // Protected data work is quiescent before entering this function.
     if (it->second.successor)
         deliver_handoff(op.request, it->second);
     if (markers_[i].occupied)
@@ -259,7 +284,7 @@ void ClientEngine::activate(size_t slot) {
     if (!op.ordered || op.started || op.phase != Phase::WaitOrder)
         throw std::runtime_error("invalid activation state");
     op.started = true;
-    post_data(slot);
+    begin_critical_section(slot);
 }
 void ClientEngine::try_predecessor_read(size_t slot) {
     auto& op = ops_.at(slot);
@@ -424,7 +449,7 @@ void ClientEngine::handle(const rdma::Completion& c) {
         if (op.lock != c.message.lock_id)
             throw std::runtime_error("lock ID mismatch");
         if (kind == Kind::Grant && op.phase == Phase::WaitGrant)
-            post_data(slot);
+            begin_critical_section(slot);
         else if (kind == Kind::ReleaseAck && op.phase == Phase::WaitRelease)
             complete(slot);
         else
@@ -473,7 +498,7 @@ void ClientEngine::handle(const rdma::Completion& c) {
         if (c.kind != rdma::CompletionKind::CompareSwap ||
             op.phase != Phase::WaitCas)
             throw std::runtime_error("invalid acquire CAS completion");
-        if (*op.cas_result == 0) post_data(wait.slot);
+        if (*op.cas_result == 0) begin_critical_section(wait.slot);
         else if (*op.cas_result == 1) post_cas(wait.slot);
         else throw std::runtime_error("CAS returned invalid lock value");
         break;
@@ -527,10 +552,14 @@ void ClientEngine::run() {
             }
         }
         net_.poll_into(completions);
-        for (auto& event : completions) handle(event);
+        for (auto& event : completions) {
+            handle(event);
+            if (!empty_sections_.empty()) finish_empty_sections();
+        }
         if (now >= measurement_end_ && requests_.empty() &&
             marker_work_.empty() && deferred_marker_slots_.empty() &&
             retired_.empty() && awaited_.empty() && read_receipts_.empty() &&
+            empty_sections_.empty() &&
             !stop_sent_) {
             // Every read winner has consumed its normal HANDOFF, all local
             // DMA has completed, and all retirements have been acknowledged.
@@ -549,6 +578,8 @@ void ClientEngine::print_result() const {
     std::cout << "RESULT {"
               << "\"node\":" << cfg_.self
               << ",\"backend\":\"" << name << "\""
+              << ",\"locks\":" << cfg_.lock_count
+              << ",\"critical_section_ops\":" << cfg_.critical_section_ops
               << ",\"workers\":" << cfg_.workers
               << ",\"outstanding_per_worker\":" << cfg_.outstanding
               << ",\"completed\":" << completed_

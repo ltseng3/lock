@@ -44,7 +44,8 @@ def cases(suite: dict):
             raise ValueError("logical workers * outstanding must be 1..512")
         yield dict(backend=backend, distribution=distribution,
                    workers=workers, outstanding=outstanding, repeat=repeat,
-                   locks=locks, critical_section_ops=critical_section_ops)
+                   locks=locks, critical_section_ops=critical_section_ops,
+                   handoff_gc=int(backend == "handoff" and suite.get("handoff_gc", False)))
 
 def arg(name: str, value) -> str:
     return f"--{name}={value}"
@@ -69,6 +70,8 @@ def process_command(topo: Topology, node, suite: dict, case: dict,
                        arg("leader-comm-batch", suite.get("leader_comm_batch", 64))])
     if node.role == "replica" and case["backend"] == "mu":
         common.append(arg("mu-inflight-window", suite.get("mu_inflight_window", 512)))
+    if case["backend"] == "handoff":
+        common.append(arg("handoff-gc", int(suite.get("handoff_gc", False))))
     if node.role == "client" and case["backend"] == "handoff":
         common.append(arg("handoff-peer-read",
                           int(suite.get("handoff_peer_read", False))))
@@ -151,7 +154,7 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
              remote_dir: str, output_dir: pathlib.Path, smoke: bool = False) -> dict:
     name = ("smoke" if smoke else
             f"{case['backend']}-{case['distribution']}-k{case.get('workers', 1)}-w{case['outstanding']}"
-            f"-l{case['locks']}-cs{case['critical_section_ops']}-r{case['repeat']}")
+            f"-l{case['locks']}-cs{case['critical_section_ops']}-gc{case['handoff_gc']}-r{case['repeat']}")
     folder = f"{remote_dir}/runs/{name}"
     result_dir = output_dir / name
     result_dir.mkdir(parents=True, exist_ok=True)
@@ -197,7 +200,9 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
                     record.get("workers") != case.get("workers", 1) or
                     record.get("outstanding_per_worker") != case["outstanding"] or
                     record.get("locks") != case["locks"] or
-                    record.get("critical_section_ops") != case["critical_section_ops"]):
+                    record.get("critical_section_ops") != case["critical_section_ops"] or
+                    record.get("handoff_gc") != int(case["backend"] == "handoff" and
+                                                     suite.get("handoff_gc", False))):
                     raise ValueError(f"invalid result identity from node {node_id}")
                 if record.get("measurement_seconds", 0) <= 0:
                     raise ValueError(f"invalid measurement duration from node {node_id}")
@@ -275,6 +280,8 @@ def main() -> int:
                     help="Mu leader log in-flight limit (1..512; default 512)")
     ap.add_argument("--handoff-inflight-window", type=int,
                     help="Handoff leader log in-flight limit (1..512; default 512)")
+    ap.add_argument("--handoff-gc", type=int, choices=(0, 1),
+                    help="NEXT reclamation and exact-ID GC batches (default 0)")
     ap.add_argument("--handoff-peer-read", type=int, choices=(0, 1),
                     help="Race one bounded predecessor READ with HANDOFF (default 0)")
     ap.add_argument("--replication-batch", type=int, choices=range(1, 17),
@@ -311,6 +318,11 @@ def main() -> int:
         suite["handoff_inflight_window"] = args.handoff_inflight_window
     if args.mu_lanes is not None:
         suite["mu_lanes"] = args.mu_lanes
+    if args.handoff_gc is not None:
+        suite["handoff_gc"] = bool(args.handoff_gc)
+    suite.setdefault("handoff_gc", False)
+    if type(suite["handoff_gc"]) is not bool:
+        raise ValueError("handoff_gc must be boolean")
     if args.handoff_peer_read is not None:
         suite["handoff_peer_read"] = bool(args.handoff_peer_read)
     if suite.get("handoff_peer_read", False) not in (False, True):

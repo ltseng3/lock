@@ -52,6 +52,10 @@ int main(int argc, char** argv) {
         cfg.watchdog_seconds = opt.number("watchdog-seconds", 90);
         cfg.cas_release_guarded = opt.number("cas-release-guarded", 0) != 0;
         cfg.handoff_peer_read = opt.number("handoff-peer-read", 0) != 0;
+        const auto gc = opt.number("handoff-gc", 0);
+        if (gc > 1 || (gc && cfg.backend != lock::Backend::Handoff))
+            throw std::invalid_argument("handoff-gc requires handoff and 0 or 1");
+        cfg.handoff_gc = gc != 0;
         if (cfg.handoff_peer_read && cfg.backend != lock::Backend::Handoff)
             throw std::invalid_argument("peer READ is only supported by handoff");
         lock::rdma::Transport net(net_cfg);

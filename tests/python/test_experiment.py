@@ -87,6 +87,17 @@ class TestExperiment(unittest.TestCase):
         with self.assertRaises(ValueError):
             next(cases(dict(self.suite, locks=0)))
 
+    def test_gc_only_on_handoff_and_both_roles(self):
+        tuned = dict(self.suite, handoff_gc=True)
+        for backend in ("cas", "mu", "handoff"):
+            case = next(c for c in cases(tuned) if c["backend"] == backend)
+            self.assertEqual(case["handoff_gc"], int(backend == "handoff"))
+            for node in self.topo.nodes:
+                args = process_command(self.topo, node, tuned, case)
+                self.assertEqual("--handoff-gc=1" in args, backend == "handoff")
+        self.assertEqual(next(c for c in cases(self.suite)
+                              if c["backend"] == "handoff")["handoff_gc"], 0)
+
     def test_peer_read_only_on_handoff_clients(self):
         tuned = dict(self.suite, handoff_peer_read=True)
         for backend in ("cas", "mu", "handoff"):

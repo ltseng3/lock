@@ -193,18 +193,27 @@ credits are unavailable; the existing inter-thread queue still fails
 closed on overflow. Barriers reserve SQ capacity and keep token zero.
 Do not add a delay waiting to fill a batch.
 
-### TODO: retirement reclamation outside the ordering hot path
+### Optional retirement GC
 
-Keep the existing per-operation ReleaseAck for now. The client retires via
-one-sided marker WRITE and does not wait for ReleaseAck to complete an
-operation. ACKs reclaim client metadata and certify that any relevant
-NEXT precedes the ACK on that client's ordered lane QP. A future GC worker
-may batch/defer reclamation after the state owner removes retired heads;
-it must not mutate live lane state, race the QP owner, or send reclamation
-ahead of a queued NEXT. Use an ordered notification fence or explicit
-sequence watermark if moving delivery to a separate QP. Bound retained
-metadata, drain GC at shutdown, and specify how recovery fences stale
-notifications before changing the acknowledgment contract.
+With `--handoff-gc=1`, a predecessor with a committed successor needs no
+ReleaseAck. Its unique validated NEXT provides the information required to
+send HANDOFF and discard the local retired record. A late NEXT reclaims
+the record after sending HANDOFF; an early NEXT avoids inserting it at all.
+The state owner still checks every retirement marker in order but emits
+explicit reclamation notifications only when removing the final prepared
+entry. Once removed without a successor, the entry cannot acquire one.
+The communication worker packs up to five exact request IDs per GC SEND
+on the existing ordered client lane QP. No timer, no cumulative sequence
+assumption across locks, no new QP or thread. Singletons flush immediately.
+The client checks sender, lane, exact ID, uniqueness and retired state before
+erasing a complete batch. In GC mode, new admissions stop when the sum of
+active and retained records reaches 4096; existing work and GC continue.
+STOP requires all marker CQEs, HANDOFF receipts and retired records to drain.
+For each final prepared owner, the explicit GC packet certifies that
+preceding markers have been processed by the state owner.
+The baseline per-retirement ACK remains selectable (default). Do not mix
+GC modes or builds between endpoints. Recovery fencing and reclamation
+across membership changes are not implemented.
 
 Hardware-free leader_batch tests exercise the production compact log and
 response sender through a recording transport: singleton flush, contiguous

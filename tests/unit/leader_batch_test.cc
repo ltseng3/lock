@@ -137,6 +137,30 @@ void test_log(rdma::Transport& net) {
     rejected([&] { log.on_write_complete(3, 7); });
     rejected([&] { log.on_write_complete(5, 7); });
 }
+void test_gc_responses(rdma::Transport& net) {
+    sends.clear();
+    LeaderResponseBatch batch(net, 1, {6,7}, 1, 2, 8, true);
+    SpscQueue<Action, 1024> queue;
+    auto add = [&](NodeId peer, Kind kind, uint64_t seq) {
+        require(queue.try_push({peer, message(kind, 0, 1, make_request_id(peer, seq))}));
+    };
+    add(6, Kind::Order, 10);
+    for (uint64_t i = 1; i <= 6; ++i) add(6, Kind::ReleaseAck, i);
+    add(7, Kind::ReleaseAck, 11);
+    add(6, Kind::Next, 12);
+    require(batch.drain(queue) == 5 && queue.size() == 0);
+    require(sends.size() == 2 && sends[0].messages.size() == 4);
+    const auto& ms = sends[0].messages;
+    require(message_kind(ms[0]) == Kind::Order);
+    auto ids = decode_retirement_gc(ms[1], 6, 1);
+    require(ms[1].flags == 5 && ids[4] == make_request_id(6, 5));
+    require(message_kind(ms[2]) == Kind::Next);
+    ids = decode_retirement_gc(ms[3], 6, 1);
+    require(ms[3].flags == 1 && ids[0] == make_request_id(6, 6));
+    require(decode_retirement_gc(sends[1].messages[0], 7, 1)[0] == make_request_id(7, 11));
+    batch.completed(6, 4); batch.completed(7, 1);
+    sends.clear();
+}
 void test_responses(rdma::Transport& net) {
     const std::vector<NodeId> clients{6,7};
     LeaderResponseBatch batch(net, 1, clients, 1, 2, 8);
@@ -171,5 +195,6 @@ int main() {
     lock::rdma::Transport net(cfg);
     test_progress();
     test_log(net);
+    test_gc_responses(net);
     test_responses(net);
 }

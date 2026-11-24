@@ -320,3 +320,15 @@ log capacity is still finite. Do not describe an empty-section result as
 application throughput with a protected WRITE. The goodput counter and
 acquisition timing definition remain unchanged. Handoff's local release
 completion boundary is still marker posting, unlike Mu's ACK boundary.
+
+## Optional retirement GC
+
+Compare `--handoff-gc=0` (default, individual ReleaseAck) with
+`--handoff-gc=1` (NEXT-based reclamation plus up to five exact IDs per
+GC SEND). The runner passes the mode to all Handoff participants and records
+it in results. All other backends are unchanged. GC is opportunistic; there
+is no waiting for a full batch and no extra worker. Leader profile
+`responses_sent` counts physical SENDs, whereas `actions_enqueued` counts
+logical actions. Client counters `gc-next`, `gc-records` and `gc-messages`
+include warmup and drain, like HANDOFF counters. A GC packet is not a new
+ownership proof and does not change the local release-completion boundary.

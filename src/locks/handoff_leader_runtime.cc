@@ -60,14 +60,14 @@ void replication_loop(Shared& s, rdma::Transport& net,
                       const std::vector<NodeId>& replicas,
                       size_t lock_count, size_t prepared_window,
                       size_t window, bool profile,
-                      size_t lane, size_t lane_count, size_t replication_batch) {
+                      size_t lane, size_t lane_count, size_t replication_batch, bool gc) {
     try {
         // Half the registered log area holds 8-byte replicated headers. The
         // adjacent half holds one 8-byte marker per slot, written by the
         // completed client to the leader's NIC-exposed memory.
         const size_t capacity = handoff_log_capacity(net.memory_bytes());
         MuCompactLog log(net, replicas, window, capacity, lane, lane_count);
-        HandoffState state(lock_count, prepared_window);
+        HandoffState state(lock_count, prepared_window, gc);
         std::deque<Message> append_pending;
         std::vector<rdma::Completion> cqes;
         cqes.reserve(64);
@@ -204,13 +204,13 @@ void handoff_communication_loop(
     rdma::Transport& net, NodeId self,
     const std::vector<NodeId>& clients, size_t lock_count,
     bool profile, size_t lane, size_t lane_count,
-    std::atomic<bool>& started, size_t communication_batch) {
+    std::atomic<bool>& started, size_t communication_batch, bool gc) {
     // Each worker owns client-facing QPs and CQ for exactly one lane.
     // Only lane zero runs Ready/Stop barriers.
     std::vector<rdma::Completion> completions;
     completions.reserve(64);
     std::set<NodeId> ready, finished;
-    LeaderResponseBatch responses(net, self, clients, lane, lane_count, communication_batch);
+    LeaderResponseBatch responses(net, self, clients, lane, lane_count, communication_batch, gc);
     while (!s.stopped.load(std::memory_order_acquire)) {
         if (lane == 0) {
             for (const auto& shard : lanes)
@@ -274,7 +274,7 @@ void run_handoff_leader(rdma::Transport& net, NodeId self,
                         size_t lock_count, size_t prepared_window,
                         size_t inflight_window, bool profile,
                         size_t lane_count, size_t replication_batch,
-                        size_t communication_batch) {
+                        size_t communication_batch, bool gc) {
     if (!replication_batch || replication_batch > MuCompactLog::max_batch ||
         !communication_batch || communication_batch > LeaderResponseBatch::drain_limit)
         throw std::invalid_argument("invalid leader batch size");
@@ -293,7 +293,7 @@ void run_handoff_leader(rdma::Transport& net, NodeId self,
         Shared* shard = lanes[lane].get();
         workers.emplace_back([&, shard, lane] {
             replication_loop(*shard, net, replicas, lock_count, prepared_window,
-                             inflight_window, profile, lane, lane_count, replication_batch);
+                             inflight_window, profile, lane, lane_count, replication_batch, gc);
         });
     }
     for (size_t lane = 1; lane < lane_count; ++lane) {
@@ -301,7 +301,7 @@ void run_handoff_leader(rdma::Transport& net, NodeId self,
         workers.emplace_back([&, shard, lane] {
             try {
                 handoff_communication_loop(*shard, lanes, net, self,
-                    clients, lock_count, profile, lane, lane_count, started, communication_batch);
+                    clients, lock_count, profile, lane, lane_count, started, communication_batch, gc);
             } catch (...) {
                 shard->report_failure(std::current_exception());
             }
@@ -309,6 +309,6 @@ void run_handoff_leader(rdma::Transport& net, NodeId self,
     }
     // Lane zero's control loop owns the start/stop barrier.
     handoff_communication_loop(*lanes.front(), lanes, net, self, clients,
-                    lock_count, profile, 0, lane_count, started, communication_batch);
+                    lock_count, profile, 0, lane_count, started, communication_batch, gc);
 }
 } // namespace lock

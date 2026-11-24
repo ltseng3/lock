@@ -26,6 +26,7 @@ struct ClientConfig {
     uint64_t watchdog_seconds = 90;
     bool cas_release_guarded = false;
     bool handoff_peer_read = false;
+    bool handoff_gc = false;
 };
 class ClientEngine {
 public:
@@ -96,6 +97,9 @@ private:
     uint64_t handoffs_sent_ = 0;
     uint64_t handoffs_received_ = 0;
     uint64_t late_next_ = 0;
+    uint64_t gc_next_reclaimed_ = 0, gc_ack_records_ = 0, gc_ack_messages_ = 0;
+    // Stop admitting new work if notification delivery is stalled.
+    static constexpr size_t kGcRetainedLimit = 4096;
     PeerReadReceipts read_receipts_;
     std::array<size_t, 256> peer_reads_{};
     size_t reads_inflight_ = 0;

@@ -42,6 +42,9 @@ int main(int argc, char** argv) {
         auto clients = ids(opt.list("clients"));
         auto backend = lock::parse_backend(opt.require("backend"));
         const bool profile_requested = opt.number("profile-leader", 0) != 0;
+        const auto gc = opt.number("handoff-gc", 0);
+        if (gc > 1 || (gc && backend != lock::Backend::Handoff))
+            throw std::invalid_argument("handoff-gc requires handoff and 0 or 1");
         const size_t lock_count = opt.number("locks", 1000);
         const size_t mu_inflight_window = opt.number("mu-inflight-window", 512);
         if (mu_inflight_window < 1 || mu_inflight_window > 512)
@@ -88,7 +91,7 @@ int main(int argc, char** argv) {
                                              lock_count, opt.number("prepared-window", 8),
                                              handoff_inflight_window,
                                              profile_requested, mu_lanes, replication_batch,
-                                             cfg.communication_batch);
+                                             cfg.communication_batch, gc != 0);
             } else {
                 // Follower NICs accept one-sided header WRITEs autonomously.
                 // No application-side polling in the measured path.

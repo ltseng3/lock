@@ -29,6 +29,8 @@ class TestMetrics(unittest.TestCase):
         self.assertEqual(s["completed"], 900)
         self.assertEqual(s["locks"], 1000)
         self.assertEqual(s["critical_section_ops"], 1)
+        self.assertEqual(s["handoff_gc"], 0)
+        self.assertEqual(s["gc_ack_messages"], 0)
         self.assertIn("locks=1000 cs-ops=1", format_summary(s))
         self.assertEqual(s["aggregate_pairs_per_second"], 300)
         self.assertEqual(s["min_client_pairs_per_second"], 100)

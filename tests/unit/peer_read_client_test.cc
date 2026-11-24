@@ -1,6 +1,7 @@
 #include "lock/bench/client.h"
 #include "lock/locks/handoff_state.h"
 #include "lock/locks/handoff_layout.h"
+#include "lock/locks/retirement_gc.h"
 #include <cassert>
 #include <algorithm>
 #include <memory>
@@ -244,8 +245,80 @@ struct ClientEngineTestAccess {
         }
         require(e.retired_.empty() && e.awaited_.empty());
     }
+    static void test_retirement_gc() {
+        rdma::Config nc; nc.self = 5;
+        rdma::Transport net(nc);
+        ClientConfig cfg;
+        cfg.self = 5; cfg.replicas = {1,2,3}; cfg.backend = Backend::Handoff;
+        cfg.critical_section_ops = 0; cfg.lock_count = 1; cfg.handoff_gc = true;
+        ClientEngine e(net, cfg);
+        posted.clear();
+        auto order = [&](uint64_t pos) {
+            e.submit(0);
+            const auto id = e.ops_[0].request;
+            auto m = message(Kind::Order, 1, 0, id);
+            m.position = pos; m.value = pos;
+            e.handle(receive(m));
+            return id;
+        };
+        auto next = [&](RequestId id, uint64_t pos, RequestId successor) {
+            auto m = message(Kind::Next, 1, 0, id);
+            m.other = successor; m.position = pos; m.value = pos+1;
+            e.handle(receive(m));
+        };
+        const auto successor = make_request_id(4, 100);
+        const auto a = order(1);
+        next(a, 1, successor);
+        e.finish_empty_sections();
+        require(e.retired_.empty() && e.gc_next_reclaimed_ == 1);
+        e.handle(done(last(rdma::CompletionKind::Write)));
+        const auto b = order(2);
+        e.finish_empty_sections();
+        require(e.retired_.contains(b));
+        e.handle(done(last(rdma::CompletionKind::Write)));
+        next(b, 2, successor);
+        require(e.retired_.empty() && e.gc_next_reclaimed_ == 2);
+        const auto x = order(3);
+        e.finish_empty_sections(); e.handle(done(last(rdma::CompletionKind::Write)));
+        const auto y = order(4);
+        e.finish_empty_sections(); e.handle(done(last(rdma::CompletionKind::Write)));
+        require(e.retired_.size() == 2);
+        const std::array bad{x, b};
+        bool threw = false;
+        try { e.handle(receive(retirement_gc_message(1, 0, bad))); }
+        catch (const std::runtime_error&) { threw = true; }
+        require(threw && e.retired_.size() == 2);
+        const std::array valid{x,y};
+        auto packet = receive(retirement_gc_message(1, 0, valid));
+        packet.lane = 1;
+        threw = false;
+        try { e.handle(packet); } catch (const std::runtime_error&) { threw = true; }
+        require(threw && e.retired_.size() == 2);
+        packet.lane = 0; e.handle(packet);
+        require(e.retired_.empty() && e.gc_ack_records_ == 2 && e.gc_ack_messages_ == 1);
+        threw = false;
+        try { e.handle(packet); } catch (const std::runtime_error&) { threw = true; }
+        require(threw);
+        require(e.markers_drained() && e.requests_.empty() && e.awaited_.empty());
+
+        HandoffState state(1, 2, true);
+        auto ma = message(Kind::Acquire, 5, 0, a);
+        auto mb = message(Kind::Acquire, 5, 0, b);
+        state.admit(ma); state.committed({0, ma});
+        state.admit(mb);
+        auto actions = state.committed({1, mb});
+        require(actions.size() == 2 && message_kind(actions[1].message) == Kind::Next);
+        require(state.retire([&](uint64_t i) { return i == 0 ? a : 0; }).actions.empty());
+        auto tail = state.retire([&](uint64_t i) { return i == 1 ? b : 0; });
+        require(tail.actions.size() == 1 && tail.actions[0].message.request == b);
+        auto mc = message(Kind::Acquire, 5, 0, x);
+        state.admit(mc);
+        auto after = state.committed({2, mc});
+        require(after.size() == 1 && after[0].message.other == 0);
+    }
     static void run() {
         test_empty_sections();
+        test_retirement_gc();
         test_inline_marker_backpressure();
         rdma::Config nc; nc.self = 5;
         rdma::Transport net(nc);

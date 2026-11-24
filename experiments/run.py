@@ -73,8 +73,8 @@ def process_command(topo: Topology, node, suite: dict, case: dict,
                        arg("leader-comm-batch", suite.get("leader_comm_batch", 64))])
     if node.role == "replica" and case["backend"] == "mu":
         common.append(arg("mu-inflight-window", suite.get("mu_inflight_window", 512)))
-    if case["backend"] == "mu" and suite.get("mu_recovery", False):
-        common.append(arg("mu-recovery", 1))
+    if case["backend"] in ("mu", "handoff") and suite.get(case["backend"] + "_recovery", False):
+        common.append(arg(case["backend"] + "-recovery", 1))
         if node.role == "replica":
             common.extend([arg("mu-recovery-publication", int(suite.get("mu_recovery_publication", True))),
                            arg("mu-recovery-replay", int(suite.get("mu_recovery_replay", True)))])
@@ -255,25 +255,28 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
                     raise ValueError(f"invalid latency sample accounting from node {node_id}")
                 results.append(record)
             manifest["client_results"] = results
-            if suite.get("mu_recovery", False):
+            if suite.get(case["backend"] + "_recovery", False):
+                recovery_prefix = case["backend"].upper() + "_RECOVERY"
                 def exactly_one(log, prefix):
                     values = [json.loads(line[len(prefix):]) for line in log.splitlines()
                               if line.startswith(prefix)]
                     if len(values) != 1:
                         raise RuntimeError(f"expected one {prefix.strip()} record")
                     return values[0]
-                traces = [exactly_one(logs[n], "MU_RECOVERY_CLIENT ") for n in topo.clients]
+                traces = [exactly_one(logs[n], recovery_prefix + "_CLIENT ") for n in topo.clients]
                 manifest["recovery_clients"] = traces
                 if suite.get("crash_after_ms") is not None:
-                    recovery = exactly_one(logs[topo.replicas[1]], "MU_RECOVERY ")
+                    recovery = exactly_one(logs[topo.replicas[1]], recovery_prefix + " ")
                     for tr in traces:
                         if not (0 < tr["last_old_completion_ns"] <= tr["notice_ns"] <=
                                 tr["ready_ns"] <= tr["first_completion_ns"] <=
                                 (suite["warmup_seconds"] + suite["duration_seconds"]) * 10**9):
                             raise RuntimeError("client did not resume during measurement")
-                    if recovery["recovered_length"] != max(recovery["local_length"],
-                                                           recovery["remote_length"]):
-                        raise RuntimeError("invalid recovered length")
+                    if (recovery["recovered_length"] != max(recovery["local_length"],
+                                                            recovery["remote_length"]) or
+                            recovery["epoch"] != 1 or
+                            recovery["epoch_first_slot"] != recovery["recovered_length"]):
+                        raise RuntimeError("invalid recovered length or epoch boundary")
                     manifest["recovery"] = recovery
                     manifest["recovery"]["max_client_gap_ns"] = max(
                         tr["first_completion_ns"] - tr["last_old_completion_ns"] for tr in traces)
@@ -287,6 +290,10 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
                 manifest["leader_profile"] = [
                     line for line in logs[topo.replicas[0]].splitlines()
                     if line.startswith(prefix)]
+                if suite.get("crash_after_ms") is not None:
+                    manifest["replacement_profile"] = [
+                        line for line in logs[topo.replicas[1]].splitlines()
+                        if line.startswith(prefix)]
             manifest["summary"] = summarize(case, results)
             manifest["total_completed"] = manifest["summary"]["completed"]
             manifest["aggregate_goodput_pairs_per_second"] = (
@@ -365,9 +372,13 @@ def main() -> int:
                     help="Print one-second Mu leader diagnostics during the trial")
     ap.add_argument("--mu-recovery", type=int, choices=(0, 1),
                     help="One externally triggered Mu leader replacement")
-    ap.add_argument("--mu-recovery-publication", type=int, choices=(0, 1),
+    ap.add_argument("--handoff-recovery", type=int, choices=(0, 1),
+                    help="One externally triggered Handoff leader replacement")
+    ap.add_argument("--recovery-publication", "--mu-recovery-publication",
+                    dest="mu_recovery_publication", type=int, choices=(0, 1),
                     help="Ordered byte publication (1, default); raw word experiment (0)")
-    ap.add_argument("--mu-recovery-replay", type=int, choices=(0, 1),
+    ap.add_argument("--recovery-replay", "--mu-recovery-replay",
+                    dest="mu_recovery_replay", type=int, choices=(0, 1),
                     help="Background follower replay (1, default)")
     ap.add_argument("--crash-after-ms", type=int,
                     help="Kill initial leader this long after its local service-start marker")
@@ -436,27 +447,33 @@ def main() -> int:
     capacity = suite["latency_sample_capacity"]
     if type(capacity) is not int or not 1 <= capacity <= 64000000:
         raise ValueError("latency_sample_capacity must be an integer in 1..64000000")
-    for key, default in (("mu_recovery", False), ("mu_recovery_publication", True),
-                         ("mu_recovery_replay", True)):
+    for key, default in (("mu_recovery", False), ("handoff_recovery", False),
+                         ("mu_recovery_publication", True), ("mu_recovery_replay", True)):
         override = getattr(args, key)
         if override is not None:
             suite[key] = bool(override)
         suite.setdefault(key, default)
         if type(suite[key]) is not bool:
             raise ValueError(f"{key} must be boolean")
+    recovery_backends = [b for b in ("mu", "handoff") if suite[b + "_recovery"]]
+    if len(recovery_backends) > 1:
+        raise ValueError("choose one recovery backend per suite")
     if args.crash_after_ms is not None:
         suite["crash_after_ms"] = args.crash_after_ms
     if suite.get("crash_after_ms") is not None:
         delay = suite["crash_after_ms"]
-        if (not suite["mu_recovery"] or type(delay) is not int or delay <= 0 or
+        if (not recovery_backends or type(delay) is not int or delay <= 0 or
                 delay >= (suite["warmup_seconds"] + suite["duration_seconds"] - 1) * 1000):
             raise ValueError("crash requires recovery, positive delay and >1s post-crash budget")
-    if suite["mu_recovery"] and (args.smoke or
-            (args.only_backend or "") not in ("", "mu") or
-            (args.only_backend != "mu" and suite["backends"] != ["mu"]) or
-            suite.get("mu_lanes", 1) != 1 or len(topo.replicas) != 3 or
-            suite["critical_section_ops"] != 0 or len(topo.clients) > 15):
-        raise ValueError("Mu recovery requires Mu only, three replicas, one lane, empty CS")
+    if recovery_backends:
+        backend = recovery_backends[0]
+        if (args.smoke or (args.only_backend or "") not in ("", backend) or
+                (args.only_backend != backend and suite["backends"] != [backend]) or
+                suite.get("mu_lanes", 1) != 1 or len(topo.replicas) != 3 or
+                suite["critical_section_ops"] != 0 or len(topo.clients) > 15):
+            raise ValueError("recovery requires one backend, three replicas, one lane, empty CS")
+        if backend == "handoff" and (suite.get("handoff_gc") or suite.get("handoff_peer_read")):
+            raise ValueError("handoff recovery initially excludes GC and peer READ")
     if suite["replicas"] != len(topo.replicas):
         raise ValueError("suite replica count does not match topology")
     if not 1 <= suite.get("mu_lanes", 1) <= 8:

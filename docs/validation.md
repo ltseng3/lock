@@ -301,3 +301,15 @@ than truncate or allocate on overflow. The runner checks completed pairs
 equal the number of stored samples. Exact nearest-rank p50/p99/p99.9
 percentiles are computed by sorting the populated ranges after the Stop
 barrier. This instrumentation is independent of the backend and recovery.
+
+## Epoch-tagged Handoff recovery
+
+The experimental branch adds a shared compact-prefix recovery runtime and
+epoch-boundary metadata. Hardware-independent tests cover epoch history,
+recovery layout separation, Handoff snapshot/queue validation and the
+actual client event loop (deferred marker, stale old-epoch HANDOFF, and
+new-epoch HANDOFF before Ready). Missing snapshots fail closed. These
+tests do not establish RNIC fencing, DMA coherence or lease expiration.
+Use the Handoff recovery suite on hardware; verify recovered length,
+repair entries, epoch_first_slot, no duplicate execution and sustained
+post-recovery throughput. See recovery.md for detailed assumptions.

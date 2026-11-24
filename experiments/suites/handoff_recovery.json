@@ -1,0 +1,37 @@
+{
+  "name": "handoff-recovery",
+  "backends": [
+    "handoff"
+  ],
+  "locks": 1000,
+  "distributions": [
+    "uniform",
+    "zipf_0.99"
+  ],
+  "workers": [
+    4
+  ],
+  "outstanding": [
+    4,
+    16
+  ],
+  "replicas": 3,
+  "mu_lanes": 1,
+  "prepared_window": 64,
+  "handoff_inflight_window": 512,
+  "replication_batch": 16,
+  "leader_comm_batch": 64,
+  "critical_section_ops": 0,
+  "handoff_recovery": true,
+  "mu_recovery_publication": true,
+  "mu_recovery_replay": true,
+  "handoff_gc": false,
+  "handoff_peer_read": false,
+  "crash_after_ms": 2000,
+  "profile_leader": false,
+  "warmup_seconds": 1,
+  "duration_seconds": 7,
+  "watchdog_seconds": 90,
+  "repetitions": 3,
+  "seed": 2026
+}

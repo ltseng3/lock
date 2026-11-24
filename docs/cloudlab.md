@@ -389,3 +389,19 @@ per-client limit of 1..64000000 samples. Two uint64_t arrays consume
 16 bytes per slot; 8000000 samples use about 122 MiB per client.
 Overflow invalidates the trial; raise the capacity and rerun. The actual
 sample count and capacity are recorded in each client RESULT.
+
+## Handoff leader replacement (experimental recovery/handoff branch)
+
+    python3 experiments/run.py --suite=experiments/suites/handoff_recovery.json --max-trials=1 --remote-dir=/tmp/lock-handoff-recovery
+
+The first Handoff recovery version requires three replicas, one lane,
+empty sections, all clients surviving, GC off and peer READ off. The
+runner uses the same preconnected TCP crash oracle and trace format as
+Mu. The server prints HANDOFF_RECOVERY and clients print
+HANDOFF_RECOVERY_CLIENT; the manifest and RECOVERY_CSV are backend
+independent. A crash trial verifies the recovered length and epoch
+boundary and requires every client to resume during measurement.
+--recovery-publication and --recovery-replay are aliases for the previous
+Mu-prefixed options. Start with publication enabled. Use a fresh remote
+directory and rebuild all nodes because wire version 2 is incompatible
+with version 1. See recovery.md for invariants and unsupported cases.

@@ -22,3 +22,11 @@ recommended. If the system C++ compiler is too old, install `g++-10` and use
 See [recovery design](docs/recovery.md) for the failure model, epoch
 metadata, ownership invariants, implementation status and validation plan.
 The recovery branches are separate from the failure-free benchmark baseline.
+
+On the experimental recovery/handoff branch, the initial Handoff recovery
+smoke experiment is:
+
+    python3 experiments/run.py --suite=experiments/suites/handoff_recovery.json --max-trials=1 --remote-dir=/tmp/lock-handoff-recovery
+
+All nodes must run the same wire version. Client crashes, leases, election
+and multiple replacements remain unsupported; see the design document.

@@ -164,7 +164,7 @@ def observe_start(proc, log, timeout):
             for line in reader:
                 if line.startswith(b"ERROR "):
                     raise RuntimeError(line.decode(errors="replace").strip())
-                if line.startswith(b"MU_SERVICE_STARTED"):
+                if line.startswith((b"MU_SERVICE_STARTED", b"HANDOFF_SERVICE_STARTED")):
                     return time.monotonic_ns()
             if proc.poll() is not None:
                 raise RuntimeError("leader exited before service start")

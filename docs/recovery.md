@@ -121,3 +121,17 @@ Only the unlogged pending IDs are admitted again. The promoted runtime
 owns the restored HandoffState and resumes appending at the recovered length.
 The first implementation requires all clients and empty critical sections;
 no leases or client exclusion are claimed.
+
+### Running and interpreting the benchmark
+
+Use the handoff_recovery.json suite with --max-trials=1 for initial
+hardware validation. The default prepared window is 64, and compact
+in-flight window 512. The runner rejects mixed recovery backends and
+unsupported GC/READ or multi-lane configurations. Recovery time includes
+the epoch boundary WRITE completion and relationship installation; it
+excludes controller injection and failed-process cleanup. The archived
+manifest includes per-client 10-ms samples and both leader profiles when
+profiling is enabled. To measure instrumentation overhead separately,
+use a suite without crash_after_ms with recovery enabled; compare against
+a matched no-recovery run. A successful empty-section run is not proof
+of safety for protected WRITEs or client crash recovery.

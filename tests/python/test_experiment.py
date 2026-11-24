@@ -50,6 +50,20 @@ class TestExperiment(unittest.TestCase):
         self.assertIn("--profile-leader=1", server)
         self.assertNotIn("--profile-leader=1", client)
 
+    def test_handoff_recovery_flags(self):
+        suite = dict(self.suite, handoff_recovery=True)
+        case = dict(next(cases(suite)), backend="handoff")
+        for node in self.topo.nodes:
+            args = process_command(self.topo, node, suite, case)
+            self.assertIn("--handoff-recovery=1", args)
+            self.assertNotIn("--mu-recovery=1", args)
+            self.assertEqual("--mu-recovery-publication=1" in args,
+                             node.role == "replica")
+        case["backend"] = "mu"
+        for node in self.topo.nodes:
+            self.assertNotIn("--handoff-recovery=1",
+                             process_command(self.topo, node, suite, case))
+
     def test_latency_capacity_only_on_clients(self):
         tuned = dict(self.suite, latency_sample_capacity=8000000)
         for backend in ("cas", "mu", "handoff"):

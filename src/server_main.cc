@@ -67,13 +67,25 @@ int main(int argc, char** argv) {
             !cfg.communication_batch || cfg.communication_batch > 64)
             throw std::invalid_argument("invalid leader batch size");
         const bool leader = cfg.self == replicas.front();
+        lock::MuRecoveryConfig recovery;
+        const auto recover = opt.number("mu-recovery", 0);
+        const auto publication = opt.number("mu-recovery-publication", 1);
+        const auto replay = opt.number("mu-recovery-replay", 1);
+        if (recover > 1 || publication > 1 || replay > 1 ||
+            (recover && (backend != lock::Backend::Mu || replicas.size() != 3 ||
+                         mu_lanes != 1 || clients.size() > 15)))
+            throw std::invalid_argument("Mu recovery requires 3 replicas, one lane, <=15 clients");
+        recovery.enabled = recover != 0;
+        recovery.publication = publication != 0;
+        recovery.replay = replay != 0;
+        if (recovery.enabled && !leader) cfg.recoverable_peer = replicas.front();
         if (backend == lock::Backend::Mu ||
             backend == lock::Backend::Handoff) {
             // Every replica must bootstrap identical per-lane QPs, including
             // passive followers, for the leader's one-sided inline WRITEs.
             cfg.replication_peers = replicas;
             cfg.replication_lanes = mu_lanes;
-            if (leader)
+            if (leader || (recovery.enabled && cfg.self == replicas[1]))
                 cfg.client_lane_peers = clients;
         }
         lock::rdma::Transport net(cfg);
@@ -85,13 +97,17 @@ int main(int argc, char** argv) {
                     lock::run_mu_leader(net, cfg.self, replicas, clients,
                                         lock_count, mu_inflight_window,
                                         profile_requested, mu_lanes, replication_batch,
-                                             cfg.communication_batch);
+                                             cfg.communication_batch, recovery);
                 else
                     lock::run_handoff_leader(net, cfg.self, replicas, clients,
                                              lock_count, opt.number("prepared-window", 8),
                                              handoff_inflight_window,
                                              profile_requested, mu_lanes, replication_batch,
                                              cfg.communication_batch, gc != 0);
+            } else if (recovery.enabled) {
+                lock::run_mu_standby(net, replicas, clients, lock_count, mu_inflight_window,
+                    profile_requested, replication_batch, cfg.communication_batch, recovery,
+                    opt.require("mu-recovery-trigger"), opt.number("watchdog-seconds", 90));
             } else {
                 // Follower NICs accept one-sided header WRITEs autonomously.
                 // No application-side polling in the measured path.

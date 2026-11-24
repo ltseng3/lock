@@ -54,10 +54,11 @@ struct JoinWorkers {
 void replication_loop(Shared& s, rdma::Transport& net,
                       const std::vector<NodeId>& replicas,
                       size_t lock_count, size_t window, bool profile,
-                      size_t lane, size_t lane_count, size_t replication_batch) {
+                      size_t lane, size_t lane_count, size_t replication_batch,
+                      MuRecoveryConfig recovery, MuPromotion* promotion) {
     try {
-        MuCompactLog log(net, replicas, window, 0, lane, lane_count);
-        MuState state(lock_count);
+        MuCompactLog log(net, replicas, window, 0, lane, lane_count, recovery);
+        MuState state = promotion ? std::move(promotion->state) : MuState(lock_count);
         std::vector<rdma::Completion> completions;
         completions.reserve(64);
         auto profile_start = Clock::now();
@@ -173,6 +174,7 @@ void mu_communication_loop(
                     throw std::runtime_error("invalid Mu readiness");
                 if (ready.size() == clients.size()) {
                     started.store(true, std::memory_order_release);
+                    std::cout << "MU_SERVICE_STARTED" << std::endl;
                     for (NodeId id : clients)
                         net.send(id, message(Kind::Ready, self), 0, true, 0);
                 }
@@ -214,7 +216,7 @@ void run_mu_leader(rdma::Transport& net, NodeId self,
                    const std::vector<NodeId>& clients, size_t lock_count,
                    size_t inflight_window, bool profile,
                    size_t lane_count, size_t replication_batch,
-                        size_t communication_batch) {
+                        size_t communication_batch, MuRecoveryConfig recovery, MuPromotion* promotion) {
     if (!replication_batch || replication_batch > MuCompactLog::max_batch ||
         !communication_batch || communication_batch > LeaderResponseBatch::drain_limit)
         throw std::invalid_argument("invalid leader batch size");
@@ -226,14 +228,25 @@ void run_mu_leader(rdma::Transport& net, NodeId self,
     workers.reserve(2 * lane_count - 1);
     for (size_t lane = 0; lane < lane_count; ++lane)
         lanes.push_back(std::make_unique<Shared>());
-    std::atomic<bool> started{false};
+    if (recovery.promoted != (promotion != nullptr) ||
+        (recovery.enabled && lane_count != 1))
+        throw std::invalid_argument("invalid Mu recovery runtime");
+    if (promotion) {
+        for (const auto& m : promotion->pending)
+            if (!lanes.front()->requests.try_push(m))
+                throw std::runtime_error("recovery pending overflow");
+        for (const auto& a : promotion->responses)
+            if (!lanes.front()->responses.try_push(a))
+                throw std::runtime_error("recovery responses overflow");
+    }
+    std::atomic<bool> started{promotion != nullptr};
     // Join workers before destroying their shared start flag.
     JoinWorkers join{lanes, workers};
     for (size_t lane = 0; lane < lane_count; ++lane) {
         Shared* shard = lanes[lane].get();
         workers.emplace_back([&, shard, lane] {
             replication_loop(*shard, net, replicas, lock_count, inflight_window,
-                             profile, lane, lane_count, replication_batch);
+                             profile, lane, lane_count, replication_batch, recovery, promotion);
         });
     }
     for (size_t lane = 1; lane < lane_count; ++lane) {

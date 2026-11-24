@@ -27,6 +27,7 @@ uint64_t percentile(std::vector<uint64_t> values, double p) {
 } // namespace
 ClientEngine::ClientEngine(rdma::Transport& net, ClientConfig cfg)
     : net_(net), cfg_(std::move(cfg)),
+      leader_(cfg_.replicas.empty() ? 0 : cfg_.replicas.front()),
       ops_(cfg_.outstanding * cfg_.workers) {
     if (cfg_.workers < 1 || cfg_.workers > 16 ||
         cfg_.outstanding * cfg_.workers > 512)
@@ -47,6 +48,9 @@ ClientEngine::ClientEngine(rdma::Transport& net, ClientConfig cfg)
     if (cfg_.outstanding == 0 || cfg_.outstanding > 512 || cfg_.lock_count == 0 ||
         cfg_.lock_count > 1000)
         throw std::invalid_argument("invalid client window or lock count");
+    if (cfg_.mu_recovery && (cfg_.backend != Backend::Mu || cfg_.replicas.size() != 3 ||
+                             cfg_.mu_lanes != 1 || cfg_.critical_section_ops != 0))
+        throw std::invalid_argument("Mu recovery initially requires empty critical sections, 3 replicas, 1 lane");
     if (cfg_.handoff_gc && cfg_.backend != Backend::Handoff)
         throw std::invalid_argument("retirement GC requires handoff");
     if (cfg_.handoff_peer_read) {
@@ -99,7 +103,7 @@ void ClientEngine::submit(size_t slot) {
         post_cas(slot);
     } else if (cfg_.backend == Backend::Mu) {
         op.phase = Phase::WaitGrant;
-        net_.send(cfg_.replicas.front(),
+        net_.send(leader_,
                   message(Kind::Acquire, cfg_.self, op.lock, op.request),
                   0, true, lock_lane(op.lock, cfg_.mu_lanes));
     } else {
@@ -153,7 +157,8 @@ void ClientEngine::release(size_t slot) {
         }
         publish_retirement(slot);
     } else if (cfg_.backend == Backend::Mu) {
-        net_.send(cfg_.replicas.front(),
+        if (recovery_paused_) return; // preserve WaitRelease for reconciliation
+        net_.send(leader_,
                   message(Kind::Release, cfg_.self, op.lock, op.request),
                   0, true, lock_lane(op.lock, cfg_.mu_lanes));
     } else {
@@ -172,6 +177,11 @@ void ClientEngine::release(size_t slot) {
 void ClientEngine::complete(size_t slot) {
     auto& op = ops_[slot];
     auto now = Clock::now();
+    if (cfg_.mu_recovery && trace_start_ != Clock::time_point{} && now <= measurement_end_) {
+        const auto index = nanos(now - trace_start_) / trace_bucket_ns_;
+        if (index < trace_counts_.size()) ++trace_counts_[index];
+        if (recovery_ready_ && first_resumed_ == Clock::time_point{}) first_resumed_ = now;
+    }
     if (op.begun >= measurement_begin_ && now <= measurement_end_) {
         ++completed_;
         acquire_ns_.push_back(nanos(op.acquired - op.begun));
@@ -396,13 +406,56 @@ void ClientEngine::handle_next(const rdma::Completion& c) {
     }
 }
 
+void ClientEngine::begin_mu_recovery() {
+    if (!cfg_.mu_recovery || recovery_started_ || stop_sent_ ||
+        !awaited_.empty() || !empty_sections_.empty())
+        throw std::runtime_error("invalid client recovery transition");
+    recovery_started_ = true;
+    recovery_paused_ = true;
+    recovery_notice_ = Clock::now();
+    net_.fence_peer(leader_);
+    leader_ = cfg_.replicas[1];
+    for (const auto& op : ops_) {
+        if (op.phase == Phase::Idle) continue;
+        if (op.phase != Phase::WaitGrant && op.phase != Phase::WaitRelease)
+            throw std::runtime_error("unsupported recovery phase");
+        net_.send(leader_, message(op.phase == Phase::WaitGrant ? Kind::RecoveryAcquire :
+            Kind::RecoveryRelease, cfg_.self, op.lock, op.request));
+    }
+    net_.send(leader_, message(Kind::RecoveryDone, cfg_.self));
+}
 void ClientEngine::handle(const rdma::Completion& c) {
+    if (cfg_.mu_recovery) {
+        if (c.kind == rdma::CompletionKind::PeerFailed) {
+            if (c.peer != cfg_.replicas.front()) throw std::runtime_error("unexpected peer failure");
+            if (!recovery_started_) recovery_paused_ = true;
+            return;
+        }
+        if ((recovery_started_ || recovery_paused_) && c.peer == cfg_.replicas.front())
+            return; // old responses in the same CQ poll are not authoritative
+        if (c.kind == rdma::CompletionKind::Receive &&
+            c.peer == cfg_.replicas[1] && c.message.sender == c.peer) {
+            const auto kind = message_kind(c.message);
+            if (kind == Kind::RecoveryBegin && c.lane == 0) {
+                begin_mu_recovery(); return;
+            }
+            if (kind == Kind::RecoveryReady && c.lane == 0) {
+                if (!recovery_started_ || recovery_ready_)
+                    throw std::runtime_error("invalid client recovery ready");
+                recovery_ready_ = true; recovery_paused_ = false;
+                recovery_ready_time_ = Clock::now();
+                return;
+            }
+            if (!recovery_ready_)
+                throw std::runtime_error("new leader response before recovery ready");
+        }
+    }
     if (c.kind == rdma::CompletionKind::Send) return;
     if (c.kind == rdma::CompletionKind::Receive) {
         if (c.message.sender != c.peer)
             throw std::runtime_error("message sender mismatch");
         const Kind kind = message_kind(c.message);
-        if (c.peer == cfg_.replicas.front()) {
+        if (c.peer == leader_) {
             const bool control = kind == Kind::Ready || kind == Kind::Stop;
             if (control) {
                 if (c.lane != 0)
@@ -418,7 +471,7 @@ void ClientEngine::handle(const rdma::Completion& c) {
         }
         if (kind == Kind::Ready) return;
         if (kind == Kind::Stop) {
-            if (c.peer != cfg_.replicas.front() || !stop_sent_ || server_stopped_)
+            if (c.peer != leader_ || !stop_sent_ || server_stopped_)
                 throw std::runtime_error("invalid shutdown barrier");
             server_stopped_ = true;
             return;
@@ -459,7 +512,7 @@ void ClientEngine::handle(const rdma::Completion& c) {
             }
             throw std::runtime_error("unexpected handoff control message");
         }
-        if (c.peer != cfg_.replicas.front())
+        if (c.peer != leader_)
             throw std::runtime_error("unexpected server message");
         auto it = requests_.find(c.message.request);
         if (it == requests_.end()) throw std::runtime_error("unknown request response");
@@ -556,13 +609,17 @@ void ClientEngine::run() {
     }
     if (!barrier) throw std::runtime_error("client start barrier timeout");
     const auto start = Clock::now();
+    if (cfg_.mu_recovery) {
+        trace_start_ = start;
+        trace_counts_.resize((cfg_.warmup_seconds + cfg_.duration_seconds) * 100 + 1);
+    }
     measurement_begin_ = start + std::chrono::seconds(cfg_.warmup_seconds);
     measurement_end_ = measurement_begin_ + std::chrono::seconds(cfg_.duration_seconds);
     auto watchdog = measurement_end_ + std::chrono::seconds(cfg_.watchdog_seconds);
     while (true) {
         auto now = Clock::now();
         if (now > watchdog) throw std::runtime_error("client watchdog timeout: fail closed");
-        if (now < measurement_end_) {
+        if (now < measurement_end_ && !recovery_paused_) {
             for (size_t i = 0; i < ops_.size(); ++i) {
                 if (cfg_.handoff_gc &&
                     retired_.size() + requests_.size() >= kGcRetainedLimit) break;
@@ -578,17 +635,33 @@ void ClientEngine::run() {
             markers_drained() && deferred_marker_slots_.empty() &&
             retired_.empty() && awaited_.empty() && read_receipts_.empty() &&
             empty_sections_.empty() &&
-            !stop_sent_) {
+            !stop_sent_ && !recovery_paused_) {
             // Every read winner has consumed its normal HANDOFF, all local
             // DMA has completed, and all retirements have been reclaimed.
             // Keep the registered region alive until the all-client barrier.
-            net_.send(leader, message(Kind::Stop, cfg_.self));
+            net_.send(leader_, message(Kind::Stop, cfg_.self));
             stop_sent_ = true;
         }
         if (stop_sent_ && server_stopped_) break;
     }
     if (!awaited_.empty()) throw std::runtime_error("outstanding CQEs at completion");
+    if (cfg_.mu_recovery) print_recovery_trace();
     print_result();
+}
+void ClientEngine::print_recovery_trace() const {
+    const auto relative = [&](Clock::time_point t) -> uint64_t {
+        return t == Clock::time_point{} ? 0 : nanos(t - trace_start_);
+    };
+    std::cout << "MU_RECOVERY_CLIENT {\"node\":" << cfg_.self
+              << ",\"notice_ns\":" << relative(recovery_notice_)
+              << ",\"ready_ns\":" << relative(recovery_ready_time_)
+              << ",\"first_completion_ns\":" << relative(first_resumed_)
+              << ",\"bucket_ns\":" << trace_bucket_ns_ << ",\"buckets\":[";
+    for (size_t i = 0; i < trace_counts_.size(); ++i) {
+        if (i) std::cout << ",";
+        std::cout << trace_counts_[i];
+    }
+    std::cout << "]}" << std::endl;
 }
 void ClientEngine::print_result() const {
     const char* name = cfg_.backend == Backend::Cas ? "cas" :

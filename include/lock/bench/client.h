@@ -27,6 +27,7 @@ struct ClientConfig {
     bool cas_release_guarded = false;
     bool handoff_peer_read = false;
     bool handoff_gc = false;
+    bool mu_recovery = false;
 };
 class ClientEngine {
 public:
@@ -76,6 +77,13 @@ private:
     static constexpr WorkId kMarkerTokenBase = 1ULL << 47;
     rdma::Transport& net_;
     ClientConfig cfg_;
+    NodeId leader_ = 0;
+    bool recovery_paused_ = false, recovery_started_ = false, recovery_ready_ = false;
+    Clock::time_point trace_start_{}, recovery_notice_{}, recovery_ready_time_{}, first_resumed_{};
+    static constexpr uint64_t trace_bucket_ns_ = 10000000; // 10 ms
+    std::vector<uint64_t> trace_counts_;
+    void begin_mu_recovery();
+    void print_recovery_trace() const;
     std::vector<LockPicker> pickers_;
     std::vector<Operation> ops_;
     // Empty sections complete synchronously in the event loop, after the

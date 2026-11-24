@@ -40,6 +40,15 @@ int main(int argc, char** argv) {
             net_cfg.client_lane_peers = {cfg.replicas.front()};
         }
         cfg.lock_count = opt.number("locks", 1000);
+        const auto recovery = opt.number("mu-recovery", 0);
+        if (recovery > 1 || (recovery && (cfg.backend != lock::Backend::Mu ||
+                                        cfg.replicas.size() != 3 || cfg.mu_lanes != 1)))
+            throw std::invalid_argument("invalid Mu client recovery mode");
+        cfg.mu_recovery = recovery != 0;
+        if (cfg.mu_recovery) {
+            net_cfg.recoverable_peer = cfg.replicas.front();
+            net_cfg.client_lane_peers.push_back(cfg.replicas[1]);
+        }
         cfg.critical_section_ops = opt.number("critical-section-ops", 1);
         if (cfg.critical_section_ops > 1)
             throw std::invalid_argument("critical-section-ops must be 0 or 1");

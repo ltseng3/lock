@@ -67,6 +67,7 @@ void Transport::compare_swap(NodeId peer, uint64_t* result, size_t offset,
     posted.push_back({CompletionKind::CompareSwap, peer, id, result, {}, offset});
 }
 void Transport::poll_into(std::vector<Completion>& out, int) { out.clear(); }
+void Transport::fence_peer(NodeId) {}
 } // namespace lock::rdma
 
 namespace lock {
@@ -316,8 +317,39 @@ struct ClientEngineTestAccess {
         auto after = state.committed({2, mc});
         require(after.size() == 1 && after[0].message.other == 0);
     }
+    static void test_mu_recovery_client() {
+        rdma::Config nc; nc.self = 5;
+        rdma::Transport net(nc);
+        ClientConfig cfg; cfg.self = 5; cfg.replicas = {1,2,3};
+        cfg.backend = Backend::Mu; cfg.mu_recovery = true;
+        cfg.critical_section_ops = 0; cfg.outstanding = 2;
+        ClientEngine e(net, cfg);
+        posted.clear(); e.submit(0); e.submit(1);
+        const auto a = e.ops_[0].request, b = e.ops_[1].request;
+        const auto la = e.ops_[0].lock, lb = e.ops_[1].lock;
+        e.handle(receive(message(Kind::Grant, 1, la, a)));
+        e.finish_empty_sections();
+        require(e.ops_[0].phase == ClientEngine::Phase::WaitRelease);
+        e.handle(receive(message(Kind::RecoveryBegin, 2)));
+        require(e.recovery_paused_ && e.leader_ == 2);
+        require(message_kind(posted[posted.size()-3].message) == Kind::RecoveryRelease);
+        require(posted[posted.size()-3].message.request == a);
+        require(message_kind(posted[posted.size()-2].message) == Kind::RecoveryAcquire);
+        require(posted[posted.size()-2].message.request == b);
+        require(message_kind(posted.back().message) == Kind::RecoveryDone);
+        e.handle(receive(message(Kind::Grant, 1, lb, b))); // stale response ignored
+        require(e.ops_[1].phase == ClientEngine::Phase::WaitGrant);
+        e.handle(receive(message(Kind::RecoveryReady, 2)));
+        e.handle(receive(message(Kind::ReleaseAck, 2, la, a)));
+        e.handle(receive(message(Kind::Grant, 2, lb, b)));
+        e.finish_empty_sections();
+        require(posted.back().peer == 2 && posted.back().message.request == b);
+        e.handle(receive(message(Kind::ReleaseAck, 2, lb, b)));
+        require(e.requests_.empty());
+    }
     static void run() {
         test_empty_sections();
+        test_mu_recovery_client();
         test_retirement_gc();
         test_inline_marker_backpressure();
         rdma::Config nc; nc.self = 5;

@@ -18,7 +18,9 @@ inline uint64_t request_sequence(RequestId request) { return request & ((1ULL <<
 enum class Kind : uint32_t {
     Acquire = 1, Release = 2, Grant = 3, ReleaseAck = 4,
     Order = 5, Start = 6, Next = 7, Handoff = 8,
-    Ready = 9, Stop = 10, Error = 11, RetirementGc = 12
+    Ready = 9, Stop = 10, Error = 11, RetirementGc = 12,
+    RecoverySeal = 13, RecoveryBegin = 14, RecoveryAcquire = 15,
+    RecoveryRelease = 16, RecoveryDone = 17, RecoveryReady = 18
 };
 struct Message {
     uint64_t request = 0;
@@ -46,7 +48,7 @@ inline Message message(Kind kind, NodeId sender, LockId lock_id = 0, RequestId r
 inline Kind message_kind(const Message& m) {
     if (m.version != kWireVersion ||
         m.kind < static_cast<uint32_t>(Kind::Acquire) ||
-        m.kind > static_cast<uint32_t>(Kind::RetirementGc))
+        m.kind > static_cast<uint32_t>(Kind::RecoveryReady))
         throw std::runtime_error("invalid wire message");
     return static_cast<Kind>(m.kind);
 }

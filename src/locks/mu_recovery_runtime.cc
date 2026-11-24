@@ -68,7 +68,8 @@ void run_mu_standby(rdma::Transport& net, const std::vector<NodeId>& replicas,
     if (active_reported != shadow->active())
         throw std::runtime_error("client recovery reports omit live requests");
     MuPromotion promotion{shadow->take_state(), std::move(pending), std::move(responses)};
-    shadow.reset();
+    // Keep the historical index until process teardown; freeing its pages
+    // here would make takeover latency depend on the entire old history.
     const auto reconciled = RecoveryClock::now();
     for (NodeId c : clients) net.send(c, message(Kind::RecoveryReady, replacement, 0, 0, kReplacementEpoch));
     const auto ready = RecoveryClock::now();

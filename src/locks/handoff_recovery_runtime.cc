@@ -107,7 +107,8 @@ void run_handoff_standby(rdma::Transport& net, const std::vector<NodeId>& replic
         check_recovery_deadline(p.deadline);
     }
     auto promotion = index->reconcile(clients, snapshots, prepared_window);
-    index.reset();
+    // Keep the historical index until process teardown. Reclaiming a large
+    // index can unmap thousands of pages, defeating bounded suffix replay.
     install_relationships(net, clients, promotion.relationships, p.deadline);
     const auto reconciled = RecoveryClock::now();
     for (auto c : clients)

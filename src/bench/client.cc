@@ -496,6 +496,8 @@ void ClientEngine::resume_handoff_recovery() {
             }
         }
     }
+    if (!early_handoff_.empty())
+        throw std::runtime_error("handoff arrived for an uninstalled recovered request");
 }
 
 void ClientEngine::handle(const rdma::Completion& c) {

@@ -376,13 +376,15 @@ struct ClientEngineTestAccess {
         require(!e.ops_[1].started && e.early_handoff_.empty());
         auto new_order = message(Kind::Order, 2, 0, b, 1);
         new_order.other = pred; new_order.position = 1; new_order.value = 11;
+        // A peer can receive its Ready before this client's CQ is drained.
+        auto early = message(Kind::Handoff, 4, 0, b, 1);
+        early.other = pred; early.position = 1;
+        e.handle(receive(early)); // before even processing B's ORDER
+        require(!e.ops_[1].started && e.empty_sections_.empty());
         e.handle(receive(new_order));
         auto next = message(Kind::Next, 2, 0, b, 1);
         next.other = c; next.position = 1; next.value = 2;
         e.handle(receive(next));
-        auto early = message(Kind::Handoff, 4, 0, b, 1);
-        early.other = pred; early.position = 1;
-        e.handle(receive(early));
         require(!e.ops_[1].started && e.empty_sections_.empty());
         new_order = message(Kind::Order, 2, 0, c, 1);
         new_order.other = b; new_order.position = 2; new_order.value = 12;
@@ -403,7 +405,39 @@ struct ClientEngineTestAccess {
         require(e.retired_.empty() && e.markers_drained());
         e.handle(receive(stale)); // stale old proof after completion is ignored
     }
+    static void test_handoff_recovery_marker_fence() {
+        rdma::Config nc; nc.self = 5;
+        rdma::Transport net(nc);
+        ClientConfig cfg; cfg.self = 5; cfg.replicas = {1,2,3};
+        cfg.backend = Backend::Handoff; cfg.handoff_recovery = true;
+        cfg.critical_section_ops = 0; cfg.lock_count = 1;
+        ClientEngine e(net, cfg);
+        posted.clear(); e.submit(0);
+        auto a = e.ops_[0].request;
+        auto order = message(Kind::Order, 1, 0, a);
+        order.value = 0; e.handle(receive(order)); e.finish_empty_sections();
+        auto old_marker = last(rdma::CompletionKind::Write);
+        require(e.retired_.contains(a) && !e.markers_drained());
+        e.submit(0);
+        auto b = e.ops_[0].request;
+        e.handle(receive(message(Kind::RecoveryBegin, 2, 0, 0, 1)));
+        require(e.markers_drained() && e.retired_.empty());
+        // Pending B had no old ORDER; new leader restores it as a head.
+        auto recovered = message(Kind::Order, 2, 0, b, 1);
+        recovered.value = 1; e.handle(receive(recovered));
+        require(!e.ops_[0].started);
+        e.handle(receive(message(Kind::RecoveryReady, 2, 0, 0, 1)));
+        e.finish_empty_sections();
+        auto new_marker = last(rdma::CompletionKind::Write);
+        require(new_marker.peer == 2 && new_marker.id == old_marker.id + 1);
+        e.handle(done(old_marker)); // stale queued CQE must not retire new credit
+        require(!e.markers_drained());
+        e.handle(done(new_marker)); require(e.markers_drained());
+        e.handle(receive(message(Kind::ReleaseAck, 2, 0, b, 1)));
+        require(e.retired_.empty() && e.requests_.empty());
+    }
     static void run() {
+        test_handoff_recovery_marker_fence();
         test_handoff_recovery_client();
         test_empty_sections();
         test_mu_recovery_client();

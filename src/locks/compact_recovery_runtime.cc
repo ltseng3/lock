@@ -51,8 +51,7 @@ RecoveredPrefix recover_compact_prefix(
     // The trigger is a controller notification, not a failure detector.
     while (!promote_requested) {
         frontier = view.scan(frontier, 256);
-        if (recovery.replay)
-            {
+        if (recovery.replay) {
             const auto target = safe_replay_prefix(frontier, window);
             replay_to(target);
             applied = target;

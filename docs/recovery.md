@@ -135,3 +135,22 @@ profiling is enabled. To measure instrumentation overhead separately,
 use a suite without crash_after_ms with recovery enabled; compare against
 a matched no-recovery run. A successful empty-section run is not proof
 of safety for protected WRITEs or client crash recovery.
+
+### Bounded recovery work and memory lifetime
+
+With background replay keeping up, recovery processes the remaining
+pipeline suffix plus the difference in replica lengths and the live
+client snapshots. The Handoff index uses a dense per-client sequence
+array and a per-lock count; reconstruction sorts only the live requests.
+Historical indexes are retained until process teardown on both recovery
+backends so large memory deallocation does not inflate takeover latency.
+This intentionally trades memory for a predictable recovery path under
+the single-replacement scope. Index memory and replay lag should be
+measured before designing a longer-running reclamation policy.
+
+The deterministic tests also generate multiple acquisition histories and
+valid per-lock completion frontiers, compare the reconstructed order and
+slots against an independent model, and exercise normal retirement after
+reconstruction. Client regression tests cover old marker CQEs after
+fencing, including a new marker credit that must not be consumed by the
+old completion. These tests do not simulate NIC DMA ordering.

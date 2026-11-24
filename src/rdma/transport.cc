@@ -30,7 +30,7 @@ struct Bootstrap {
 static_assert(sizeof(Bootstrap) == 48);
 struct LaneBootstrap { uint32_t qpn, psn; };
 static_assert(sizeof(LaneBootstrap) == 8);
-enum class Tag : uint64_t { Receive = 1, Send = 2, Write = 3, Cas = 4 };
+enum class Tag : uint64_t { Receive = 1, Send = 2, Write = 3, Cas = 4, Read = 5 };
 uint64_t encode(Tag tag, NodeId peer, uint64_t token) {
     if (peer > 255 || token > kTokenMask)
         throw std::runtime_error("RDMA work ID exceeds encoding range");
@@ -522,6 +522,27 @@ bool Transport::write_inline(NodeId peer, uint64_t value, size_t offset,
     unsignaled = signaled ? 0 : unsignaled + 1;
     return signaled;
 }
+void Transport::read_word(NodeId peer, uint64_t* result, size_t offset,
+                          WorkId id) {
+    auto& x = *impl_;
+    x.verify_remote(peer, offset, sizeof(uint64_t));
+    if ((offset % 8) || !x.is_local(result, sizeof(uint64_t)) ||
+        (reinterpret_cast<uintptr_t>(result) % 8))
+        throw std::invalid_argument("READ result and remote offset must be aligned");
+    auto& c = x.conn(peer);
+    ibv_sge sge{};
+    sge.addr = reinterpret_cast<uintptr_t>(result);
+    sge.length = sizeof(uint64_t); sge.lkey = x.mr->lkey;
+    ibv_send_wr wr{}, *bad = nullptr;
+    wr.wr_id = encode(Tag::Read, peer, id);
+    wr.sg_list = &sge; wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_READ;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr.rdma.remote_addr = c.remote.base + offset;
+    wr.wr.rdma.rkey = c.remote.rkey;
+    check(!ibv_post_send(c.qp, &wr, &bad), "post READ");
+    c.unsignaled_posted = 0;
+}
 void Transport::compare_swap(NodeId peer, uint64_t* result, size_t offset,
                              uint64_t expected, uint64_t desired, WorkId id) {
     auto& x = *impl_;
@@ -608,6 +629,11 @@ void Transport::poll_on_cq(std::vector<Completion>& result, int batch,
         case Tag::Send: c.kind = CompletionKind::Send; break;
         case Tag::Write: c.kind = CompletionKind::Write; break;
         case Tag::Cas: c.kind = CompletionKind::CompareSwap; break;
+        case Tag::Read:
+            if (w.opcode != IBV_WC_RDMA_READ)
+                throw std::runtime_error("unexpected READ completion opcode");
+            c.kind = CompletionKind::Read;
+            break;
         default: throw std::runtime_error("unexpected CQ work ID tag");
         }
         result.push_back(c);

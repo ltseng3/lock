@@ -2,6 +2,8 @@
 #include "lock/bench/workload.h"
 #include "lock/locks/backend.h"
 #include "lock/rdma/transport.h"
+#include "lock/locks/peer_completion.h"
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -22,6 +24,7 @@ struct ClientConfig {
     uint64_t duration_seconds = 15;
     uint64_t watchdog_seconds = 90;
     bool cas_release_guarded = false;
+    bool handoff_peer_read = false;
 };
 class ClientEngine {
 public:
@@ -30,7 +33,7 @@ public:
 private:
     using Clock = std::chrono::steady_clock;
     enum class Phase { Idle, WaitGrant, WaitOrder, WaitCas, Writing, WaitRelease, WaitCasRelease };
-    enum class Purpose { AcquireCas, DataWrite, ReleaseCas, ReleaseWrite };
+    enum class Purpose { AcquireCas, DataWrite, ReleaseCas, ReleaseWrite, PredecessorRead };
     struct Operation {
         Phase phase = Phase::Idle;
         RequestId request = 0;
@@ -46,6 +49,10 @@ private:
         uint64_t* cas_result = nullptr;
         uint64_t* data_value = nullptr;
         uint64_t* release_zero = nullptr;
+        uint64_t* read_result = nullptr;
+        // An operation may finish by HANDOFF while a READ is still in flight.
+        // Do not recycle this operation or its result buffer until its CQE.
+        bool read_pending = false;
         Clock::time_point begun{};
         Clock::time_point acquired{};
     };
@@ -60,7 +67,6 @@ private:
         RequestId successor = 0;
         uint64_t successor_position = 0;
         bool sent = false;
-        bool acknowledged = false;
     };
     struct Marker {
         uint64_t* payload = nullptr;
@@ -85,6 +91,12 @@ private:
     uint64_t handoffs_sent_ = 0;
     uint64_t handoffs_received_ = 0;
     uint64_t late_next_ = 0;
+    PeerReadReceipts read_receipts_;
+    std::array<size_t, 256> peer_reads_{};
+    size_t reads_inflight_ = 0;
+    uint64_t activation_by_read_ = 0, activation_by_handoff_ = 0;
+    uint64_t read_attempts_ = 0, read_misses_ = 0, read_skipped_ = 0;
+    uint64_t redundant_handoffs_ = 0;
     bool stop_sent_ = false;
     bool server_stopped_ = false;
     uint64_t next_sequence_ = 1;
@@ -99,6 +111,9 @@ private:
     void release(size_t slot);
     void complete(size_t slot);
     void handle_order(const rdma::Completion& event);
+    void try_predecessor_read(size_t slot);
+    void observe_predecessor(size_t slot, uint64_t value);
+    void activate(size_t slot);
     void handle_activation(const rdma::Completion& event);
     void handle_next(const rdma::Completion& event);
     void deliver_handoff(RequestId predecessor, const Retired& record);

@@ -5,7 +5,7 @@
 #include "lock/rdma/transport.h"
 #include <algorithm>
 #include <array>
-#include <deque>
+#include "lock/rdma/completion_prefix.h"
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -22,24 +22,23 @@ public:
     LeaderResponseBatch(rdma::Transport& net, NodeId self,
                         const std::vector<NodeId>& clients, size_t lane,
                         size_t lane_count, size_t batch_size)
-        : net_(net), self_(self), clients_(clients), lane_(lane),
-          lane_count_(lane_count), batch_size_(batch_size) {
+        : net_(net), self_(self), lane_(lane), lane_count_(lane_count),
+          batch_size_(batch_size), peers_(clients.size()) {
         if (!batch_size || batch_size > drain_limit)
             throw std::invalid_argument("invalid leader communication batch");
-        for (auto peer : clients_) {
-            if (!peer || peer >= peers_.size() || peers_[peer].valid)
+        index_.fill(-1);
+        for (size_t i = 0; i < clients.size(); ++i) {
+            const auto peer = clients[i];
+            if (!peer || peer >= index_.size() || index_[peer] != -1)
                 throw std::invalid_argument("invalid leader client list");
-            peers_[peer].valid = true;
-            peers_[peer].messages.reserve(drain_limit);
+            index_[peer] = static_cast<int>(i);
+            peers_[i].peer = peer;
+            peers_[i].messages.reserve(drain_limit);
         }
     }
     void completed(NodeId peer, WorkId end) {
         if (!end) return; // Individual barrier SENDs use token zero.
-        auto& p = client(peer);
-        if (p.ends.empty() || p.ends.front() != end || end <= p.completed)
-            throw std::runtime_error("invalid leader SEND completion prefix");
-        p.ends.pop_front();
-        p.completed = end;
+        client(peer).progress.complete(end);
     }
     template <size_t Capacity>
     size_t drain(SpscQueue<Action, Capacity>& queue) {
@@ -57,17 +56,16 @@ public:
         }
         if (!staged_) return 0;
         size_t sent = 0;
-        for (NodeId peer : clients_) {
-            auto& p = peers_[peer];
+        for (auto& p : peers_) {
             while (p.cursor < p.messages.size()) {
-                const size_t room = sq_credit - (p.posted - p.completed);
+                const size_t room = sq_credit -
+                    (p.progress.posted() - p.progress.completed());
                 const size_t count = std::min({room, batch_size_,
                                                p.messages.size() - p.cursor});
                 if (!count) break;
-                const WorkId end = p.posted + count;
-                net_.send_batch(peer, {p.messages.data() + p.cursor, count}, end, lane_);
-                p.ends.push_back(end);
-                p.posted = end;
+                const WorkId end = p.progress.posted() + count;
+                net_.send_batch(p.peer, {p.messages.data() + p.cursor, count}, end, lane_);
+                p.progress.post(end);
                 p.cursor += count;
                 sent += count;
                 staged_ -= count;
@@ -81,21 +79,20 @@ public:
     }
 private:
     struct PeerState {
-        bool valid = false;
+        NodeId peer = 0;
         std::vector<Message> messages;
         size_t cursor = 0;
-        WorkId posted = 0, completed = 0;
-        std::deque<WorkId> ends;
+        rdma::CompletionPrefix<sq_credit> progress;
     };
     PeerState& client(NodeId peer) {
-        if (peer >= peers_.size() || !peers_[peer].valid)
+        if (peer >= index_.size() || index_[peer] == -1)
             throw std::runtime_error("response or completion for unknown client");
-        return peers_[peer];
+        return peers_[static_cast<size_t>(index_[peer])];
     }
     rdma::Transport& net_;
     NodeId self_;
-    const std::vector<NodeId>& clients_;
     size_t lane_, lane_count_, batch_size_, staged_ = 0;
-    std::array<PeerState, 256> peers_{};
+    std::array<int, 256> index_;
+    std::vector<PeerState> peers_;
 };
 } // namespace lock

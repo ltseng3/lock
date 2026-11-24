@@ -3,7 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
+#include "lock/rdma/completion_prefix.h"
 #include <functional>
 #include <stdexcept>
 #include <vector>
@@ -22,7 +22,7 @@ public:
     }
     bool can_post() const {
         for (const auto& f : followers_)
-            if (f.pending.size() >= max_outstanding_batches) return false;
+            if (f.full()) return false;
         return true;
     }
     // Call after a batch is successfully posted to every follower.
@@ -30,32 +30,24 @@ public:
     void posted(uint64_t end) {
         if (end <= posted_ || !can_post())
             throw std::runtime_error("invalid replication batch end or credit");
-        for (auto& f : followers_) f.pending.push_back(end);
+        for (auto& f : followers_) f.post(end);
         posted_ = end;
     }
     void completed(size_t follower, uint64_t end) {
-        auto& f = followers_.at(follower);
-        if (f.pending.empty() || f.pending.front() != end || end <= f.prefix)
-            throw std::runtime_error("invalid replication batch completion");
-        f.pending.pop_front();
-        f.prefix = end;
+        followers_.at(follower).complete(end);
         std::array<uint64_t, 4> prefixes{};
         for (size_t i = 0; i < followers_.size(); ++i)
-            prefixes[i] = followers_[i].prefix;
+            prefixes[i] = followers_[i].completed();
         // Leader contributes one copy. The quorum-th highest follower
         // prefix is the largest contiguous prefix present on a majority.
-        std::sort(prefixes.begin(), prefixes.begin() + followers_.size(),
+        std::sort(prefixes.begin(), prefixes.end(),
                   std::greater<uint64_t>{});
         committed_ = prefixes[followers_.size() / 2 - 1];
     }
     uint64_t committed() const { return committed_; }
     uint64_t posted() const { return posted_; }
 private:
-    struct Follower {
-        uint64_t prefix = 0;
-        std::deque<uint64_t> pending;
-    };
-    std::vector<Follower> followers_;
+    std::vector<rdma::CompletionPrefix<max_outstanding_batches>> followers_;
     uint64_t posted_ = 0, committed_ = 0;
 };
 } // namespace lock

@@ -133,7 +133,7 @@ replica QPs, a separate CQ, global-slot assignment, and lock-state application.
 They exchange validated requests and committed responses through bounded SPSC
 queues. A full queue fails closed instead of silently dropping a mutation.
 The follower processes are passive after connection setup; their NICs accept
-8-byte inline RDMA WRITEs without follower CPU polling.
+inline RDMA WRITEs containing compact 8-byte entries without follower CPU polling.
 
 Run the existing single-test configuration from node 4 after updating:
 
@@ -141,7 +141,7 @@ Run the existing single-test configuration from node 4 after updating:
 
 The 8-byte encoding supports node IDs 1..255, lock IDs 0..65535, and
 39-bit nonzero request sequences; larger values fail explicitly. The format
-is Mu-specific; the 128-byte handoff record remains unchanged. This path
+is shared by Mu and compact handoff. This path
 requires CloudLab correctness and latency validation before drawing conclusions.
 
 ## Handoff compact-header diagnostic run
@@ -151,7 +151,7 @@ per-slot retirement-marker sidecar. The leader separates client communication
 from quorum replication and lock ordering; followers handle data through
 one-sided NIC operations without CPU polling. Only locks with committed
 outstanding holders are checked for retirement, rather than all configured
-locks on every loop. The Mu backend and its layout are unchanged.
+locks on every loop. Handoff reserves a sidecar; Mu does not.
 
 For a single run matching a 4-worker/16-outstanding Mu benchmark, create the
 same single-case suite with `backends: ["handoff"]` and run it with:
@@ -181,9 +181,10 @@ log for that lock are always on a single thread. Different locks can commit
 concurrently, with a separate RC QP and completion queue per replica peer
 and lane. All replica nodes must run the same lane count; the runner forwards
 the setting to every node. There is no global ordering guarantee between
-different lanes or unrelated locks. Log slots are interleaved:
-`global_slot = local_slot * N + lane`, preserving the deterministic sidecar
-marker address and avoiding overlapping writes.
+different lanes or unrelated locks. Log slots occupy contiguous disjoint
+lane ranges; `global_slot = lane * lane_capacity + local_slot`, where
+`lane_capacity = floor(total_capacity / N / 8) * 8`. The marker address
+remains a deterministic function of the global physical slot.
 
 For one handoff run with four lanes, use a single-case handoff suite:
 
@@ -192,8 +193,9 @@ For one handoff run with four lanes, use a single-case handoff suite:
 To measure the default single lane, omit `--mu-lanes`. Lane-count changes
 require a full deploy/rebuild and fresh process startup on every node.
 Multiple replication lanes increase CPU and NIC resource consumption and are
-not expected to help a workload focused on only one hot lock. The communication
-thread remains a shared per-node bottleneck. Hardware correctness and
+not expected to help a workload focused on only one hot lock. Each leader
+lane has its own communication worker; clients still share their local
+event loop and NIC. Hardware correctness and
 performance on target adapters remain unverified until tested.
 
 The handoff replication worker now checks completed client release markers

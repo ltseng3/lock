@@ -28,14 +28,13 @@ log order, so it need not appear inside the word. In this failure-free prototype
 there is no replay/leader takeover; log contents alone are not evidence of a
 crash-recoverable service.
 
-The Mu leader has one communication thread and one replication/state-application
+Each Mu lane has one communication thread and one replication/state-application
 thread. Each owns distinct RC QPs and a distinct CQ; two bounded SPSC queues
-carry validated mutations and committed responses. Mu replication WRITEs are
-8-byte inline one-sided RDMA WRITEs to every follower; follower processes sleep
-after initialization and do not poll CQs or run application logic in the measured
-path. A local record plus enough signaled follower WRITE completions establishes
-a quorum; the commit prefix is applied in global slot order. Full source
-messages remain only in the leader's bounded in-flight ring.
+carry validated mutations and committed responses. Mu replicates contiguous
+batches of 8-byte records via inline one-sided RDMA WRITEs to every follower;
+followers sleep after initialization. Quorum progress uses completed follower
+prefixes, applied in increasing lane-local order. Full source messages remain
+only in the leader's bounded in-flight ring.
 
 This change has unit tests for the encoding and concurrent queue. It has NOT
 been hardware-tested or validated for performance on CloudLab. Successful
@@ -83,8 +82,9 @@ early-HANDOFF and late-NEXT handling.
 With `--mu-lanes=N`, each lock is assigned to exactly one lane by
 `lock_id % N`. The lane has an independent worker, quorum completion queue,
 and follower QPs; committed order is strict within a lane. Global log slots
-use `local_slot*N+lane` to preserve disjoint 8-byte header/marker sidecar
-addresses. There is no cross-lane global mutation order (distinct locks do
+use contiguous lane ranges of cache-line-aligned length:
+`global_slot = lane * lane_capacity + local_slot`. The same global slot
+identifies both the header and its marker sidecar entry. There is no cross-lane global mutation order (distinct locks do
 not depend on such an order in the common-path prototype). All replicas
 must bootstrap the same number of lane QPs before clients start. Followers
 remain CPU-passive for one-sided writes.
@@ -211,3 +211,7 @@ payloads and offsets, ring reuse with a late non-quorum CQE, three/five-node
 majority progress, malformed completions, slow-follower credits, and
 NEXT-before-ACK ordering across interleaved destination batches. These tests
 do not substitute for real verbs and multi-lane hardware testing.
+
+Both replication and response posting use the same fixed-capacity per-QP
+completion-prefix tracker. This avoids heap allocations for completion
+bookkeeping and makes exact CQE validation independent of the protocol.

@@ -189,14 +189,12 @@ void ClientEngine::publish_retirement(size_t slot) {
     }
     const size_t i = free_markers_.back();
     free_markers_.pop_back();
-    Retired record{op.lock, op.position, op.successor, op.successor_position, false};
+    Retired record{op.lock, op.position, op.successor, op.successor_position};
     auto [it, added] = retired_.emplace(op.request, record);
     if (!added) throw std::runtime_error("duplicate retirement");
     // Protected data work was completed before entering this function.
-    if (it->second.successor) {
+    if (it->second.successor)
         deliver_handoff(op.request, it->second);
-        it->second.sent = true;
-    }
     if (markers_[i].occupied)
         throw std::runtime_error("reused occupied release marker buffer");
     markers_[i].occupied = true;
@@ -281,6 +279,7 @@ void ClientEngine::try_predecessor_read(size_t slot) {
     }
     const size_t offset = peer_completion_offset(op.predecessor);
     if (peer == cfg_.self) {
+        ++local_probes_;
         auto* word = static_cast<uint64_t*>(net_.at(offset, sizeof(uint64_t)));
         observe_predecessor(slot, std::atomic_ref<uint64_t>(*word).load(
             std::memory_order_acquire));
@@ -306,7 +305,8 @@ void ClientEngine::observe_predecessor(size_t slot, uint64_t value) {
 void ClientEngine::handle_activation(const rdma::Completion& c) {
     const Message& m = c.message;
     // Match against the exact committed proof even after B's slot is reused.
-    if (message_kind(m) == Kind::Handoff && read_receipts_.consume(c.peer, m)) {
+    if (cfg_.handoff_peer_read && message_kind(m) == Kind::Handoff &&
+        read_receipts_.consume(c.peer, m)) {
         ++handoffs_received_;
         ++redundant_handoffs_;
         return;
@@ -368,7 +368,6 @@ void ClientEngine::handle_next(const rdma::Completion& c) {
     it->second.successor_position = m.value;
     ++late_next_;
     deliver_handoff(m.request, it->second);
-    it->second.sent = true;
 }
 
 void ClientEngine::handle(const rdma::Completion& c) {
@@ -566,6 +565,7 @@ void ClientEngine::print_result() const {
               << ",\"activation_by_read\":" << activation_by_read_
               << ",\"activation_by_handoff\":" << activation_by_handoff_
               << ",\"read_attempts\":" << read_attempts_
+              << ",\"local_probes\":" << local_probes_
               << ",\"read_misses\":" << read_misses_
               << ",\"read_skipped\":" << read_skipped_
               << ",\"redundant_handoffs\":" << redundant_handoffs_

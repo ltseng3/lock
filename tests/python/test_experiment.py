@@ -68,6 +68,18 @@ class TestExperiment(unittest.TestCase):
         self.assertIn("--handoff-inflight-window=256", leader)
         self.assertNotIn("--handoff-inflight-window=256", client)
 
+    def test_peer_read_only_on_handoff_clients(self):
+        tuned = dict(self.suite, handoff_peer_read=True)
+        for backend in ("cas", "mu", "handoff"):
+            case = dict(next(cases(self.suite)), backend=backend)
+            for node in self.topo.nodes:
+                args = process_command(self.topo, node, tuned, case)
+                self.assertEqual("--handoff-peer-read=1" in args,
+                                 backend == "handoff" and node.role == "client")
+        case = dict(next(cases(self.suite)), backend="handoff")
+        self.assertIn("--handoff-peer-read=0", process_command(
+            self.topo, self.topo.by_id(4), self.suite, case))
+
     def test_mu_lanes_stay_consistent_on_clients_and_replicas(self):
         # The transport bootstrap requires both ends of each client-leader
         # link to select the same number of QPs.

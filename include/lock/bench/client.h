@@ -31,6 +31,8 @@ public:
     ClientEngine(rdma::Transport& net, ClientConfig cfg);
     void run();
 private:
+    // Hardware-free event-order regression tests drive the real client state machine.
+    friend struct ClientEngineTestAccess;
     using Clock = std::chrono::steady_clock;
     enum class Phase { Idle, WaitGrant, WaitOrder, WaitCas, Writing, WaitRelease, WaitCasRelease };
     enum class Purpose { AcquireCas, DataWrite, ReleaseCas, ReleaseWrite, PredecessorRead };
@@ -66,7 +68,6 @@ private:
         uint64_t position = 0;
         RequestId successor = 0;
         uint64_t successor_position = 0;
-        bool sent = false;
     };
     struct Marker {
         uint64_t* payload = nullptr;
@@ -95,7 +96,8 @@ private:
     std::array<size_t, 256> peer_reads_{};
     size_t reads_inflight_ = 0;
     uint64_t activation_by_read_ = 0, activation_by_handoff_ = 0;
-    uint64_t read_attempts_ = 0, read_misses_ = 0, read_skipped_ = 0;
+    uint64_t read_attempts_ = 0, local_probes_ = 0;
+    uint64_t read_misses_ = 0, read_skipped_ = 0;
     uint64_t redundant_handoffs_ = 0;
     bool stop_sent_ = false;
     bool server_stopped_ = false;

@@ -40,13 +40,18 @@ class TestMetrics(unittest.TestCase):
     def test_handoff_counters(self):
         case = dict(self.case, backend="handoff")
         results = [dict(r) for r in self.results]
-        results[0].update(handoffs_sent=8, handoffs_received=7, late_next=1)
+        results[0].update(handoffs_sent=8, handoffs_received=7, late_next=1,
+                          activation_by_read=3, activation_by_handoff=4,
+                          read_attempts=5, local_probes=1, redundant_handoffs=3)
         results[1].update(handoffs_sent=2, handoffs_received=3, late_next=4)
         summary = summarize(case, results)
         self.assertEqual(summary["handoffs_sent"], 10)
         self.assertEqual(summary["handoffs_received"], 10)
         self.assertEqual(summary["late_next"], 5)
         self.assertIn("late-next=5", format_summary(summary))
+        self.assertEqual(summary["activation_by_read"], 3)
+        self.assertIn("by-read=3 by-handoff=4", format_summary(summary))
+        self.assertIn("reads=5 local-probes=1", format_summary(summary))
 
     def test_empty_results_rejected(self):
         with self.assertRaisesRegex(ValueError, "no client results"):

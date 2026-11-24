@@ -12,6 +12,8 @@ SUMMARY_FIELDS = (
     "acquire_p50_min_us", "acquire_p50_max_us", "acquire_p99_worst_us",
     "total_p50_min_us", "total_p50_max_us", "total_p99_worst_us",
     "handoffs_sent", "handoffs_received", "late_next",
+    "activation_by_read", "activation_by_handoff",
+    "read_attempts", "local_probes", "read_misses", "read_skipped", "redundant_handoffs",
 )
 
 
@@ -40,6 +42,9 @@ def summarize(case: dict, results: list[dict]) -> dict:
         "handoffs_sent": sum(r.get("handoffs_sent", 0) for r in results),
         "handoffs_received": sum(r.get("handoffs_received", 0) for r in results),
         "late_next": sum(r.get("late_next", 0) for r in results),
+        **{key: sum(r.get(key, 0) for r in results) for key in (
+            "activation_by_read", "activation_by_handoff",
+            "read_attempts", "local_probes", "read_misses", "read_skipped", "redundant_handoffs")},
     }
 
 
@@ -61,6 +66,10 @@ def format_summary(s: dict) -> str:
             f" handoff-sent={s['handoffs_sent']}"
             f" received={s['handoffs_received']}"
             f" late-next={s['late_next']}"
+            f" by-read={s['activation_by_read']} by-handoff={s['activation_by_handoff']}"
+            f" reads={s['read_attempts']} local-probes={s['local_probes']}"
+            f" read-misses={s['read_misses']} read-skipped={s['read_skipped']}"
+            f" redundant-handoffs={s['redundant_handoffs']}"
         )
     return message
 

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <span>
 #include <vector>
 
 namespace lock::rdma {
@@ -43,6 +44,7 @@ struct Config {
     // On the leader each lane has its own CQ; clients can poll a shared CQ.
     // Client-to-client HANDOFF and replica data WRITEs retain lane zero.
     std::vector<NodeId> client_lane_peers;
+    size_t communication_batch = 64; // leader receive repost batch, 1..64
 };
 
 std::vector<Peer> parse_peers(const std::string& spec);
@@ -67,6 +69,13 @@ public:
     bool write_inline(NodeId peer, uint64_t value, size_t remote_offset,
                       WorkId work_id, bool signal = true,
                       size_t lane = 0);
+    // A contiguous inline WRITE, always signaled. Up to 16 compact words.
+    void write_inline_words(NodeId peer, std::span<const uint64_t> words,
+                            size_t remote_offset, WorkId end, size_t lane);
+    // Linked SEND WRs for one client QP, with only the tail signaled.
+    // The caller owns SQ credits; end identifies the completed prefix.
+    void send_batch(NodeId peer, std::span<const Message> messages,
+                    WorkId end, size_t lane);
     // A signaled, eight-byte peer READ into registered, aligned storage.
     void read_word(NodeId peer, uint64_t* result, size_t remote_offset,
                    WorkId work_id);

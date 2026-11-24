@@ -64,6 +64,8 @@ def process_command(topo: Topology, node, suite: dict, case: dict,
         return ["./build/lock_rdma_smoke", *common]
     if node.role == "client":
         common.append(arg("critical-section-ops", case["critical_section_ops"]))
+        if "latency_sample_capacity" in suite:
+            common.append(arg("latency-sample-capacity", suite["latency_sample_capacity"]))
     if node.role == "replica" and suite.get("profile_leader", False):
         common.append(arg("profile-leader", 1))
     if node.role == "replica" and case["backend"] in ("mu", "handoff"):
@@ -247,6 +249,10 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
                     raise ValueError(f"invalid measurement duration from node {node_id}")
                 if record.get("completed", 0) <= 0:
                     raise ValueError(f"no completed pairs from node {node_id}")
+                if (record.get("latency_samples") != record["completed"] or
+                        record.get("latency_sample_capacity") != suite["latency_sample_capacity"] or
+                        record["completed"] > record["latency_sample_capacity"]):
+                    raise ValueError(f"invalid latency sample accounting from node {node_id}")
                 results.append(record)
             manifest["client_results"] = results
             if suite.get("mu_recovery", False):
@@ -350,6 +356,8 @@ def main() -> int:
                     help="0: immediate release; 1: one completed 8-byte WRITE (default)")
     ap.add_argument("--warmup-seconds", type=int, help="Override suite warmup")
     ap.add_argument("--duration-seconds", type=int, help="Override suite measurement")
+    ap.add_argument("--latency-sample-capacity", type=int,
+                    help="Exact samples preallocated per client (default 1.5M per measurement second)")
     ap.add_argument("--repetitions", type=int, help="Override suite repetitions")
     ap.add_argument("--show-clients", action="store_true",
                     help="Print per-client throughput and latency details")
@@ -422,6 +430,12 @@ def main() -> int:
             suite[key] = override
     if suite["warmup_seconds"] < 0 or suite["duration_seconds"] < 1 or suite["repetitions"] < 1:
         raise ValueError("warmup must be >=0; duration and repetitions must be >=1")
+    if args.latency_sample_capacity is not None:
+        suite["latency_sample_capacity"] = args.latency_sample_capacity
+    suite.setdefault("latency_sample_capacity", 1500000 * suite["duration_seconds"])
+    capacity = suite["latency_sample_capacity"]
+    if type(capacity) is not int or not 1 <= capacity <= 64000000:
+        raise ValueError("latency_sample_capacity must be an integer in 1..64000000")
     for key, default in (("mu_recovery", False), ("mu_recovery_publication", True),
                          ("mu_recovery_replay", True)):
         override = getattr(args, key)

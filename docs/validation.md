@@ -289,3 +289,15 @@ controller injection timings and client-local completion gaps are separate.
 In crash trials only, preconnected TCP supervisors confirm SIGKILL and
 child exit before either surviving replica receives a promotion signal.
 The ordinary no-crash runner and RDMA data path are unchanged.
+
+## Fixed latency sample budget
+
+Clients allocate and initialize two exact uint64_t latency arrays before
+sending Ready. Each measured completion records one acquisition and one
+total-latency sample by index; the measured path never grows these arrays.
+The default capacity is 1.5 million samples per measurement second per
+client, adjustable via --latency-sample-capacity. A trial fails rather
+than truncate or allocate on overflow. The runner checks completed pairs
+equal the number of stored samples. Exact nearest-rank p50/p99/p99.9
+percentiles are computed by sorting the populated ranges after the Stop
+barrier. This instrumentation is independent of the backend and recovery.

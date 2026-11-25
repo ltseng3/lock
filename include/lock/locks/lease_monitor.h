@@ -67,10 +67,23 @@ inline size_t heartbeat_offset(NodeId client) {
 }
 struct HandoffLeaseConfig {
     uint64_t duration_us = 0, scan_us = 0, heartbeat_us = 0;
+    bool client_recovery = false;
+    uint64_t activation_us = 0, clock_error_ppm = 1'000'000;
+    uint64_t authority_us() const {
+        return client_recovery
+            ? conservative_authority_us(activation_us, duration_us, clock_error_ppm) : 0;
+    }
     void validate() const {
         if (duration_us > 60'000'000 || scan_us > 60'000'000 ||
             heartbeat_us > 60'000'000 || (scan_us && !duration_us))
             throw std::invalid_argument("invalid Handoff lease configuration");
+        if (client_recovery) {
+            if (!scan_us && !heartbeat_us)
+                throw std::invalid_argument("client recovery requires monitoring");
+            (void)authority_us();
+        } else if (activation_us || clock_error_ppm != 1'000'000) {
+            throw std::invalid_argument("activation and clock bound require client recovery");
+        }
     }
 };
 } // namespace lock

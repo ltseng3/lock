@@ -22,6 +22,7 @@ struct Posted {
     uint64_t inline_value = 0;
 };
 std::vector<Posted> posted;
+NodeId fail_send_peer = 0;
 }
 namespace lock::rdma {
 struct Transport::Impl {
@@ -47,6 +48,7 @@ void* Transport::allocate(size_t length, size_t alignment) {
 size_t Transport::memory_bytes() const { return impl_->cfg.memory_bytes; }
 size_t Transport::remote_memory_bytes(NodeId) const { return memory_bytes(); }
 void Transport::send(NodeId peer, const Message& m, WorkId id, bool, size_t) {
+    if (peer == fail_send_peer) throw PeerUnavailable(peer);
     posted.push_back({CompletionKind::Send, peer, id, nullptr, m});
 }
 bool Transport::write(NodeId peer, const void*, size_t, size_t offset, WorkId id, bool signal) {
@@ -143,6 +145,54 @@ struct ClientEngineTestAccess {
         bool rejected = false;
         try { e.finish_empty_sections(); } catch (const std::runtime_error&) { rejected = true; }
         require(rejected && writes() == before);
+    }
+    static void test_client_recovery() {
+        rdma::Config nc; nc.self = 5;
+        rdma::Transport net(nc);
+        ClientConfig cfg; cfg.backend = Backend::Handoff; cfg.self = 5;
+        cfg.replicas = {1,2,3}; cfg.lock_count = 1; cfg.critical_section_ops = 0;
+        cfg.lease = {5000, 100, 0, true, 5000, 100};
+        ClientEngine e(net, cfg);
+        posted.clear();
+        e.submit(0);
+        const auto old = e.ops_[0].request;
+        const auto begun = e.ops_[0].begun;
+        e.ops_[0].activation_begun = ClientEngine::Clock::now() - std::chrono::seconds(1);
+        auto order = message(Kind::Order, 1, 0, old);
+        order.value = 10;
+        e.handle(receive(order));
+        require(!e.ops_[0].started && e.activation_expired_ == 1);
+        require(message_kind(last(rdma::CompletionKind::Send).message) == Kind::HandoffExpired);
+        e.handle(receive(message(Kind::HandoffReconcile, 1, 0, old)));
+        const auto fresh = e.ops_[0].request;
+        require(fresh != old && e.ops_[0].begun == begun && !e.ops_[0].ordered);
+        auto reply = last(rdma::CompletionKind::Send).message;
+        require(message_kind(reply) == Kind::HandoffReconciled && reply.request == old &&
+                reply.other == fresh);
+        e.handle(receive(order));
+        auto delayed = message(Kind::Handoff, 6, 0, old);
+        delayed.other = make_request_id(6, 1);
+        e.handle(receive(delayed));
+        require(!e.ops_[0].started && e.stale_controls_ == 2);
+        order.request = fresh; order.value = 11; order.position = 1;
+        e.ops_[0].activation_begun = ClientEngine::Clock::now();
+        e.handle(receive(order));
+        require(e.ops_[0].started);
+        auto next = message(Kind::Next, 1, 0, fresh);
+        next.other = make_request_id(6, 2); next.position = 1; next.value = 2;
+        e.handle(receive(next));
+        fail_send_peer = 6;
+        e.finish_empty_sections();
+        fail_send_peer = 0;
+        require(e.handoff_post_failures_ == 1 && e.retired_.contains(fresh));
+        auto marker = last(rdma::CompletionKind::Write);
+        require(marker.inline_value == fresh);
+        // Reconcile an executed request whose marker is not yet observed.
+        e.handle(receive(message(Kind::HandoffReconcile, 1, 0, fresh)));
+        reply = last(rdma::CompletionKind::Send).message;
+        require(reply.request == fresh && reply.other == 0 && e.retired_.empty());
+        e.handle(done(marker));
+        require(e.markers_drained() && e.ops_[0].phase == ClientEngine::Phase::Idle);
     }
     static void test_empty_sections() {
         rdma::Config nc; nc.self = 5;
@@ -395,6 +445,7 @@ struct ClientEngineTestAccess {
     }
     static void run() {
         test_lease_monitor();
+        test_client_recovery();
         test_empty_sections();
         test_mu_recovery_client();
         test_retirement_gc();

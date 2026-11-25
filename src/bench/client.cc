@@ -48,6 +48,8 @@ ClientEngine::ClientEngine(rdma::Transport& net, ClientConfig cfg)
     if ((cfg_.lease.duration_us || cfg_.lease.heartbeat_us || cfg_.handoff_trace) &&
         (cfg_.backend != Backend::Handoff || cfg_.critical_section_ops != 0 || cfg_.mu_lanes != 1 || cfg_.mu_recovery))
         throw std::invalid_argument("lease experiments require Handoff, empty CS, one lane, no recovery");
+    if (cfg_.lease.client_recovery && (cfg_.handoff_gc || cfg_.handoff_peer_read))
+        throw std::invalid_argument("client recovery requires GC and peer READ disabled");
     if (cfg_.handoff_gc && cfg_.backend != Backend::Handoff)
         throw std::invalid_argument("retirement GC requires handoff");
     if (cfg_.handoff_peer_read) {
@@ -92,7 +94,9 @@ void ClientEngine::submit(size_t slot) {
     op.request = make_request_id(cfg_.self, next_sequence_++);
     op.lock = pickers_.at(slot / cfg_.outstanding).next();
     op.begun = Clock::now();
+    op.activation_begun = op.begun;
     op.ordered = false; op.started = false;
+    op.expired = false; op.hold_expired = false;
     op.predecessor = 0; op.successor = 0;
     op.position = 0; op.successor_position = 0; op.log_slot = 0;
     requests_.emplace(op.request, slot);
@@ -110,9 +114,9 @@ void ClientEngine::submit(size_t slot) {
                   0, true, lock_lane(op.lock, cfg_.mu_lanes));
     }
 }
-void ClientEngine::begin_critical_section(size_t slot) {
+void ClientEngine::begin_critical_section(size_t slot, Clock::time_point acquired) {
     auto& op = ops_[slot];
-    op.acquired = Clock::now();
+    op.acquired = acquired;
     if (cfg_.critical_section_ops == 0) {
         op.phase = Phase::EmptyCriticalSection;
         empty_sections_.push_back(slot);
@@ -142,14 +146,20 @@ void ClientEngine::release(size_t slot) {
     auto& op = ops_[slot];
     if (op.phase != Phase::Writing && op.phase != Phase::EmptyCriticalSection)
         throw std::runtime_error("release before critical section completion");
-    // acquired is set at actual activation, not reservation or submission.
-    // No timeout-based regrant: fail closed if the empty section overruns.
+    // In the recovery mode the holding deadline uses the same clock sample
+    // as the activation gate. An overrun of an empty CS can retire safely,
+    // but does not send HANDOFF; the leader repairs the chain.
     if (cfg_.lease.duration_us) {
         const auto now = Clock::now();
         ++lease_checked_;
         lease_max_hold_ns_ = std::max(lease_max_hold_ns_, nanos(now - op.acquired));
-        if (lease_elapsed(op.acquired, now, cfg_.lease.duration_us))
-            throw std::runtime_error("acquisition lease expired before retirement: fail closed");
+        if (lease_elapsed(op.acquired, now, cfg_.lease.duration_us)) {
+            if (!cfg_.lease.client_recovery)
+                throw std::runtime_error("acquisition lease expired before retirement: fail closed");
+            op.hold_expired = true;
+            ++hold_expired_;
+            notify_expiry(op);
+        }
     }
     op.phase = Phase::WaitRelease;
     if (cfg_.backend == Backend::Handoff) {
@@ -200,11 +210,10 @@ void ClientEngine::complete(size_t slot) {
 }
 
 void ClientEngine::deliver_handoff(RequestId predecessor, const Retired& record) {
-    if (!record.successor) return;
+    if (!record.successor || !record.allow_handoff) return;
     Message m = message(Kind::Handoff, cfg_.self, record.lock, record.successor);
     m.other = predecessor;
     m.position = record.successor_position;
-    ++handoffs_sent_;
     const NodeId peer = request_node(record.successor);
     if (peer == cfg_.self) {
         rdma::Completion c{};
@@ -213,8 +222,15 @@ void ClientEngine::deliver_handoff(RequestId predecessor, const Retired& record)
         c.message = m;
         handle_activation(c);
     } else {
-        net_.send(peer, m);
+        try {
+            net_.send(peer, m);
+        } catch (const rdma::PeerUnavailable& error) {
+            if (!cfg_.lease.client_recovery || error.peer() != peer) throw;
+            ++handoff_post_failures_;
+            return; // Still publish our own retirement to the healthy leader.
+        }
     }
+    ++handoffs_sent_;
 }
 void ClientEngine::publish_retirement(size_t slot) {
     auto& op = ops_.at(slot);
@@ -228,7 +244,8 @@ void ClientEngine::publish_retirement(size_t slot) {
     }
     if (markers_posted_ + 1 >= kMarkerTokenBase)
         throw std::runtime_error("marker work ID exhausted");
-    Retired record{op.lock, op.position, op.successor, op.successor_position};
+    Retired record{op.lock, op.position, op.successor, op.successor_position,
+                   !op.hold_expired};
     // A unique validated NEXT is sufficient to reclaim after HANDOFF.
     // A predecessor without NEXT still needs an explicit GC notification.
     if (!cfg_.handoff_gc || !record.successor) {
@@ -250,7 +267,10 @@ void ClientEngine::publish_retirement(size_t slot) {
 void ClientEngine::handle_order(const rdma::Completion& c) {
     const Message& m = c.message;
     auto it = requests_.find(m.request);
-    if (it == requests_.end()) throw std::runtime_error("ORDER for unknown request");
+    if (it == requests_.end()) {
+        if (stale_request(m.request)) return;
+        throw std::runtime_error("ORDER for unknown request");
+    }
     auto& op = ops_.at(it->second);
     if (op.phase != Phase::WaitOrder || op.ordered || op.lock != m.lock_id)
         throw std::runtime_error("invalid ORDER");
@@ -294,12 +314,87 @@ void ClientEngine::handle_order(const rdma::Completion& c) {
     if (cfg_.handoff_peer_read && !op.started && op.predecessor)
         try_predecessor_read(it->second);
 }
-void ClientEngine::activate(size_t slot) {
+bool ClientEngine::stale_request(RequestId request) {
+    if (!cfg_.lease.client_recovery || request_node(request) != cfg_.self ||
+        !request_sequence(request) || request_sequence(request) >= next_sequence_)
+        return false;
+    ++stale_controls_;
+    return true;
+}
+void ClientEngine::notify_expiry(Operation& op) {
+    if (op.expired) return;
+    op.expired = true;
+    net_.send(leader_, message(Kind::HandoffExpired, cfg_.self, op.lock, op.request));
+}
+bool ClientEngine::activate(size_t slot) {
     auto& op = ops_.at(slot);
     if (!op.ordered || op.started || op.phase != Phase::WaitOrder)
         throw std::runtime_error("invalid activation state");
+    const auto now = Clock::now();
+    if (cfg_.lease.client_recovery &&
+        (op.expired || lease_elapsed(op.activation_begun, now, cfg_.lease.activation_us))) {
+        if (!op.expired) {
+            ++activation_expired_;
+            notify_expiry(op);
+        }
+        return false;
+    }
     op.started = true;
-    begin_critical_section(slot);
+    // Never sample a fresh holding start after an activation check: a pause
+    // between the two would otherwise extend authority past its bound.
+    begin_critical_section(slot, now);
+    return true;
+}
+
+void ClientEngine::handle_reconcile(const Message& m) {
+    if (!cfg_.lease.client_recovery || request_node(m.request) != cfg_.self)
+        throw std::runtime_error("invalid handoff reconciliation");
+    auto reply = message(Kind::HandoffReconciled, cfg_.self, m.lock_id, m.request);
+    if (auto it = retired_.find(m.request); it != retired_.end()) {
+        if (it->second.lock != m.lock_id)
+            throw std::runtime_error("reconciliation lock mismatch");
+        retired_.erase(it);
+        ++reconciled_executed_;
+    } else {
+        const auto live = requests_.find(m.request);
+        if (live == requests_.end()) {
+            if (stale_request(m.request)) return;
+            throw std::runtime_error("reconciliation for unknown request");
+        }
+        const auto slot = live->second;
+        auto& op = ops_[slot];
+        if (op.lock != m.lock_id || op.read_pending)
+            throw std::runtime_error("invalid reconciliation operation");
+        if (op.started) {
+            // The event loop drains empty sections before processing another
+            // event. A live executed slot can only be awaiting marker credit.
+            if (op.phase != Phase::WaitRelease ||
+                std::erase(deferred_marker_slots_, slot) != 1)
+                throw std::runtime_error("reconciliation before quiescence");
+            complete(slot);
+            ++reconciled_executed_;
+        } else {
+            if (op.phase != Phase::WaitOrder)
+                throw std::runtime_error("invalid waiting reconciliation");
+            requests_.erase(live);
+            reply.other = make_request_id(cfg_.self, next_sequence_++);
+            op.request = reply.other;
+            op.ordered = false; op.started = false;
+            op.expired = false; op.hold_expired = false;
+            op.predecessor = 0; op.successor = 0;
+            op.position = 0; op.successor_position = 0; op.log_slot = 0;
+            // Retain the logical operation's begun timestamp and lock. Only
+            // the wire attempt gets a fresh identity and activation window.
+            op.activation_begun = Clock::now();
+            if (!requests_.emplace(op.request, slot).second)
+                throw std::runtime_error("duplicate recovery attempt");
+            ++recovered_waiters_;
+        }
+    }
+    early_start_.erase(m.request);
+    early_handoff_.erase(m.request);
+    early_next_.erase(m.request);
+    net_.send(leader_, reply);
 }
 void ClientEngine::try_predecessor_read(size_t slot) {
     auto& op = ops_.at(slot);
@@ -352,7 +447,10 @@ void ClientEngine::handle_activation(const rdma::Completion& c) {
         return;
     }
     auto it = requests_.find(m.request);
-    if (it == requests_.end()) throw std::runtime_error("activation for unknown request");
+    if (it == requests_.end()) {
+        if (stale_request(m.request)) return;
+        throw std::runtime_error("activation for unknown request");
+    }
     auto& op = ops_.at(it->second);
     if (op.lock != m.lock_id)
         throw std::runtime_error("activation lock mismatch");
@@ -365,8 +463,8 @@ void ClientEngine::handle_activation(const rdma::Completion& c) {
             throw std::runtime_error("duplicate early activation");
         return;
     }
-    if (op.phase != Phase::WaitOrder || op.started || m.position != op.position)
-        throw std::runtime_error("duplicate or mismatched activation");
+    if (m.position != op.position)
+        throw std::runtime_error("mismatched activation");
     if (kind == Kind::Start) {
         if (c.peer != cfg_.replicas.front() || op.predecessor != 0)
             throw std::runtime_error("unauthorized START");
@@ -375,9 +473,15 @@ void ClientEngine::handle_activation(const rdma::Completion& c) {
             c.peer != request_node(op.predecessor))
             throw std::runtime_error("unauthorized HANDOFF");
         ++handoffs_received_;
-        ++activation_by_handoff_;
     }
-    activate(it->second);
+    if (op.started && cfg_.lease.client_recovery) {
+        ++stale_controls_;
+        return;
+    }
+    if (op.phase != Phase::WaitOrder || op.started)
+        throw std::runtime_error("duplicate or mismatched activation");
+    if (activate(it->second) && kind == Kind::Handoff)
+        ++activation_by_handoff_;
 }
 void ClientEngine::handle_next(const rdma::Completion& c) {
     const Message& m = c.message;
@@ -399,8 +503,10 @@ void ClientEngine::handle_next(const rdma::Completion& c) {
         return;
     }
     auto it = retired_.find(m.request);
-    if (it == retired_.end())
+    if (it == retired_.end()) {
+        if (stale_request(m.request)) return;
         throw std::runtime_error("NEXT after acknowledged retirement");
+    }
     if (it->second.lock != m.lock_id ||
         it->second.position != m.position || it->second.successor)
         throw std::runtime_error("invalid late NEXT");
@@ -433,6 +539,13 @@ void ClientEngine::begin_mu_recovery() {
     net_.send(leader_, message(Kind::RecoveryDone, cfg_.self));
 }
 void ClientEngine::handle(const rdma::Completion& c) {
+    if (cfg_.lease.client_recovery && c.kind == rdma::CompletionKind::PeerFailed) {
+        if (!c.peer || c.peer == cfg_.self ||
+            std::find(cfg_.replicas.begin(), cfg_.replicas.end(), c.peer) != cfg_.replicas.end())
+            throw std::runtime_error("unexpected client peer failure");
+        ++client_peer_failures_;
+        return;
+    }
     if (cfg_.mu_recovery) {
         if (c.kind == rdma::CompletionKind::PeerFailed) {
             if (c.peer != cfg_.replicas.front()) throw std::runtime_error("unexpected peer failure");
@@ -494,6 +607,7 @@ void ClientEngine::handle(const rdma::Completion& c) {
             }
             if (c.peer != cfg_.replicas.front())
                 throw std::runtime_error("handoff control from non-leader");
+            if (kind == Kind::HandoffReconcile) { handle_reconcile(c.message); return; }
             if (kind == Kind::Order) { handle_order(c); return; }
             if (kind == Kind::Start) { handle_activation(c); return; }
             if (kind == Kind::Next) { handle_next(c); return; }
@@ -513,6 +627,8 @@ void ClientEngine::handle(const rdma::Completion& c) {
             }
             if (kind == Kind::ReleaseAck && !cfg_.handoff_gc) {
                 auto it = retired_.find(c.message.request);
+                if (it == retired_.end() && !requests_.contains(c.message.request) &&
+                    stale_request(c.message.request)) return;
                 if (it == retired_.end() || it->second.lock != c.message.lock_id ||
                     it->second.position != c.message.position)
                     throw std::runtime_error("invalid retirement ACK");
@@ -718,6 +834,16 @@ void ClientEngine::print_result() {
               << ",\"handoff_lease_us\":" << cfg_.lease.duration_us
               << ",\"handoff_lease_scan_us\":" << cfg_.lease.scan_us
               << ",\"handoff_heartbeat_us\":" << cfg_.lease.heartbeat_us
+              << ",\"handoff_client_recovery\":" << cfg_.lease.client_recovery
+              << ",\"handoff_activation_us\":" << cfg_.lease.activation_us
+              << ",\"handoff_clock_error_ppm\":" << cfg_.lease.clock_error_ppm
+              << ",\"activation_expired\":" << activation_expired_
+              << ",\"hold_expired\":" << hold_expired_
+              << ",\"stale_controls\":" << stale_controls_
+              << ",\"recovered_waiters\":" << recovered_waiters_
+              << ",\"reconciled_executed\":" << reconciled_executed_
+              << ",\"handoff_post_failures\":" << handoff_post_failures_
+              << ",\"client_peer_failures\":" << client_peer_failures_
               << ",\"lease_checked\":" << lease_checked_
               << ",\"lease_max_hold_ns\":" << lease_max_hold_ns_
               << ",\"heartbeat_writes\":" << heartbeat_writes_

@@ -51,6 +51,7 @@ private:
         uint64_t generation = 0;
         bool ordered = false;
         bool started = false;
+        bool expired = false, hold_expired = false;
         RequestId predecessor = 0;
         RequestId successor = 0;
         uint64_t position = 0;
@@ -64,6 +65,7 @@ private:
         // Do not recycle this operation or its result buffer until its CQE.
         bool read_pending = false;
         Clock::time_point begun{};
+        Clock::time_point activation_begun{};
         Clock::time_point acquired{};
     };
     struct Awaited {
@@ -76,6 +78,7 @@ private:
         uint64_t position = 0;
         RequestId successor = 0;
         uint64_t successor_position = 0;
+        bool allow_handoff = true;
     };
     // Transport work IDs have 48 payload bits. Reserve bit 47 for the
     // FIFO of signaled inline retirement WRITEs on the leader's base QP.
@@ -112,6 +115,9 @@ private:
     uint64_t heartbeat_writes_ = 0, heartbeat_cqes_ = 0, heartbeat_skips_ = 0;
     bool heartbeat_pending_ = false;
     uint64_t lease_checked_ = 0, lease_max_hold_ns_ = 0;
+    uint64_t activation_expired_ = 0, hold_expired_ = 0, stale_controls_ = 0;
+    uint64_t recovered_waiters_ = 0, reconciled_executed_ = 0, handoff_post_failures_ = 0;
+    uint64_t client_peer_failures_ = 0;
     void heartbeat(Clock::time_point now, Clock::time_point& next);
     uint64_t handoffs_sent_ = 0;
     uint64_t handoffs_received_ = 0;
@@ -136,14 +142,17 @@ private:
     WorkId track(size_t slot, Purpose purpose);
     void submit(size_t slot);
     void post_cas(size_t slot);
-    void begin_critical_section(size_t slot);
+    void begin_critical_section(size_t slot, Clock::time_point acquired = Clock::now());
     void finish_empty_sections();
     void release(size_t slot);
     void complete(size_t slot);
     void handle_order(const rdma::Completion& event);
     void try_predecessor_read(size_t slot);
     void observe_predecessor(size_t slot, uint64_t value);
-    void activate(size_t slot);
+    bool activate(size_t slot);
+    bool stale_request(RequestId request);
+    void notify_expiry(Operation& op);
+    void handle_reconcile(const Message& m);
     void handle_activation(const rdma::Completion& event);
     void handle_next(const rdma::Completion& event);
     void deliver_handoff(RequestId predecessor, const Retired& record);

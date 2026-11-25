@@ -104,6 +104,16 @@ void replication_loop(Shared& s, rdma::Transport& net,
         // and check only the relevant lock before assigning a successor.
         constexpr auto kRetirementScanPeriod = std::chrono::microseconds(32);
         auto next_retirement_scan = Clock::now() + kRetirementScanPeriod;
+        // Diagnostic mode uses the existing profile switch. Buffer samples
+        // and emit one batch per 100 ms, preserving most data on leader exit.
+        struct Sample {
+            uint64_t ns, id, inflight, pending, responses;
+            HandoffState::Snapshot state;
+        };
+        std::vector<Sample> samples;
+        if (profile) samples.reserve(400);
+        const auto diagnostic_start = Clock::now();
+        auto next_sample = diagnostic_start;
         std::array<Message, MuCompactLog::max_batch> batch;
         while (!s.stopped.load(std::memory_order_acquire)) {
             net.poll_replication_into(cqes, 64, lane);
@@ -163,6 +173,32 @@ void replication_loop(Shared& s, rdma::Transport& net,
                 ++replication_batches;
             }
             max_inflight = std::max(max_inflight, log.inflight());
+
+            if (profile && now >= next_sample) {
+                next_sample = now + std::chrono::milliseconds(1);
+                const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    now - diagnostic_start).count();
+                for (size_t id = 0; id < std::min<size_t>(4, lock_count); ++id) {
+                    if (lock_lane(id, lane_count) != lane) continue;
+                    samples.push_back({static_cast<uint64_t>(ns), id, log.inflight(),
+                        append_pending.size() + s.requests.size(), s.responses.size(),
+                        state.snapshot(id, read_marker)});
+                }
+                if (samples.size() >= 100 * std::min<size_t>(4, lock_count)) {
+                    std::lock_guard<std::mutex> output_lock(profile_output_mutex);
+                    for (const auto& v : samples) {
+                        const auto& q = v.state;
+                        std::cout << "HANDOFF_DIAG " << v.ns << ' ' << v.id << ' '
+                                  << q.waiting << ' ' << q.prepared << ' '
+                                  << q.uncommitted << ' ' << q.next_position << ' '
+                                  << q.head_request << ' ' << q.head_marker << ' '
+                                  << q.later_markers << ' ' << v.inflight << ' '
+                                  << v.pending << ' ' << v.responses << '\n';
+                    }
+                    std::cout.flush();
+                    samples.clear();
+                }
+            }
 
             if (profile && ((++loops & 4095ULL) == 0)) {
                 const auto now = Clock::now();

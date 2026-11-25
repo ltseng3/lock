@@ -20,7 +20,9 @@ enum class Kind : uint32_t {
     Order = 5, Start = 6, Next = 7, Handoff = 8,
     Ready = 9, Stop = 10, Error = 11, RetirementGc = 12,
     RecoverySeal = 13, RecoveryBegin = 14, RecoveryAcquire = 15,
-    RecoveryRelease = 16, RecoveryDone = 17, RecoveryReady = 18
+    RecoveryRelease = 16, RecoveryDone = 17, RecoveryReady = 18,
+    HandoffExpired = 19, HandoffReconcile = 20, HandoffReconciled = 21,
+    HandoffClientFailed = 22 // internal leader event, never accepted from the wire
 };
 struct Message {
     uint64_t request = 0;
@@ -48,7 +50,7 @@ inline Message message(Kind kind, NodeId sender, LockId lock_id = 0, RequestId r
 inline Kind message_kind(const Message& m) {
     if (m.version != kWireVersion ||
         m.kind < static_cast<uint32_t>(Kind::Acquire) ||
-        m.kind > static_cast<uint32_t>(Kind::RecoveryReady))
+        m.kind > static_cast<uint32_t>(Kind::HandoffClientFailed))
         throw std::runtime_error("invalid wire message");
     return static_cast<Kind>(m.kind);
 }

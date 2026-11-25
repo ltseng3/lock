@@ -12,6 +12,24 @@ inline bool lease_elapsed(LeaseClock::time_point acquired,
     return duration_us && now - acquired >= std::chrono::microseconds(duration_us);
 }
 
+// Bound a client-local activation window plus holding lease in leader-local
+// microseconds. Both clocks must advance at rates in [1-rho, 1+rho], where
+// rho is max_clock_error_ppm / 1e6. Submission (or recovery-ready) must
+// causally precede the leader's timestamp. Round upward; network delay does
+// not enter the bound. This helper does not establish the clock assumption.
+inline uint64_t conservative_authority_us(uint64_t activation_us, uint64_t hold_us,
+                                          uint64_t max_clock_error_ppm) {
+    constexpr uint64_t scale = 1'000'000;
+    constexpr uint64_t max_duration_us = 60'000'000;
+    if (!activation_us || !hold_us || activation_us > max_duration_us ||
+        hold_us > max_duration_us || max_clock_error_ppm >= scale)
+        throw std::invalid_argument("invalid authority bound");
+    // Inputs are bounded above; the multiplication fits in uint64_t.
+    const uint64_t denominator = scale - max_clock_error_ppm;
+    const uint64_t numerator = (activation_us + hold_us) * (scale + max_clock_error_ppm);
+    return numerator / denominator + (numerator % denominator != 0);
+}
+
 // Observation age is NOT the holder's lease age. No timeout grants authority.
 struct ProgressWatch {
     uint64_t token = 0;

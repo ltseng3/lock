@@ -99,6 +99,20 @@ struct ClientEngineTestAccess {
         if (!ok) throw std::runtime_error("empty critical section regression failed");
     }
     static void test_lease_monitor() {
+        require(conservative_authority_us(5000, 5000, 0) == 10000);
+        require(conservative_authority_us(5000, 5000, 100) == 10003);
+        require(conservative_authority_us(1, 1, 1) == 3);
+        require(heartbeat_offset(255) + sizeof(uint64_t) <= rdma::kReceiveOffset);
+        for (const auto ppm : {1'000'000ULL, 1'000'001ULL}) {
+            bool invalid = false;
+            try { (void)conservative_authority_us(5000, 5000, ppm); }
+            catch (const std::invalid_argument&) { invalid = true; }
+            require(invalid);
+        }
+        bool invalid_window = false;
+        try { (void)conservative_authority_us(0, 5000, 100); }
+        catch (const std::invalid_argument&) { invalid_window = true; }
+        require(invalid_window);
         rdma::Config nc; nc.self = 5;
         rdma::Transport net(nc);
         ClientConfig cfg; cfg.backend = Backend::Handoff; cfg.self = 5;

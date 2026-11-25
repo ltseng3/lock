@@ -1,6 +1,7 @@
 # Handoff client recovery
 
-Status: design and implementation roadmap. Client recovery is not yet enabled by this document.
+Status: staged implementation. Client recovery and timeout-based regrant
+are not enabled yet. See the implementation checklist below.
 
 ## Scope
 
@@ -192,11 +193,18 @@ survivor accounting and injection teardown separately. Keep existing
 
 ## Implementation order
 
-- [ ] Transport isolation: opt-in recoverable client peers, posting and
-  completion isolation, per-destination response accounting, regression tests.
-- [ ] Deterministic client crash supervision and failure-aware runner.
-- [ ] Pure conservative lease arithmetic, client activation gate and
-  stale-identity handling; fake-clock boundary and pause tests.
+- [x] Per-destination response isolation and regression tests.
+- [x] Reserve heartbeat mailboxes outside receive buffers.
+- [x] Opt-in recoverable client transport primitives (single lane); retain
+  fatal defaults and the existing Mu old-leader path.
+- [ ] Connect transport events to Handoff runtime, direct HANDOFF failure
+  handling, admission and stop barrier; validate on hardware.
+- [x] Reusable deterministic client crash supervision, client service-start
+  marker and local process test.
+- [ ] Wire client crash supervision and survivor result validation into runner.
+- [x] Pure conservative lease arithmetic and boundary tests.
+- [ ] Enforce the activation gate and stale-identity handling; fake-clock
+  boundary and pause tests.
 - [ ] Per-lock recovery, survivor reconciliation, FIFO-preserving rebuild
   and stale retirement/activation tests; no new common-path RPC.
 - [ ] Adversarial tests: failure before/after HANDOFF and marker, failed

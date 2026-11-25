@@ -67,8 +67,24 @@ int main(int argc, char** argv) {
         if (gc > 1 || (gc && cfg.backend != lock::Backend::Handoff))
             throw std::invalid_argument("handoff-gc requires handoff and 0 or 1");
         cfg.handoff_gc = gc != 0;
+        const auto client_recovery = opt.number("handoff-client-recovery", 0);
+        if (client_recovery > 1)
+            throw std::invalid_argument("handoff-client-recovery must be 0 or 1");
         cfg.lease = {opt.number("handoff-lease-us", 0), opt.number("handoff-lease-scan-us", 0),
-                     opt.number("handoff-heartbeat-us", 0)};
+                     opt.number("handoff-heartbeat-us", 0), client_recovery != 0,
+                     opt.number("handoff-activation-us", 0),
+                     opt.number("handoff-clock-error-ppm", 1'000'000)};
+        cfg.lease.validate();
+        if (cfg.lease.client_recovery) {
+            if (cfg.backend != lock::Backend::Handoff || cfg.mu_lanes != 1 ||
+                cfg.critical_section_ops || cfg.handoff_peer_read || cfg.handoff_gc ||
+                cfg.mu_recovery || cfg.replicas.size() != 3)
+                throw std::invalid_argument("invalid Handoff client recovery configuration");
+            for (auto peer : ids(opt.list("clients")))
+                if (peer != cfg.self) net_cfg.recoverable_clients.push_back(peer);
+            if (net_cfg.recoverable_clients.empty())
+                throw std::invalid_argument("client recovery requires >=2 clients");
+        }
         const auto trace = opt.number("handoff-trace", 0);
         if (trace > 1) throw std::invalid_argument("handoff-trace must be 0 or 1");
         cfg.handoff_trace = trace != 0;

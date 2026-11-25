@@ -41,6 +41,7 @@ public:
     HandoffStep recover(LeaseClock::time_point now,
                         const std::function<uint64_t(uint64_t)>& read_marker);
     bool recovering() const { return !recovering_locks_.empty(); }
+    bool idle() const; // shutdown only
     const HandoffRecoveryStats& recovery_stats() const { return recovery_stats_; }
 private:
     std::vector<ProgressWatch> lease_heads_;

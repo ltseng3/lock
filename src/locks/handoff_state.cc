@@ -149,6 +149,12 @@ void HandoffState::monitor_heads(LeaseClock::time_point now, uint64_t timeout_us
         stats.sample(lease_heads_[lock], locks_[lock].prepared.front().request, now, timeout_us);
 }
 
+bool HandoffState::idle() const {
+    return active_locks_.empty() && recovering_locks_.empty() &&
+        std::all_of(locks_.begin(), locks_.end(), [](const State& state) {
+            return state.waiting.empty() && !state.uncommitted && state.prepared.empty();
+        });
+}
 void HandoffState::begin_repair(size_t lock_id, LeaseClock::time_point now) {
     auto& state = locks_.at(lock_id);
     if (state.repair != Repair::Normal) return;

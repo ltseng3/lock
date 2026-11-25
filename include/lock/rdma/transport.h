@@ -101,6 +101,8 @@ public:
                                size_t offset, size_t marker_offset, WorkId end, size_t lane);
     // One-shot fencing. Call only from the sole owner with all peer users stopped.
     void fence_peer(NodeId peer);
+    // Local containment only, not a protected-data fence. Single QP owner.
+    void isolate_client(NodeId peer);
     void read_range(NodeId peer, void* result, size_t length, size_t remote_offset, WorkId work_id);
     // Linked SEND WRs for one client QP, with only the tail signaled.
     // The caller owns SQ credits; end identifies the completed prefix.

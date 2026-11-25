@@ -45,8 +45,13 @@ int main(int argc, char** argv) {
         const auto gc = opt.number("handoff-gc", 0);
         if (gc > 1 || (gc && backend != lock::Backend::Handoff))
             throw std::invalid_argument("handoff-gc requires handoff and 0 or 1");
+        const auto client_recovery = opt.number("handoff-client-recovery", 0);
+        if (client_recovery > 1)
+            throw std::invalid_argument("handoff-client-recovery must be 0 or 1");
         const lock::HandoffLeaseConfig lease{opt.number("handoff-lease-us", 0),
-            opt.number("handoff-lease-scan-us", 0), opt.number("handoff-heartbeat-us", 0)};
+            opt.number("handoff-lease-scan-us", 0), opt.number("handoff-heartbeat-us", 0),
+            client_recovery != 0, opt.number("handoff-activation-us", 0),
+            opt.number("handoff-clock-error-ppm", 1'000'000)};
         lease.validate();
         if ((lease.duration_us || lease.heartbeat_us) && backend != lock::Backend::Handoff)
             throw std::invalid_argument("lease monitor requires Handoff");
@@ -72,6 +77,11 @@ int main(int argc, char** argv) {
             !cfg.communication_batch || cfg.communication_batch > 64)
             throw std::invalid_argument("invalid leader batch size");
         const bool leader = cfg.self == replicas.front();
+        if (lease.client_recovery &&
+            (backend != lock::Backend::Handoff || mu_lanes != 1 || gc ||
+             replicas.size() != 3 || clients.size() < 2))
+            throw std::invalid_argument("invalid Handoff client recovery configuration");
+        if (lease.client_recovery && leader) cfg.recoverable_clients = clients;
         lock::MuRecoveryConfig recovery;
         const auto recover = opt.number("mu-recovery", 0);
         const auto publication = opt.number("mu-recovery-publication", 1);

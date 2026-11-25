@@ -603,6 +603,12 @@ void Transport::write_inline_words(NodeId peer, std::span<const uint64_t> words,
     wr.wr.rdma.rkey = c.remote.rkey;
     check(!ibv_post_send(qp, &wr, &bad), "post compact WRITE batch");
 }
+void Transport::isolate_client(NodeId peer) {
+    auto& c = impl_->conn(peer);
+    if (!c.recoverable_client || !impl_->connected)
+        throw std::invalid_argument("cannot isolate undesignated client");
+    c.failed = true;
+}
 void Transport::fence_peer(NodeId peer) {
     auto& x = *impl_;
     if (!peer || peer != x.cfg.recoverable_peer)

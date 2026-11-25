@@ -48,13 +48,15 @@ struct ProgressWatch {
 };
 struct LeaseScanStats {
     uint64_t scans = 0, checks = 0, changes = 0, suspicions = 0, max_age_ns = 0;
-    void sample(ProgressWatch& watch, uint64_t token, LeaseClock::time_point now,
+    bool sample(ProgressWatch& watch, uint64_t token, LeaseClock::time_point now,
                 uint64_t timeout_us) {
         ++checks;
         changes += watch.observe(token, now);
         max_age_ns = std::max(max_age_ns, static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(now - watch.since).count()));
-        suspicions += watch.suspect(now, timeout_us);
+        const bool suspected = watch.suspect(now, timeout_us);
+        suspicions += suspected;
+        return suspected;
     }
 };
 // Disjoint from flags, application data (1000 words), and log.

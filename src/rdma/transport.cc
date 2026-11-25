@@ -163,6 +163,8 @@ struct Transport::Impl {
         scratch_next = cfg.memory_bytes - 16ULL * 1024 * 1024;
         if (!cfg.communication_batch || cfg.communication_batch > 64)
             throw std::invalid_argument("communication batch must be 1..64");
+        if (cfg.min_rnr_timer > 31)
+            throw std::invalid_argument("minimum RNR timer encoding must be 0..31");
         if (cfg.receive_depth < 2 || cfg.receive_depth > 1024)
             throw std::invalid_argument("receive depth must be 2..1024");
         int count = 0;
@@ -366,7 +368,7 @@ struct Transport::Impl {
         rtr.dest_qp_num = b.qpn;
         rtr.rq_psn = b.psn;
         rtr.max_dest_rd_atomic = 1;
-        rtr.min_rnr_timer = 12;
+        rtr.min_rnr_timer = cfg.min_rnr_timer;
         rtr.ah_attr.is_global = 0;
         rtr.ah_attr.dlid = static_cast<uint16_t>(b.lid);
         rtr.ah_attr.sl = 0;

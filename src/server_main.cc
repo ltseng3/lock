@@ -38,6 +38,12 @@ int main(int argc, char** argv) {
         cfg.tcp_port = opt.number("tcp-port", 18515);
         cfg.ib_port = opt.number("ib-port", 1);
         cfg.device = opt.get("device");
+        const auto receive_depth = opt.number("receive-depth", 128);
+        const auto min_rnr_timer = opt.number("min-rnr-timer", 12);
+        if (receive_depth < 2 || receive_depth > 1024 || min_rnr_timer > 31)
+            throw std::invalid_argument("invalid receive depth or RNR timer encoding");
+        cfg.receive_depth = static_cast<uint32_t>(receive_depth);
+        cfg.min_rnr_timer = static_cast<uint8_t>(min_rnr_timer);
         cfg.memory_bytes = opt.number("memory-mib", 512) * 1024ULL * 1024;
         auto replicas = ids(opt.list("replicas"));
         auto clients = ids(opt.list("clients"));

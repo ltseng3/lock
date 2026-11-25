@@ -8,7 +8,7 @@ sys.path.insert(0, str(ROOT / "experiments"))
 from cluster import Remote, Topology
 from unittest import mock
 import tempfile
-from run import cases, process_command, wait_for
+from run import cases, process_command, wait_for, validate_transport_diagnostics, snapshot_rdma_counters
 
 class TestExperiment(unittest.TestCase):
     def setUp(self):
@@ -49,6 +49,34 @@ class TestExperiment(unittest.TestCase):
         client = process_command(self.topo, self.topo.by_id(4), enhanced, case)
         self.assertIn("--profile-leader=1", server)
         self.assertNotIn("--profile-leader=1", client)
+
+    def test_transport_diagnostic_flags(self):
+        case = dict(next(cases(self.suite)), backend="handoff")
+        suite = dict(self.suite, client_receive_depth=512,
+                     server_receive_depth=256, min_rnr_timer=8, mu_lanes=1)
+        validate_transport_diagnostics(suite)
+        for node in self.topo.nodes:
+            args = process_command(self.topo, node, suite, case)
+            depth = 512 if node.role == "client" else 256
+            self.assertIn(f"--receive-depth={depth}", args)
+            self.assertIn("--min-rnr-timer=8", args)
+            default = process_command(self.topo, node, self.suite, case)
+            self.assertFalse(any(a.startswith("--receive-depth=") for a in default))
+        for override in (dict(client_receive_depth=1024), dict(min_rnr_timer=0),
+                         dict(server_receive_depth=True), dict(mu_lanes=2)):
+            with self.assertRaises(ValueError):
+                validate_transport_diagnostics(dict(suite, **override))
+
+    def test_rdma_counter_snapshot(self):
+        remote = mock.Mock()
+        remote.command.return_value = "/sys/counter\t42\n/sys/unavailable\tN/A\n"
+        snapshot = snapshot_rdma_counters(remote, self.topo)
+        self.assertEqual(len(snapshot), 8)
+        self.assertEqual(snapshot["4"]["counters"], {"/sys/counter": 42})
+        remote.command.side_effect = RuntimeError("counter unavailable")
+        snapshot = snapshot_rdma_counters(remote, self.topo)
+        self.assertEqual(snapshot["4"]["counters"], {})
+        self.assertIn("error", snapshot["4"])
 
     def test_handoff_recovery_flags(self):
         suite = dict(self.suite, handoff_recovery=True)

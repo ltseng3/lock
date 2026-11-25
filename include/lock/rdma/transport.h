@@ -34,6 +34,7 @@ struct Config {
     std::string device;
     size_t memory_bytes = kDefaultMemoryBytes;
     uint32_t receive_depth = 128;
+    uint8_t min_rnr_timer = 12; // InfiniBand encoded minimum RNR NAK delay
     NodeId recoverable_peer = 0; // only the explicitly designated crash-stop peer
     // Leader-only Mu configuration: these peer QPs get a dedicated
     // replication CQ, separate from the client-communication CQ.

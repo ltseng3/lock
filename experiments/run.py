@@ -62,6 +62,11 @@ def process_command(topo: Topology, node, suite: dict, case: dict,
     ]
     if smoke:
         return ["./build/lock_rdma_smoke", *common]
+    depth_key = "client_receive_depth" if node.role == "client" else "server_receive_depth"
+    if depth_key in suite:
+        common.append(arg("receive-depth", suite[depth_key]))
+    if "min_rnr_timer" in suite:
+        common.append(arg("min-rnr-timer", suite["min_rnr_timer"]))
     if node.role == "client":
         common.append(arg("critical-section-ops", case["critical_section_ops"]))
         if "latency_sample_capacity" in suite:
@@ -175,6 +180,51 @@ def kill_supervisor(remote: Remote, node, folder: str) -> None:
                    f"kill \"$(cat {pid})\" 2>/dev/null || true; rm -f {pid}; fi",
                    check=False)
 
+def validate_transport_diagnostics(suite: dict) -> None:
+    # Restrict this diagnostic sweep to the receive-memory and CQ budget
+    # exercised on the eight-node, single-lane topology.
+    for key, lo, hi in (("client_receive_depth", 128, 512),
+                        ("server_receive_depth", 128, 512),
+                        ("min_rnr_timer", 1, 31)):
+        if key in suite and (type(suite[key]) is not int or not lo <= suite[key] <= hi):
+            raise ValueError(f"{key} must be an integer in {lo}..{hi}")
+    if type(suite.get("collect_rdma_counters", False)) is not bool:
+        raise ValueError("collect_rdma_counters must be boolean")
+    if any(k in suite for k in ("client_receive_depth", "server_receive_depth",
+                                "min_rnr_timer")) and suite.get("mu_lanes", 1) != 1:
+        raise ValueError("transport diagnostics require one lane")
+
+
+def snapshot_rdma_counters(remote: Remote, topo: Topology) -> dict:
+    # Best-effort, read-only snapshots OUTSIDE the measured interval.
+    # mlx4/driver versions expose different counter sets. Missing counters
+    # are not zero, and no reset or privileged access is requested.
+    command = r'''
+for f in /sys/class/infiniband/*/hw_counters/* \
+         /sys/class/infiniband/*/ports/*/hw_counters/* \
+         /sys/class/infiniband/*/ports/*/counters/*; do
+    [ -f "$f" ] && [ -r "$f" ] || continue
+    if IFS= read -r value < "$f" 2>/dev/null; then
+        printf '%s\t%s\n' "$f" "$value"
+    fi
+done
+true
+'''
+    def read_node(node):
+        try:
+            raw = remote.command(node, command)
+            values = {}
+            for line in raw.splitlines():
+                path, sep, value = line.partition("\t")
+                if sep and value.strip().isdigit():
+                    values[path] = int(value.strip())
+            return {"counters": values}
+        except Exception as exc:
+            return {"error": str(exc), "counters": {}}
+    with ThreadPoolExecutor(max_workers=len(topo.nodes)) as pool:
+        return {str(n.id): v for n, v in zip(topo.nodes, pool.map(read_node, topo.nodes))}
+
+
 def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
              remote_dir: str, output_dir: pathlib.Path, smoke: bool = False) -> dict:
     name = ("smoke" if smoke else
@@ -193,6 +243,8 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
         (result_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         return manifest
     control = None
+    if suite.get("collect_rdma_counters", False):
+        manifest["rdma_counters_before"] = snapshot_rdma_counters(remote, topo)
     try:
         crash = not smoke and suite.get("crash_after_ms") is not None
         if crash:
@@ -337,6 +389,8 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
                 remote.parallel(tuple(topo.by_id(n) for n in topo.replicas), collect_supervisor)
             except Exception as exc:
                 manifest.setdefault("cleanup_errors", []).append(str(exc))
+        if suite.get("collect_rdma_counters", False):
+            manifest["rdma_counters_after"] = snapshot_rdma_counters(remote, topo)
         if manifest.get("collection_errors") or manifest.get("cleanup_errors"):
             manifest["valid"] = False
         (result_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -474,6 +528,7 @@ def main() -> int:
             raise ValueError("recovery requires one backend, three replicas, one lane, empty CS")
         if backend == "handoff" and (suite.get("handoff_gc") or suite.get("handoff_peer_read")):
             raise ValueError("handoff recovery initially excludes GC and peer READ")
+    validate_transport_diagnostics(suite)
     if suite["replicas"] != len(topo.replicas):
         raise ValueError("suite replica count does not match topology")
     if not 1 <= suite.get("mu_lanes", 1) <= 8:

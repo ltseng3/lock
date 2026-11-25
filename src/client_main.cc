@@ -25,6 +25,12 @@ int main(int argc, char** argv) {
         net_cfg.tcp_port = opt.number("tcp-port", 18515);
         net_cfg.ib_port = opt.number("ib-port", 1);
         net_cfg.device = opt.get("device");
+        const auto receive_depth = opt.number("receive-depth", 128);
+        const auto min_rnr_timer = opt.number("min-rnr-timer", 12);
+        if (receive_depth < 2 || receive_depth > 1024 || min_rnr_timer > 31)
+            throw std::invalid_argument("invalid receive depth or RNR timer encoding");
+        net_cfg.receive_depth = static_cast<uint32_t>(receive_depth);
+        net_cfg.min_rnr_timer = static_cast<uint8_t>(min_rnr_timer);
         net_cfg.memory_bytes = opt.number("memory-mib", 128) * 1024ULL * 1024;
         lock::ClientConfig cfg;
         cfg.self = net_cfg.self;

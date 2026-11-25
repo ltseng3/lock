@@ -30,3 +30,5 @@ smoke experiment is:
 
 All nodes must run the same wire version. Client crashes, leases, election
 and multiple replacements remain unsupported; see the design document.
+
+For the experimental transport stall ablation, see [Handoff stall diagnostics](docs/handoff-stall-diagnostics.md).

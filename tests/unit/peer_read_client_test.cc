@@ -98,6 +98,38 @@ struct ClientEngineTestAccess {
     static void require(bool ok) {
         if (!ok) throw std::runtime_error("empty critical section regression failed");
     }
+    static void test_lease_monitor() {
+        rdma::Config nc; nc.self = 5;
+        rdma::Transport net(nc);
+        ClientConfig cfg; cfg.backend = Backend::Handoff; cfg.self = 5;
+        cfg.replicas = {1,2,3}; cfg.lock_count = 1; cfg.critical_section_ops = 0;
+        cfg.lease.duration_us = 5000; cfg.lease.heartbeat_us = 1000;
+        ClientEngine e(net,cfg);
+        posted.clear();
+        auto t = ClientEngine::Clock::now(), next = t;
+        e.heartbeat(t,next);
+        auto beat = last(rdma::CompletionKind::Write);
+        require(beat.offset == heartbeat_offset(5) && beat.inline_value == 1);
+        e.heartbeat(t + std::chrono::milliseconds(1),next);
+        require(writes() == 1 && e.heartbeat_skips_ == 1);
+        e.handle(done(beat));
+        e.heartbeat(t + std::chrono::milliseconds(2),next);
+        require(last(rdma::CompletionKind::Write).inline_value == 2);
+        e.handle(done(last(rdma::CompletionKind::Write)));
+        require(e.heartbeat_writes_ == e.heartbeat_cqes_);
+        e.submit(0);
+        e.ops_[0].begun = ClientEngine::Clock::now() - std::chrono::seconds(1);
+        auto order = message(Kind::Order,1,0,e.ops_[0].request);
+        order.value = 10;
+        e.handle(receive(order));
+        require(e.ops_[0].phase == ClientEngine::Phase::EmptyCriticalSection);
+        require(e.ops_[0].acquired > e.ops_[0].begun);
+        e.ops_[0].acquired = ClientEngine::Clock::now() - std::chrono::seconds(1);
+        const auto before = writes();
+        bool rejected = false;
+        try { e.finish_empty_sections(); } catch (const std::runtime_error&) { rejected = true; }
+        require(rejected && writes() == before);
+    }
     static void test_empty_sections() {
         rdma::Config nc; nc.self = 5;
         rdma::Transport net(nc);
@@ -348,6 +380,7 @@ struct ClientEngineTestAccess {
         require(e.requests_.empty());
     }
     static void run() {
+        test_lease_monitor();
         test_empty_sections();
         test_mu_recovery_client();
         test_retirement_gc();

@@ -2,6 +2,7 @@
 #include "lock/bench/workload.h"
 #include "lock/bench/latency_samples.h"
 #include "lock/locks/backend.h"
+#include "lock/locks/lease_monitor.h"
 #include "lock/rdma/transport.h"
 #include "lock/locks/peer_completion.h"
 #include <array>
@@ -30,6 +31,8 @@ struct ClientConfig {
     bool handoff_peer_read = false;
     bool handoff_gc = false;
     bool mu_recovery = false;
+    HandoffLeaseConfig lease;
+    bool handoff_trace = false;
 };
 class ClientEngine {
 public:
@@ -77,6 +80,7 @@ private:
     // Transport work IDs have 48 payload bits. Reserve bit 47 for the
     // FIFO of signaled inline retirement WRITEs on the leader's base QP.
     static constexpr WorkId kMarkerTokenBase = 1ULL << 47;
+    static constexpr WorkId kHeartbeatToken = kMarkerTokenBase - 1;
     rdma::Transport& net_;
     ClientConfig cfg_;
     NodeId leader_ = 0;
@@ -105,6 +109,10 @@ private:
     uint64_t markers_posted_ = 0, markers_completed_ = 0;
     std::deque<size_t> deferred_marker_slots_;
     bool markers_drained() const { return markers_posted_ == markers_completed_; }
+    uint64_t heartbeat_writes_ = 0, heartbeat_cqes_ = 0, heartbeat_skips_ = 0;
+    bool heartbeat_pending_ = false;
+    uint64_t lease_checked_ = 0, lease_max_hold_ns_ = 0;
+    void heartbeat(Clock::time_point now, Clock::time_point& next);
     uint64_t handoffs_sent_ = 0;
     uint64_t handoffs_received_ = 0;
     uint64_t late_next_ = 0;

@@ -44,6 +44,10 @@ ClientEngine::ClientEngine(rdma::Transport& net, ClientConfig cfg)
     if (cfg_.mu_recovery && (cfg_.backend != Backend::Mu || cfg_.replicas.size() != 3 ||
                              cfg_.mu_lanes != 1 || cfg_.critical_section_ops != 0))
         throw std::invalid_argument("Mu recovery initially requires empty critical sections, 3 replicas, 1 lane");
+    cfg_.lease.validate();
+    if ((cfg_.lease.duration_us || cfg_.lease.heartbeat_us || cfg_.handoff_trace) &&
+        (cfg_.backend != Backend::Handoff || cfg_.critical_section_ops != 0 || cfg_.mu_lanes != 1 || cfg_.mu_recovery))
+        throw std::invalid_argument("lease experiments require Handoff, empty CS, one lane, no recovery");
     if (cfg_.handoff_gc && cfg_.backend != Backend::Handoff)
         throw std::invalid_argument("retirement GC requires handoff");
     if (cfg_.handoff_peer_read) {
@@ -66,7 +70,7 @@ ClientEngine::ClientEngine(rdma::Transport& net, ClientConfig cfg)
     }
 }
 WorkId ClientEngine::track(size_t slot, Purpose purpose) {
-    if (next_work_ >= kMarkerTokenBase)
+    if (next_work_ >= kHeartbeatToken)
         throw std::runtime_error("client work ID exhausted");
     WorkId id = next_work_++;
     awaited_.emplace(id, Awaited{slot, ops_.at(slot).generation, purpose});
@@ -138,6 +142,15 @@ void ClientEngine::release(size_t slot) {
     auto& op = ops_[slot];
     if (op.phase != Phase::Writing && op.phase != Phase::EmptyCriticalSection)
         throw std::runtime_error("release before critical section completion");
+    // acquired is set at actual activation, not reservation or submission.
+    // No timeout-based regrant: fail closed if the empty section overruns.
+    if (cfg_.lease.duration_us) {
+        const auto now = Clock::now();
+        ++lease_checked_;
+        lease_max_hold_ns_ = std::max(lease_max_hold_ns_, nanos(now - op.acquired));
+        if (lease_elapsed(op.acquired, now, cfg_.lease.duration_us))
+            throw std::runtime_error("acquisition lease expired before retirement: fail closed");
+    }
     op.phase = Phase::WaitRelease;
     if (cfg_.backend == Backend::Handoff) {
         // The protected WRITE has completed, or no data work was issued.
@@ -170,7 +183,7 @@ void ClientEngine::release(size_t slot) {
 void ClientEngine::complete(size_t slot) {
     auto& op = ops_[slot];
     auto now = Clock::now();
-    if (cfg_.mu_recovery && trace_start_ != Clock::time_point{}) {
+    if ((cfg_.mu_recovery || cfg_.handoff_trace) && trace_start_ != Clock::time_point{}) {
         if (now <= measurement_end_) {
             const auto index = nanos(now - trace_start_) / trace_bucket_ns_;
             if (index < trace_counts_.size()) ++trace_counts_[index];
@@ -526,6 +539,14 @@ void ClientEngine::handle(const rdma::Completion& c) {
             throw std::runtime_error("unexpected response or phase");
         return;
     }
+    if (c.work_id == kHeartbeatToken) {
+        if (!cfg_.lease.heartbeat_us || !heartbeat_pending_ ||
+            c.kind != rdma::CompletionKind::Write || c.peer != leader_)
+            throw std::runtime_error("invalid heartbeat completion");
+        heartbeat_pending_ = false;
+        ++heartbeat_cqes_;
+        return;
+    }
     if (c.work_id >= kMarkerTokenBase) {
         if (cfg_.backend != Backend::Handoff ||
             c.kind != rdma::CompletionKind::Write || c.peer != cfg_.replicas.front() ||
@@ -587,10 +608,22 @@ void ClientEngine::handle(const rdma::Completion& c) {
         break;
     }
 }
+void ClientEngine::heartbeat(Clock::time_point now, Clock::time_point& next) {
+    if (!cfg_.lease.heartbeat_us || stop_sent_ || now < next) return;
+    next = now + std::chrono::microseconds(cfg_.lease.heartbeat_us);
+    if (heartbeat_pending_) { ++heartbeat_skips_; return; }
+    if (heartbeat_writes_ == UINT64_MAX) throw std::runtime_error("heartbeat exhausted");
+    if (!net_.write_inline(leader_, heartbeat_writes_ + 1,
+                           heartbeat_offset(cfg_.self), kHeartbeatToken))
+        throw std::runtime_error("heartbeat WRITE must be signaled");
+    ++heartbeat_writes_;
+    heartbeat_pending_ = true;
+}
+
 void ClientEngine::run() {
     latency_samples_.prepare(LatencySamples::capacity_for(
         cfg_.duration_seconds, cfg_.latency_sample_capacity));
-    if (cfg_.mu_recovery)
+    if (cfg_.mu_recovery || cfg_.handoff_trace)
         trace_counts_.resize((cfg_.warmup_seconds + cfg_.duration_seconds) * 100 + 1);
     const NodeId leader = cfg_.replicas.front();
     net_.send(leader, message(Kind::Ready, cfg_.self));
@@ -611,13 +644,16 @@ void ClientEngine::run() {
     }
     if (!barrier) throw std::runtime_error("client start barrier timeout");
     const auto start = Clock::now();
-    if (cfg_.mu_recovery) trace_start_ = start;
+    if (cfg_.mu_recovery || cfg_.handoff_trace) trace_start_ = start;
+    auto next_heartbeat = start;
     measurement_begin_ = start + std::chrono::seconds(cfg_.warmup_seconds);
     measurement_end_ = measurement_begin_ + std::chrono::seconds(cfg_.duration_seconds);
     auto watchdog = measurement_end_ + std::chrono::seconds(cfg_.watchdog_seconds);
     while (true) {
         auto now = Clock::now();
         if (now > watchdog) throw std::runtime_error("client watchdog timeout: fail closed");
+        if (cfg_.lease.heartbeat_us && (now < measurement_end_ || !requests_.empty()))
+            heartbeat(now, next_heartbeat);
         if (now < measurement_end_ && !recovery_paused_) {
             for (size_t i = 0; i < ops_.size(); ++i) {
                 if (cfg_.handoff_gc &&
@@ -633,7 +669,7 @@ void ClientEngine::run() {
         if (now >= measurement_end_ && requests_.empty() &&
             markers_drained() && deferred_marker_slots_.empty() &&
             retired_.empty() && awaited_.empty() && read_receipts_.empty() &&
-            empty_sections_.empty() &&
+            empty_sections_.empty() && !heartbeat_pending_ &&
             !stop_sent_ && !recovery_paused_) {
             // Every read winner has consumed its normal HANDOFF, all local
             // DMA has completed, and all retirements have been reclaimed.
@@ -644,14 +680,15 @@ void ClientEngine::run() {
         if (stop_sent_ && server_stopped_) break;
     }
     if (!awaited_.empty()) throw std::runtime_error("outstanding CQEs at completion");
-    if (cfg_.mu_recovery) print_recovery_trace();
+    if (cfg_.mu_recovery || cfg_.handoff_trace) print_recovery_trace();
     print_result();
 }
 void ClientEngine::print_recovery_trace() const {
     const auto relative = [&](Clock::time_point t) -> uint64_t {
         return t == Clock::time_point{} ? 0 : nanos(t - trace_start_);
     };
-    std::cout << "MU_RECOVERY_CLIENT {\"node\":" << cfg_.self
+    std::cout << (cfg_.mu_recovery ? "MU_RECOVERY_CLIENT" : "HANDOFF_LEASE_CLIENT")
+              << " {\"node\":" << cfg_.self
               << ",\"last_old_completion_ns\":" << relative(last_old_completion_)
               << ",\"failure_pause_ns\":" << relative(failure_pause_)
               << ",\"notice_ns\":" << relative(recovery_notice_)
@@ -676,6 +713,14 @@ void ClientEngine::print_result() {
               << ",\"locks\":" << cfg_.lock_count
               << ",\"critical_section_ops\":" << cfg_.critical_section_ops
               << ",\"handoff_gc\":" << (cfg_.handoff_gc ? 1 : 0)
+              << "\"handoff_lease_us\":" << cfg_.lease.duration_us << ","
+              << "\"handoff_lease_scan_us\":" << cfg_.lease.scan_us << ","
+              << "\"handoff_heartbeat_us\":" << cfg_.lease.heartbeat_us << ","
+              << "\"lease_checked\":" << lease_checked_ << ","
+              << "\"lease_max_hold_ns\":" << lease_max_hold_ns_ << ","
+              << "\"heartbeat_writes\":" << heartbeat_writes_ << ","
+              << "\"heartbeat_cqes\":" << heartbeat_cqes_ << ","
+              << "\"heartbeat_skips\":" << heartbeat_skips_ << ","
               << ",\"gc_next_reclaimed\":" << gc_next_reclaimed_
               << ",\"gc_ack_records\":" << gc_ack_records_
               << ",\"gc_ack_messages\":" << gc_ack_messages_

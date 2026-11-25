@@ -67,6 +67,11 @@ int main(int argc, char** argv) {
         if (gc > 1 || (gc && cfg.backend != lock::Backend::Handoff))
             throw std::invalid_argument("handoff-gc requires handoff and 0 or 1");
         cfg.handoff_gc = gc != 0;
+        cfg.lease = {opt.number("handoff-lease-us", 0), opt.number("handoff-lease-scan-us", 0),
+                     opt.number("handoff-heartbeat-us", 0)};
+        const auto trace = opt.number("handoff-trace", 0);
+        if (trace > 1) throw std::invalid_argument("handoff-trace must be 0 or 1");
+        cfg.handoff_trace = trace != 0;
         if (cfg.handoff_peer_read && cfg.backend != lock::Backend::Handoff)
             throw std::invalid_argument("peer READ is only supported by handoff");
         lock::rdma::Transport net(net_cfg);

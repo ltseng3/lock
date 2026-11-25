@@ -45,6 +45,11 @@ int main(int argc, char** argv) {
         const auto gc = opt.number("handoff-gc", 0);
         if (gc > 1 || (gc && backend != lock::Backend::Handoff))
             throw std::invalid_argument("handoff-gc requires handoff and 0 or 1");
+        const lock::HandoffLeaseConfig lease{opt.number("handoff-lease-us", 0),
+            opt.number("handoff-lease-scan-us", 0), opt.number("handoff-heartbeat-us", 0)};
+        lease.validate();
+        if ((lease.duration_us || lease.heartbeat_us) && backend != lock::Backend::Handoff)
+            throw std::invalid_argument("lease monitor requires Handoff");
         const size_t lock_count = opt.number("locks", 1000);
         const size_t mu_inflight_window = opt.number("mu-inflight-window", 512);
         if (mu_inflight_window < 1 || mu_inflight_window > 512)
@@ -106,7 +111,7 @@ int main(int argc, char** argv) {
                                              lock_count, opt.number("prepared-window", 8),
                                              handoff_inflight_window,
                                              profile_requested, mu_lanes, replication_batch,
-                                             cfg.communication_batch, gc != 0);
+                                             cfg.communication_batch, gc != 0, lease);
             } else if (recovery.enabled) {
                 lock::run_mu_standby(net, replicas, clients, lock_count, mu_inflight_window,
                     profile_requested, replication_batch, cfg.communication_batch, recovery,

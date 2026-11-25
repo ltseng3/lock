@@ -118,4 +118,12 @@ HandoffStep HandoffState::retire(
     }
     return out;
 }
+void HandoffState::monitor_heads(LeaseClock::time_point now, uint64_t timeout_us,
+                                 LeaseScanStats& stats) {
+    if (!timeout_us) throw std::invalid_argument("zero lease monitor timeout");
+    if (lease_heads_.empty()) lease_heads_.resize(locks_.size());
+    ++stats.scans;
+    for (auto lock : active_locks_)
+        stats.sample(lease_heads_[lock], locks_[lock].prepared.front().request, now, timeout_us);
+}
 } // namespace lock

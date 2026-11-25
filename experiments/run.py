@@ -80,6 +80,10 @@ def process_command(topo: Topology, node, suite: dict, case: dict,
                            arg("mu-recovery-replay", int(suite.get("mu_recovery_replay", True)))])
     if case["backend"] == "handoff":
         common.append(arg("handoff-gc", int(suite.get("handoff_gc", False))))
+        for key in ("handoff_lease_us", "handoff_lease_scan_us", "handoff_heartbeat_us"):
+            common.append(arg(key.replace("_", "-"), suite.get(key, 0)))
+        if node.role == "client":
+            common.append(arg("handoff-trace", int(suite.get("handoff_trace", False))))
     if node.role == "client" and case["backend"] == "handoff":
         common.append(arg("handoff-peer-read",
                           int(suite.get("handoff_peer_read", False))))
@@ -255,6 +259,31 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
                     raise ValueError(f"invalid latency sample accounting from node {node_id}")
                 results.append(record)
             manifest["client_results"] = results
+            if case["backend"] == "handoff":
+                for record in results:
+                    for key in ("handoff_lease_us", "handoff_lease_scan_us", "handoff_heartbeat_us"):
+                        if record.get(key, 0) != suite.get(key, 0):
+                            raise RuntimeError("lease configuration mismatch")
+                    if record.get("heartbeat_writes", 0) != record.get("heartbeat_cqes", 0):
+                        raise RuntimeError("heartbeat CQE accounting mismatch")
+                    if suite.get("handoff_lease_us", 0) and record.get("lease_checked", 0) < record["completed"]:
+                        raise RuntimeError("missing local lease checks")
+                if suite.get("handoff_lease_us", 0) or suite.get("handoff_heartbeat_us", 0):
+                    reports = [json.loads(line[len("HANDOFF_LEASE_MONITOR "):])
+                               for line in logs[topo.replicas[0]].splitlines()
+                               if line.startswith("HANDOFF_LEASE_MONITOR ")]
+                    if len(reports) != 1:
+                        raise RuntimeError("expected one lease monitor report")
+                    manifest["lease_monitor"] = reports[0]
+                    if reports[0]["heartbeat_total"] != sum(r["heartbeat_writes"] for r in results):
+                        raise RuntimeError("heartbeat publication accounting mismatch")
+                if suite.get("handoff_trace", False):
+                    traces = [json.loads(line[len("HANDOFF_LEASE_CLIENT "):])
+                              for n in topo.clients for line in logs[n].splitlines()
+                              if line.startswith("HANDOFF_LEASE_CLIENT ")]
+                    if sorted(t["node"] for t in traces) != sorted(topo.clients):
+                        raise RuntimeError("incomplete Handoff traces")
+                    manifest["lease_clients"] = traces
             if suite.get("mu_recovery", False):
                 def exactly_one(log, prefix):
                     values = [json.loads(line[len(prefix):]) for line in log.splitlines()
@@ -457,6 +486,22 @@ def main() -> int:
             suite.get("mu_lanes", 1) != 1 or len(topo.replicas) != 3 or
             suite["critical_section_ops"] != 0 or len(topo.clients) > 15):
         raise ValueError("Mu recovery requires Mu only, three replicas, one lane, empty CS")
+    for key in ("handoff_lease_us", "handoff_lease_scan_us", "handoff_heartbeat_us"):
+        suite.setdefault(key, 0)
+        if type(suite[key]) is not int or not 0 <= suite[key] <= 60_000_000:
+            raise ValueError(f"{key} must be an integer in 0..60000000")
+    suite.setdefault("handoff_trace", False)
+    if type(suite["handoff_trace"]) is not bool:
+        raise ValueError("handoff_trace must be boolean")
+    if suite["handoff_lease_scan_us"] and not suite["handoff_lease_us"]:
+        raise ValueError("head monitoring requires a nonzero acquisition lease")
+    if any(suite[k] for k in ("handoff_lease_us", "handoff_lease_scan_us",
+                              "handoff_heartbeat_us", "handoff_trace")):
+        if (args.smoke or (args.only_backend or "") not in ("", "handoff") or
+                (args.only_backend != "handoff" and suite["backends"] != ["handoff"]) or
+                suite.get("mu_lanes", 1) != 1 or suite["critical_section_ops"] != 0 or
+                suite["mu_recovery"]):
+            raise ValueError("lease experiments require Handoff only, one lane, empty CS, no recovery")
     if suite["replicas"] != len(topo.replicas):
         raise ValueError("suite replica count does not match topology")
     if not 1 <= suite.get("mu_lanes", 1) <= 8:

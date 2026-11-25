@@ -20,6 +20,18 @@ int main() {
     catch (const std::out_of_range&) { rejected = true; }
     assert(rejected);
 
+    const auto t = LeaseClock::time_point{};
+    ProgressWatch watch;
+    if (!watch.observe(1, t) || watch.suspect(t + std::chrono::microseconds(999), 1000) ||
+        !watch.suspect(t + std::chrono::microseconds(1000), 1000) ||
+        watch.suspect(t + std::chrono::microseconds(2000), 1000) ||
+        !watch.observe(2, t + std::chrono::microseconds(2000)) ||
+        watch.suspect(t + std::chrono::microseconds(2001), 1000))
+        throw std::runtime_error("progress watch regression");
+    if (heartbeat_offset(1) + 64 != heartbeat_offset(2) ||
+        lease_elapsed(t, t + std::chrono::microseconds(999), 1000) ||
+        !lease_elapsed(t, t + std::chrono::microseconds(1000), 1000))
+        throw std::runtime_error("lease deadline/layout regression");
     HandoffState state(1000, 2);
     bool bad_lock = false;
     try { (void)state.retire_lock(1000, [](uint64_t) { return uint64_t{0}; }); }
@@ -41,6 +53,12 @@ int main() {
     std::map<uint64_t,uint64_t> markers{{1,b}};
     auto blocked = state.retire([&](uint64_t slot) { return markers[slot]; });
     assert(blocked.actions.empty());
+    LeaseScanStats stats;
+    state.monitor_heads(t, 1000, stats);
+    state.monitor_heads(t + std::chrono::milliseconds(1), 1000, stats);
+    state.monitor_heads(t + std::chrono::milliseconds(2), 1000, stats);
+    if (stats.suspicions != 1 || stats.checks != 3)
+        throw std::runtime_error("head monitor changed or skipped unresolved head");
     markers[0] = a;
     auto progress = state.retire([&](uint64_t slot) { return markers[slot]; });
     assert(progress.actions.size() == 2 && progress.append.size() == 1);

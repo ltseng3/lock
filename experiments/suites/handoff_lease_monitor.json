@@ -1,0 +1,37 @@
+{
+  "name": "handoff-lease-monitor",
+  "backends": [
+    "handoff"
+  ],
+  "locks": 1000,
+  "distributions": [
+    "uniform",
+    "zipf_0.99"
+  ],
+  "workers": [
+    4
+  ],
+  "outstanding": [
+    8,
+    16
+  ],
+  "replicas": 3,
+  "mu_lanes": 1,
+  "prepared_window": 64,
+  "handoff_inflight_window": 128,
+  "replication_batch": 16,
+  "leader_comm_batch": 64,
+  "critical_section_ops": 0,
+  "handoff_gc": false,
+  "handoff_peer_read": false,
+  "handoff_lease_us": 5000,
+  "handoff_lease_scan_us": 100,
+  "handoff_heartbeat_us": 1000,
+  "handoff_trace": true,
+  "profile_leader": true,
+  "warmup_seconds": 1,
+  "duration_seconds": 7,
+  "watchdog_seconds": 90,
+  "repetitions": 3,
+  "seed": 2026
+}

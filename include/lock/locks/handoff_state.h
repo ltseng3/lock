@@ -1,5 +1,6 @@
 #pragma once
 #include "lock/locks/mu_state.h"
+#include "lock/locks/lease_monitor.h"
 #include "lock/locks/replicated_log.h"
 #include <cstddef>
 #include <cstdint>
@@ -21,7 +22,10 @@ public:
     // assigning a predecessor to a newly committed request on the same lock.
     HandoffStep retire_lock(LockId lock_id,
                             const std::function<uint64_t(uint64_t)>& read_marker);
+    // Observation only: never changes ownership.
+    void monitor_heads(LeaseClock::time_point now, uint64_t timeout_us, LeaseScanStats& stats);
 private:
+    std::vector<ProgressWatch> lease_heads_;
     struct Entry { RequestId request; uint64_t position; uint64_t log_slot; };
     struct State {
         uint64_t next_position = 0;

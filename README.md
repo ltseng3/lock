@@ -16,3 +16,7 @@ The project accepts **CMake 3.16.3** (the Ubuntu 20.04 system version). It still
 requires a compiler and standard library implementing C++20; GCC 10 or newer is
 recommended. If the system C++ compiler is too old, install `g++-10` and use
 `CXX=g++-10 cmake -S . -B build` to configure a **fresh** build directory.
+
+### Experimental Handoff lease monitoring
+
+See [fixed acquisition leases and advisory monitoring](docs/lease-monitor.md) for scope, flags and matched overhead experiments.

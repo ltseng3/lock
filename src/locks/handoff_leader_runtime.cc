@@ -31,6 +31,8 @@ struct Shared {
     SpscQueue<Action> responses;
     std::atomic<uint64_t> acquire_rx{0}, responses_sent{0}, send_cqe{0};
     std::atomic<bool> stopped{false}, failed{false};
+    std::atomic<uint64_t> lease_scans{0}, lease_checks{0}, lease_changes{0},
+        lease_suspicions{0}, lease_max_age_ns{0};
     std::atomic<bool> failure_claimed{false};
     std::exception_ptr failure;
     void report_failure(std::exception_ptr error) {
@@ -60,7 +62,8 @@ void replication_loop(Shared& s, rdma::Transport& net,
                       const std::vector<NodeId>& replicas,
                       size_t lock_count, size_t prepared_window,
                       size_t window, bool profile,
-                      size_t lane, size_t lane_count, size_t replication_batch, bool gc) {
+                      size_t lane, size_t lane_count, size_t replication_batch, bool gc,
+                      HandoffLeaseConfig lease) {
     try {
         // Half the registered log area holds 8-byte replicated headers. The
         // adjacent half holds one 8-byte marker per slot, written by the
@@ -101,6 +104,8 @@ void replication_loop(Shared& s, rdma::Transport& net,
         // and check only the relevant lock before assigning a successor.
         constexpr auto kRetirementScanPeriod = std::chrono::microseconds(32);
         auto next_retirement_scan = Clock::now() + kRetirementScanPeriod;
+        auto next_lease_scan = next_retirement_scan;
+        LeaseScanStats lease_stats;
         std::array<Message, MuCompactLog::max_batch> batch;
         while (!s.stopped.load(std::memory_order_acquire)) {
             net.poll_replication_into(cqes, 64, lane);
@@ -119,6 +124,16 @@ void replication_loop(Shared& s, rdma::Transport& net,
                 publish_retirement(state.retire(read_marker));
                 // Space complete scans apart even if a scan itself is costly.
                 next_retirement_scan = Clock::now() + kRetirementScanPeriod;
+            }
+
+            if (lease.scan_us && now >= next_lease_scan) {
+                state.monitor_heads(now, lease.duration_us, lease_stats);
+                s.lease_scans.store(lease_stats.scans, std::memory_order_relaxed);
+                s.lease_checks.store(lease_stats.checks, std::memory_order_relaxed);
+                s.lease_changes.store(lease_stats.changes, std::memory_order_relaxed);
+                s.lease_suspicions.store(lease_stats.suspicions, std::memory_order_relaxed);
+                s.lease_max_age_ns.store(lease_stats.max_age_ns, std::memory_order_relaxed);
+                next_lease_scan = Clock::now() + std::chrono::microseconds(lease.scan_us);
             }
 
             // Preserve the retirement-first optimization without repeatedly
@@ -204,12 +219,16 @@ void handoff_communication_loop(
     rdma::Transport& net, NodeId self,
     const std::vector<NodeId>& clients, size_t lock_count,
     bool profile, size_t lane, size_t lane_count,
-    std::atomic<bool>& started, size_t communication_batch, bool gc) {
+    std::atomic<bool>& started, size_t communication_batch, bool gc,
+    HandoffLeaseConfig lease) {
     // Each worker owns client-facing QPs and CQ for exactly one lane.
     // Only lane zero runs Ready/Stop barriers.
     std::vector<rdma::Completion> completions;
     completions.reserve(64);
     std::set<NodeId> ready, finished;
+    std::array<ProgressWatch,256> heartbeat_watch{};
+    LeaseScanStats heartbeat_stats;
+    auto next_heartbeat_scan = Clock::now();
     LeaderResponseBatch responses(net, self, clients, lane, lane_count, communication_batch, gc);
     while (!s.stopped.load(std::memory_order_acquire)) {
         if (lane == 0) {
@@ -245,9 +264,31 @@ void handoff_communication_loop(
                 if (std::find(clients.begin(), clients.end(), c.peer) == clients.end() ||
                     !finished.insert(c.peer).second)
                     throw std::runtime_error("invalid handoff shutdown");
-                if (finished.size() == clients.size())
+                if (finished.size() == clients.size()) {
+                    if (lease.duration_us || lease.heartbeat_us) {
+                        uint64_t heartbeat_total = 0;
+                        if (lease.heartbeat_us) for (auto id : clients) {
+                            auto* ptr = static_cast<uint64_t*>(net.at(heartbeat_offset(id), 8));
+                            heartbeat_total += std::atomic_ref<uint64_t>(*ptr).load(std::memory_order_acquire);
+                        }
+                        std::cout << "HANDOFF_LEASE_MONITOR {\"lease_us\":" << lease.duration_us
+                                  << ",\"scan_us\":" << lease.scan_us
+                                  << ",\"heartbeat_us\":" << lease.heartbeat_us
+                                  << ",\"head_scans\":" << s.lease_scans.load()
+                                  << ",\"head_checks\":" << s.lease_checks.load()
+                                  << ",\"head_changes\":" << s.lease_changes.load()
+                                  << ",\"head_suspicions\":" << s.lease_suspicions.load()
+                                  << ",\"head_max_age_ns\":" << s.lease_max_age_ns.load()
+                                  << ",\"heartbeat_scans\":" << heartbeat_stats.scans
+                                  << ",\"heartbeat_checks\":" << heartbeat_stats.checks
+                                  << ",\"heartbeat_changes\":" << heartbeat_stats.changes
+                                  << ",\"heartbeat_suspicions\":" << heartbeat_stats.suspicions
+                                  << ",\"heartbeat_max_age_ns\":" << heartbeat_stats.max_age_ns
+                                  << ",\"heartbeat_total\":" << heartbeat_total << "}" << std::endl;
+                    }
                     for (NodeId id : clients)
                         net.send(id, message(Kind::Stop, self), 0, true, 0);
+                }
             } else if ((kind == Kind::Acquire) &&
                        started.load(std::memory_order_acquire)) {
                 if (std::find(clients.begin(), clients.end(), c.peer) == clients.end() ||
@@ -262,6 +303,20 @@ void handoff_communication_loop(
                 throw std::runtime_error("unexpected handoff lane message");
             }
         }
+        if (lease.heartbeat_us && started.load(std::memory_order_acquire) &&
+            finished.size() != clients.size()) {
+            const auto now = Clock::now();
+            if (now >= next_heartbeat_scan) {
+                ++heartbeat_stats.scans;
+                for (auto id : clients) {
+                    if (finished.contains(id)) continue;
+                    auto* ptr = static_cast<uint64_t*>(net.at(heartbeat_offset(id), 8));
+                    const auto value = std::atomic_ref<uint64_t>(*ptr).load(std::memory_order_acquire);
+                    heartbeat_stats.sample(heartbeat_watch[id], value, now, 5 * lease.heartbeat_us);
+                }
+                next_heartbeat_scan = now + std::chrono::microseconds(lease.heartbeat_us);
+            }
+        }
         const size_t sent = responses.drain(s.responses);
         if (profile && sent)
             s.responses_sent.fetch_add(sent, std::memory_order_relaxed);
@@ -274,7 +329,10 @@ void run_handoff_leader(rdma::Transport& net, NodeId self,
                         size_t lock_count, size_t prepared_window,
                         size_t inflight_window, bool profile,
                         size_t lane_count, size_t replication_batch,
-                        size_t communication_batch, bool gc) {
+                        size_t communication_batch, bool gc, HandoffLeaseConfig lease) {
+    lease.validate();
+    if ((lease.duration_us || lease.heartbeat_us) && lane_count != 1)
+        throw std::invalid_argument("lease monitoring initially requires one lane");
     if (!replication_batch || replication_batch > MuCompactLog::max_batch ||
         !communication_batch || communication_batch > LeaderResponseBatch::drain_limit)
         throw std::invalid_argument("invalid leader batch size");
@@ -293,7 +351,7 @@ void run_handoff_leader(rdma::Transport& net, NodeId self,
         Shared* shard = lanes[lane].get();
         workers.emplace_back([&, shard, lane] {
             replication_loop(*shard, net, replicas, lock_count, prepared_window,
-                             inflight_window, profile, lane, lane_count, replication_batch, gc);
+                             inflight_window, profile, lane, lane_count, replication_batch, gc, lease);
         });
     }
     for (size_t lane = 1; lane < lane_count; ++lane) {
@@ -301,7 +359,7 @@ void run_handoff_leader(rdma::Transport& net, NodeId self,
         workers.emplace_back([&, shard, lane] {
             try {
                 handoff_communication_loop(*shard, lanes, net, self,
-                    clients, lock_count, profile, lane, lane_count, started, communication_batch, gc);
+                    clients, lock_count, profile, lane, lane_count, started, communication_batch, gc, lease);
             } catch (...) {
                 shard->report_failure(std::current_exception());
             }
@@ -309,6 +367,6 @@ void run_handoff_leader(rdma::Transport& net, NodeId self,
     }
     // Lane zero's control loop owns the start/stop barrier.
     handoff_communication_loop(*lanes.front(), lanes, net, self, clients,
-                    lock_count, profile, 0, lane_count, started, communication_batch, gc);
+                    lock_count, profile, 0, lane_count, started, communication_batch, gc, lease);
 }
 } // namespace lock

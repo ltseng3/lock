@@ -8,12 +8,47 @@ sys.path.insert(0, str(ROOT / "experiments"))
 from cluster import Remote, Topology
 from unittest import mock
 import tempfile
-from run import cases, process_command, wait_for
+from run import (cases, process_command, wait_for, validate_handoff_recovery,
+                 validate_client_recovery)
 
 class TestExperiment(unittest.TestCase):
     def setUp(self):
         self.topo = Topology.load(ROOT / "experiments/topologies/apt8.json")
         self.suite = json.loads((ROOT / "experiments/suites/first.json").read_text())
+
+    def test_handoff_client_recovery_configuration(self):
+        suite = dict(self.suite, backends=["handoff"], critical_section_ops=0,
+                     handoff_client_recovery=True, handoff_lease_us=5000,
+                     handoff_lease_scan_us=100, handoff_heartbeat_us=1000,
+                     handoff_activation_us=5000, handoff_clock_error_ppm=100,
+                     client_crash_node=5, client_crash_after_ms=2000,
+                     duration_seconds=7, warmup_seconds=1)
+        validate_handoff_recovery(suite, self.topo)
+        case = next(cases(suite))
+        for node in self.topo.nodes:
+            args = process_command(self.topo, node, suite, case)
+            self.assertIn("--handoff-client-recovery=1", args)
+            self.assertIn("--handoff-activation-us=5000", args)
+            self.assertIn("--handoff-clock-error-ppm=100", args)
+            self.assertFalse(any(arg.startswith("--client-crash-") for arg in args))
+        for override in ({"handoff_clock_error_ppm": 1_000_000}, {"client_crash_node": 1},
+                         {"handoff_gc": True}, {"critical_section_ops": 1},
+                         {"mu_lanes": 2}, {"client_crash_after_ms": 8000}):
+            with self.assertRaises(ValueError):
+                validate_handoff_recovery(dict(suite, **override), self.topo)
+
+    def test_client_recovery_result_validation(self):
+        report = dict(started=2, repaired=2, retried=1, executed=1)
+        failure = dict(node=5, source="heartbeat")
+        log = ("HANDOFF_CLIENT_RECOVERY " + json.dumps(report) + "\n" +
+               "HANDOFF_CLIENT_FAILURE " + json.dumps(failure) + "\n")
+        results = [dict(recovered_waiters=1, reconciled_executed=1)]
+        self.assertEqual(validate_client_recovery(log, 5, results), (report, failure))
+        for victim in (0, 6):
+            with self.assertRaises(RuntimeError):
+                validate_client_recovery(log, victim, results)
+        with self.assertRaises(RuntimeError):
+            validate_client_recovery(log, 5, [])
 
     def test_ip_mapping_and_partition(self):
         self.assertEqual(len(self.topo.nodes), 8)

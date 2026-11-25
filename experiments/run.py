@@ -16,7 +16,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from cluster import Remote, Topology
-from recovery_control import RecoveryControl
+from recovery_control import ClientCrashControl, RecoveryControl
 from metrics import SUMMARY_FIELDS, summarize, format_summary, format_client
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -82,6 +82,10 @@ def process_command(topo: Topology, node, suite: dict, case: dict,
         common.append(arg("handoff-gc", int(suite.get("handoff_gc", False))))
         for key in ("handoff_lease_us", "handoff_lease_scan_us", "handoff_heartbeat_us"):
             common.append(arg(key.replace("_", "-"), suite.get(key, 0)))
+        if suite.get("handoff_client_recovery", False):
+            common.extend([arg("handoff-client-recovery", 1),
+                           arg("handoff-activation-us", suite["handoff_activation_us"]),
+                           arg("handoff-clock-error-ppm", suite["handoff_clock_error_ppm"])])
         if node.role == "client":
             common.append(arg("handoff-trace", int(suite.get("handoff_trace", False))))
     if node.role == "client" and case["backend"] == "handoff":
@@ -112,7 +116,7 @@ def process_command(topo: Topology, node, suite: dict, case: dict,
 def start_node(remote: Remote, node, remote_dir: str,
                run_name: str, argv: list[str], control=None) -> None:
     folder = f"{remote_dir}/runs/{run_name}"
-    if control is not None and node.role == "replica":
+    if control is not None and node.id in control.participants:
         # Supervisor owns the child and publishes its real PID. Its own
         # diagnostics and PID are separate from the server log and PID.
         cmd = shlex.join(control.agent_command(node.id, folder, argv))
@@ -179,6 +183,54 @@ def kill_supervisor(remote: Remote, node, folder: str) -> None:
                    f"kill \"$(cat {pid})\" 2>/dev/null || true; rm -f {pid}; fi",
                    check=False)
 
+def validate_client_recovery(log, victim, results):
+    def records(prefix):
+        return [json.loads(line[len(prefix):]) for line in log.splitlines()
+                if line.startswith(prefix)]
+    reports = records("HANDOFF_CLIENT_RECOVERY ")
+    failures = records("HANDOFF_CLIENT_FAILURE ")
+    if len(reports) != 1 or len(failures) != int(bool(victim)):
+        raise RuntimeError("missing or unexpected client recovery records")
+    if victim and failures[0]["node"] != victim:
+        raise RuntimeError("client failure identity mismatch")
+    report = reports[0]
+    if report["started"] != report["repaired"]:
+        raise RuntimeError("unfinished per-lock repair")
+    if report["retried"] != sum(r.get("recovered_waiters", 0) for r in results):
+        raise RuntimeError("survivor retry accounting mismatch")
+    if report["executed"] != sum(r.get("reconciled_executed", 0) for r in results):
+        raise RuntimeError("survivor execution reconciliation mismatch")
+    return report, failures[0] if failures else None
+
+
+def validate_handoff_recovery(suite, topo, only_backend=None, smoke=False):
+    enabled = suite.setdefault("handoff_client_recovery", False)
+    if type(enabled) is not bool:
+        raise ValueError("handoff_client_recovery must be boolean")
+    activation = suite.setdefault("handoff_activation_us", 0)
+    ppm = suite.setdefault("handoff_clock_error_ppm", 1_000_000)
+    victim = suite.get("client_crash_node")
+    delay = suite.get("client_crash_after_ms")
+    if enabled:
+        if (smoke or only_backend not in (None, "handoff") or
+                (only_backend != "handoff" and suite["backends"] != ["handoff"]) or
+                suite.get("mu_lanes", 1) != 1 or len(topo.replicas) != 3 or
+                len(topo.clients) < 2 or suite["critical_section_ops"] != 0 or
+                suite.get("mu_recovery") or suite.get("handoff_gc") or
+                suite.get("handoff_peer_read") or not suite["handoff_lease_us"] or
+                not (suite["handoff_lease_scan_us"] or suite["handoff_heartbeat_us"]) or
+                type(activation) is not int or not 1 <= activation <= 60_000_000 or
+                type(ppm) is not int or not 0 <= ppm < 1_000_000):
+            raise ValueError("invalid Handoff client recovery configuration or missing clock bound")
+    elif activation or ppm != 1_000_000 or victim is not None or delay is not None:
+        raise ValueError("client crash/activation/clock bound requires Handoff client recovery")
+    if victim is not None or delay is not None:
+        if (type(victim) is not int or victim not in topo.clients or
+                type(delay) is not int or delay <= 0 or
+                delay >= (suite["warmup_seconds"] + suite["duration_seconds"] - 1) * 1000):
+            raise ValueError("client crash requires a configured victim, delay and >1s post-crash budget")
+
+
 def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
              remote_dir: str, output_dir: pathlib.Path, smoke: bool = False) -> dict:
     name = ("smoke" if smoke else
@@ -197,9 +249,15 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
         (result_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         return manifest
     control = None
+    victim = 0 if smoke else (suite.get("client_crash_node") or 0)
+    survivors = tuple(n for n in topo.clients if n != victim)
     try:
         crash = not smoke and suite.get("crash_after_ms") is not None
-        if crash:
+        if victim:
+            address = topo.by_id(topo.controller_node_id).rdma_ip
+            control = ClientCrashControl(address, victim, suite["client_crash_after_ms"],
+                                         min(120, suite.get("watchdog_seconds", 90)))
+        elif crash:
             # Listener is on the controller's existing topology address.
             # All replica supervisors connect before any server starts.
             address = topo.by_id(topo.controller_node_id).rdma_ip
@@ -212,7 +270,7 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
             control.arm()
             # The local leader timer observes the actual service-start
             # marker. Do not SSH-poll readiness across the crash boundary.
-            manifest["injection"] = control.crash_and_promote()
+            manifest["injection"] = control.crash() if victim else control.crash_and_promote()
             control.close()
         else:
             wait_for(remote, topo.nodes, folder, "RDMA_SMOKE_OK" if smoke else "READY node=",
@@ -220,7 +278,7 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
         if not smoke:
             duration = (suite["warmup_seconds"] + suite["duration_seconds"] +
                         suite["watchdog_seconds"])
-            wait_for(remote, tuple(topo.by_id(n) for n in topo.clients),
+            wait_for(remote, tuple(topo.by_id(n) for n in survivors),
                      folder, "RESULT ", duration)
         if not smoke:
             # Fetch all eight logs concurrently; serial SSH calls dominate short trials.
@@ -232,8 +290,10 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
             for node_id, log in logs.items():
                 if any(line.startswith("ERROR ") for line in log.splitlines()):
                     raise RuntimeError(f"node {node_id} reported a runtime error")
+            if victim and any(line.startswith("RESULT ") for line in logs[victim].splitlines()):
+                raise RuntimeError("injected client unexpectedly completed the trial")
             results = []
-            for node_id in topo.clients:
+            for node_id in survivors:
                 log = logs[node_id]
                 found = [line.split("RESULT ", 1)[1] for line in log.splitlines()
                          if line.startswith("RESULT ")]
@@ -261,8 +321,10 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
             manifest["client_results"] = results
             if case["backend"] == "handoff":
                 for record in results:
-                    for key in ("handoff_lease_us", "handoff_lease_scan_us", "handoff_heartbeat_us"):
-                        if record.get(key, 0) != suite.get(key, 0):
+                    for key, default in (("handoff_lease_us", 0), ("handoff_lease_scan_us", 0),
+                                         ("handoff_heartbeat_us", 0), ("handoff_client_recovery", False),
+                                         ("handoff_activation_us", 0), ("handoff_clock_error_ppm", 1_000_000)):
+                        if record.get(key, default) != suite.get(key, default):
                             raise RuntimeError("lease configuration mismatch")
                     if record.get("heartbeat_writes", 0) != record.get("heartbeat_cqes", 0):
                         raise RuntimeError("heartbeat CQE accounting mismatch")
@@ -282,13 +344,21 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
                             raise RuntimeError("leader lease configuration mismatch")
                     if suite.get("handoff_lease_scan_us", 0) and not reports[0]["head_checks"]:
                         raise RuntimeError("no observed lease heads")
-                    if reports[0]["heartbeat_total"] != sum(r["heartbeat_writes"] for r in results):
-                        raise RuntimeError("heartbeat publication accounting mismatch")
+                    if reports[0].get("excluded", 0) != victim:
+                        raise RuntimeError("leader excluded an unexpected client")
+                    if (reports[0]["heartbeat_total"] - reports[0].get("heartbeat_failed", 0) !=
+                            sum(r["heartbeat_writes"] for r in results)):
+                        raise RuntimeError("survivor heartbeat publication accounting mismatch")
+                if suite.get("handoff_client_recovery", False):
+                    recovery, failure = validate_client_recovery(logs[topo.replicas[0]], victim, results)
+                    manifest["handoff_client_recovery"] = recovery
+                    manifest["client_failure"] = failure
+                    manifest["goodput_scope"] = "survivors_full_measurement" if victim else "all_clients"
                 if suite.get("handoff_trace", False):
                     traces = [json.loads(line[len("HANDOFF_LEASE_CLIENT "):])
-                              for n in topo.clients for line in logs[n].splitlines()
+                              for n in survivors for line in logs[n].splitlines()
                               if line.startswith("HANDOFF_LEASE_CLIENT ")]
-                    if sorted(t["node"] for t in traces) != sorted(topo.clients):
+                    if sorted(t["node"] for t in traces) != sorted(survivors):
                         raise RuntimeError("incomplete Handoff traces")
                     manifest["lease_clients"] = traces
             if suite.get("mu_recovery", False):
@@ -363,7 +433,7 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
                 finally:
                     kill_supervisor(remote, node, folder)
             try:
-                remote.parallel(tuple(topo.by_id(n) for n in topo.replicas), collect_supervisor)
+                remote.parallel(tuple(topo.by_id(n) for n in control.participants), collect_supervisor)
             except Exception as exc:
                 manifest.setdefault("cleanup_errors", []).append(str(exc))
         if manifest.get("collection_errors") or manifest.get("cleanup_errors"):
@@ -407,6 +477,16 @@ def main() -> int:
                     help="Background follower replay (1, default)")
     ap.add_argument("--crash-after-ms", type=int,
                     help="Kill initial leader this long after its local service-start marker")
+    ap.add_argument("--handoff-client-recovery", type=int, choices=(0, 1))
+    ap.add_argument("--handoff-lease-us", type=int)
+    ap.add_argument("--handoff-lease-scan-us", type=int)
+    ap.add_argument("--handoff-heartbeat-us", type=int)
+    ap.add_argument("--handoff-activation-us", type=int)
+    ap.add_argument("--handoff-clock-error-ppm", type=int,
+                    help="Explicit assumed bound on each monotonic clock's rate error")
+    ap.add_argument("--client-crash-node", type=int)
+    ap.add_argument("--client-crash-after-ms", type=int,
+                    help="Kill selected client after its local Handoff service-start marker")
     ap.add_argument("--mu-inflight-window", type=int,
                     help="Mu leader log in-flight limit (1..512; default 512)")
     ap.add_argument("--handoff-inflight-window", type=int,
@@ -493,6 +573,14 @@ def main() -> int:
             suite.get("mu_lanes", 1) != 1 or len(topo.replicas) != 3 or
             suite["critical_section_ops"] != 0 or len(topo.clients) > 15):
         raise ValueError("Mu recovery requires Mu only, three replicas, one lane, empty CS")
+    for key in ("handoff_lease_us", "handoff_lease_scan_us", "handoff_heartbeat_us",
+                "handoff_activation_us", "handoff_clock_error_ppm",
+                "client_crash_node", "client_crash_after_ms"):
+        override = getattr(args, key)
+        if override is not None:
+            suite[key] = override
+    if args.handoff_client_recovery is not None:
+        suite["handoff_client_recovery"] = bool(args.handoff_client_recovery)
     for key in ("handoff_lease_us", "handoff_lease_scan_us", "handoff_heartbeat_us"):
         suite.setdefault(key, 0)
         if type(suite[key]) is not int or not 0 <= suite[key] <= 60_000_000:
@@ -509,6 +597,7 @@ def main() -> int:
                 suite.get("mu_lanes", 1) != 1 or suite["critical_section_ops"] != 0 or
                 suite["mu_recovery"]):
             raise ValueError("lease experiments require Handoff only, one lane, empty CS, no recovery")
+    validate_handoff_recovery(suite, topo, args.only_backend, args.smoke)
     if suite["replicas"] != len(topo.replicas):
         raise ValueError("suite replica count does not match topology")
     if not 1 <= suite.get("mu_lanes", 1) <= 8:
@@ -567,6 +656,10 @@ def main() -> int:
                 if "recovery" in record:
                     print("RECOVERY", json.dumps(record["recovery"]), flush=True)
                     print("INJECTION", json.dumps(record["injection"]), flush=True)
+                if "handoff_client_recovery" in record:
+                    print("HANDOFF_CLIENT_RECOVERY", json.dumps(record["handoff_client_recovery"]), flush=True)
+                    if record.get("injection"):
+                        print("INJECTION", json.dumps(record["injection"]), flush=True)
                 if args.show_clients:
                     for client in record["client_results"]:
                         print("  CLIENT", format_client(client), flush=True)

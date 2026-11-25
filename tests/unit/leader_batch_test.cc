@@ -215,6 +215,38 @@ void test_gc_responses(rdma::Transport& net) {
     batch.completed(6, 4); batch.completed(7, 1);
     sends.clear();
 }
+void test_isolated_responses(rdma::Transport& net) {
+    sends.clear();
+    LeaderResponseBatch batch(net, 1, {6,7}, 1, 2, 8);
+    SpscQueue<Action, 1024> queue;
+    auto add = [&](NodeId peer, uint64_t seq) {
+        require(queue.try_push({peer, message(Kind::Order, 0, 1,
+                                             make_request_id(peer, seq))}));
+    };
+    for (size_t i = 0; i < LeaderResponseBatch::sq_credit; ++i)
+        add(6, i + 1);
+    for (size_t i = 0; i < LeaderResponseBatch::sq_credit; i += 64)
+        require(batch.drain(queue) == 64);
+    add(6, 1000);
+    add(7, 1);
+    require(batch.drain(queue) == 1);
+    require(batch.drain(queue) == 0); // blocked suffix for peer 6
+    batch.isolate(6);
+    batch.isolate(6); // duplicate notification is harmless
+    batch.completed(6, 8); // trailing CQE cannot restore abandoned credits
+    batch.completed(7, 1);
+    add(6, 1001);
+    add(7, 2);
+    const size_t before = sends.size();
+    require(batch.drain(queue) == 1 && queue.size() == 0);
+    require(sends.size() == before + 1 && sends.back().peer == 7);
+    require(sends.back().messages[0].request == make_request_id(7, 2));
+    batch.completed(7, 2);
+    rejected([&] { batch.completed(7, 2); }); // healthy accounting stays strict
+    rejected([&] { batch.isolate(8); });
+    sends.clear();
+}
+
 void test_responses(rdma::Transport& net) {
     const std::vector<NodeId> clients{6,7};
     LeaderResponseBatch batch(net, 1, clients, 1, 2, 8);
@@ -252,4 +284,5 @@ int main() {
     test_recovered_log();
     test_gc_responses(net);
     test_responses(net);
+    test_isolated_responses(net);
 }

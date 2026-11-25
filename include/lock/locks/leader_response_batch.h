@@ -39,7 +39,20 @@ public:
     }
     void completed(NodeId peer, WorkId end) {
         if (!end) return; // Individual barrier SENDs use token zero.
-        client(peer).progress.complete(end);
+        auto& p = client(peer);
+        if (!p.isolated) p.progress.complete(end);
+    }
+    // Called by the communication worker after transport isolation. Abandon
+    // only this destination's staged suffix and credits; do not pretend its
+    // outstanding SENDs completed. Isolation is irreversible for this run.
+    void isolate(NodeId peer) {
+        auto& p = client(peer);
+        if (p.isolated) return;
+        p.isolated = true;
+        staged_ -= p.messages.size() - p.cursor;
+        p.messages.clear();
+        p.cursor = 0;
+        p.gc_count = 0;
     }
     template <size_t Capacity>
     size_t drain(SpscQueue<Action, Capacity>& queue) {
@@ -54,6 +67,7 @@ public:
                     throw std::runtime_error("leader response routed to wrong lane");
                 a.message.sender = self_;
                 auto& p = client(a.destination);
+                if (p.isolated) continue;
                 if (gc_ && message_kind(a.message) == Kind::ReleaseAck) {
                     if (request_node(a.message.request) != a.destination)
                         throw std::runtime_error("GC action destination mismatch");
@@ -71,6 +85,7 @@ public:
         if (!staged_) return 0;
         size_t sent = 0;
         for (auto& p : peers_) {
+            if (p.isolated) continue;
             while (p.cursor < p.messages.size()) {
                 const size_t room = sq_credit -
                     (p.progress.posted() - p.progress.completed());
@@ -94,6 +109,7 @@ public:
 private:
     struct PeerState {
         NodeId peer = 0;
+        bool isolated = false;
         std::vector<Message> messages;
         size_t cursor = 0;
         rdma::CompletionPrefix<sq_credit> progress;

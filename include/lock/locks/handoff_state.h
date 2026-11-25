@@ -21,6 +21,25 @@ public:
     // assigning a predecessor to a newly committed request on the same lock.
     HandoffStep retire_lock(LockId lock_id,
                             const std::function<uint64_t(uint64_t)>& read_marker);
+    // Read-only diagnostic snapshot; called only by the owning replication thread.
+    struct Snapshot {
+        uint64_t waiting, prepared, uncommitted, next_position, head_request;
+        uint64_t head_marker, later_markers;
+    };
+    Snapshot snapshot(size_t id,
+                      const std::function<uint64_t(uint64_t)>& read_marker) const {
+        const auto& s = locks_.at(id);
+        Snapshot out{s.waiting.size(), s.prepared.size(), s.uncommitted,
+                     s.next_position, 0, 0, 0};
+        if (!s.prepared.empty()) {
+            out.head_request = s.prepared.front().request;
+            out.head_marker = read_marker(s.prepared.front().log_slot);
+            if (!out.head_marker)
+                for (size_t i = 1; i < s.prepared.size(); ++i)
+                    if (read_marker(s.prepared[i].log_slot)) ++out.later_markers;
+        }
+        return out;
+    }
 private:
     struct Entry { RequestId request; uint64_t position; uint64_t log_slot; };
     struct State {

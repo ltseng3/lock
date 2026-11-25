@@ -294,6 +294,13 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
                     manifest["replacement_profile"] = [
                         line for line in logs[topo.replicas[1]].splitlines()
                         if line.startswith(prefix)]
+            if case["backend"] == "handoff" and suite.get("profile_leader", False):
+                manifest["handoff_diagnostics"] = {
+                    str(n): [list(map(int, line.split()[1:]))
+                             for line in logs[n].splitlines()
+                             if line.startswith("HANDOFF_DIAG ")]
+                    for n in topo.replicas[:2]
+                }
             manifest["summary"] = summarize(case, results)
             manifest["total_completed"] = manifest["summary"]["completed"]
             manifest["aggregate_goodput_pairs_per_second"] = (

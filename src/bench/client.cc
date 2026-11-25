@@ -643,6 +643,8 @@ void ClientEngine::run() {
         }
     }
     if (!barrier) throw std::runtime_error("client start barrier timeout");
+    if (cfg_.backend == Backend::Handoff)
+        std::cout << "HANDOFF_CLIENT_STARTED node=" << cfg_.self << std::endl;
     const auto start = Clock::now();
     if (cfg_.mu_recovery || cfg_.handoff_trace) trace_start_ = start;
     auto next_heartbeat = start;

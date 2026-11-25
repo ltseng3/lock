@@ -8,7 +8,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "experiments"))
-from recovery_control import RecoveryControl
+from recovery_control import ClientCrashControl, RecoveryControl
 
 
 class TestRecoveryControl(unittest.TestCase):
@@ -81,6 +81,45 @@ class TestRecoveryControl(unittest.TestCase):
                                 p.communicate()
                         if p.stderr:
                             p.stderr.close()
+
+    def test_client_crash_after_service_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = pathlib.Path(directory)
+            with ClientCrashControl("127.0.0.1", 5, 100, 10) as control:
+                code = (
+                    "import time\n"
+                    "print('READY node=5',flush=True)\n"
+                    "time.sleep(.1)\n"
+                    "print('HANDOFF_CLIENT_STARTED',flush=True)\n"
+                    "while True: time.sleep(1)\n"
+                )
+                with self.assertRaises(ValueError):
+                    control.agent_command(6, folder, [sys.executable])
+                cmd = control.agent_command(5, folder, [sys.executable, "-u", "-c", code])
+                p = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.PIPE)
+                try:
+                    control.arm()
+                    result = control.crash()
+                    self.assertEqual(result["failed"], 5)
+                    self.assertEqual(result["returncode"], -signal.SIGKILL)
+                    self.assertGreaterEqual(result["client_timer_actual_ns"], 100_000_000)
+                    self.assertGreaterEqual(result["client_exit_wait_ns"], 0)
+                    self.assertNotIn("replacement", result)
+                    _, err = p.communicate(timeout=10)
+                    self.assertEqual(p.returncode, 0, err.decode(errors="replace"))
+                    self.assertFalse((folder / "pid").exists())
+                    self.assertIn("HANDOFF_CLIENT_STARTED", (folder / "node.log").read_text())
+                finally:
+                    if p.poll() is None:
+                        p.terminate()
+                        try:
+                            p.communicate(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            p.kill()
+                            p.communicate()
+                    if p.stderr:
+                        p.stderr.close()
 
     def test_reject_invalid_membership(self):
         with self.assertRaises(ValueError):

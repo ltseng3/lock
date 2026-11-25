@@ -693,7 +693,7 @@ void ClientEngine::run() {
     latency_samples_.prepare(LatencySamples::capacity_for(
         cfg_.duration_seconds, cfg_.latency_sample_capacity));
     if (cfg_.recovery_enabled())
-        trace_counts_.resize((cfg_.warmup_seconds + cfg_.duration_seconds) * 100 + 1);
+        trace_counts_.resize((cfg_.warmup_seconds + cfg_.duration_seconds) * 1000 + 1);
     const NodeId leader = cfg_.replicas.front();
     net_.send(leader, message(Kind::Ready, cfg_.self));
     auto barrier_deadline = Clock::now() + std::chrono::seconds(cfg_.watchdog_seconds);

@@ -275,6 +275,13 @@ def run_case(remote: Remote, topo: Topology, suite: dict, case: dict,
                     if len(reports) != 1:
                         raise RuntimeError("expected one lease monitor report")
                     manifest["lease_monitor"] = reports[0]
+                    for key, field in (("handoff_lease_us", "lease_us"),
+                                       ("handoff_lease_scan_us", "scan_us"),
+                                       ("handoff_heartbeat_us", "heartbeat_us")):
+                        if reports[0][field] != suite.get(key, 0):
+                            raise RuntimeError("leader lease configuration mismatch")
+                    if suite.get("handoff_lease_scan_us", 0) and not reports[0]["head_checks"]:
+                        raise RuntimeError("no observed lease heads")
                     if reports[0]["heartbeat_total"] != sum(r["heartbeat_writes"] for r in results):
                         raise RuntimeError("heartbeat publication accounting mismatch")
                 if suite.get("handoff_trace", False):

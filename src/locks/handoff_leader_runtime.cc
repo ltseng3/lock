@@ -271,6 +271,7 @@ void handoff_communication_loop(
                             auto* ptr = static_cast<uint64_t*>(net.at(heartbeat_offset(id), 8));
                             heartbeat_total += std::atomic_ref<uint64_t>(*ptr).load(std::memory_order_acquire);
                         }
+                        std::lock_guard<std::mutex> output_lock(profile_output_mutex);
                         std::cout << "HANDOFF_LEASE_MONITOR {\"lease_us\":" << lease.duration_us
                                   << ",\"scan_us\":" << lease.scan_us
                                   << ",\"heartbeat_us\":" << lease.heartbeat_us

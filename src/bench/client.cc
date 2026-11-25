@@ -713,14 +713,14 @@ void ClientEngine::print_result() {
               << ",\"locks\":" << cfg_.lock_count
               << ",\"critical_section_ops\":" << cfg_.critical_section_ops
               << ",\"handoff_gc\":" << (cfg_.handoff_gc ? 1 : 0)
-              << "\"handoff_lease_us\":" << cfg_.lease.duration_us << ","
-              << "\"handoff_lease_scan_us\":" << cfg_.lease.scan_us << ","
-              << "\"handoff_heartbeat_us\":" << cfg_.lease.heartbeat_us << ","
-              << "\"lease_checked\":" << lease_checked_ << ","
-              << "\"lease_max_hold_ns\":" << lease_max_hold_ns_ << ","
-              << "\"heartbeat_writes\":" << heartbeat_writes_ << ","
-              << "\"heartbeat_cqes\":" << heartbeat_cqes_ << ","
-              << "\"heartbeat_skips\":" << heartbeat_skips_ << ","
+              << ",\"handoff_lease_us\":" << cfg_.lease.duration_us
+              << ",\"handoff_lease_scan_us\":" << cfg_.lease.scan_us
+              << ",\"handoff_heartbeat_us\":" << cfg_.lease.heartbeat_us
+              << ",\"lease_checked\":" << lease_checked_
+              << ",\"lease_max_hold_ns\":" << lease_max_hold_ns_
+              << ",\"heartbeat_writes\":" << heartbeat_writes_
+              << ",\"heartbeat_cqes\":" << heartbeat_cqes_
+              << ",\"heartbeat_skips\":" << heartbeat_skips_
               << ",\"gc_next_reclaimed\":" << gc_next_reclaimed_
               << ",\"gc_ack_records\":" << gc_ack_records_
               << ",\"gc_ack_messages\":" << gc_ack_messages_

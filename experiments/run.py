@@ -196,10 +196,16 @@ def validate_client_recovery(log, victim, results):
     report = reports[0]
     if report["started"] != report["repaired"]:
         raise RuntimeError("unfinished per-lock repair")
-    if report["retried"] != sum(r.get("recovered_waiters", 0) for r in results):
-        raise RuntimeError("survivor retry accounting mismatch")
-    if report["executed"] != sum(r.get("reconciled_executed", 0) for r in results):
-        raise RuntimeError("survivor execution reconciliation mismatch")
+    if not results:
+        raise RuntimeError("no survivor results")
+    # An injected victim may have participated in an earlier repair, but
+    # cannot publish final counters. Require exact equality without a crash
+    # and a lower bound with a crash; never fabricate victim counters.
+    for leader_key, client_key in (("retried", "recovered_waiters"),
+                                   ("executed", "reconciled_executed")):
+        observed = sum(r.get(client_key, 0) for r in results)
+        if observed > report[leader_key] or (not victim and observed != report[leader_key]):
+            raise RuntimeError(f"survivor {leader_key} accounting mismatch")
     return report, failures[0] if failures else None
 
 
@@ -596,7 +602,7 @@ def main() -> int:
                 (args.only_backend != "handoff" and suite["backends"] != ["handoff"]) or
                 suite.get("mu_lanes", 1) != 1 or suite["critical_section_ops"] != 0 or
                 suite["mu_recovery"]):
-            raise ValueError("lease experiments require Handoff only, one lane, empty CS, no recovery")
+            raise ValueError("lease experiments require Handoff only, one lane, empty CS, no Mu recovery")
     validate_handoff_recovery(suite, topo, args.only_backend, args.smoke)
     if suite["replicas"] != len(topo.replicas):
         raise ValueError("suite replica count does not match topology")

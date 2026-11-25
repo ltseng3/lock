@@ -49,6 +49,13 @@ class TestExperiment(unittest.TestCase):
                 validate_client_recovery(log, victim, results)
         with self.assertRaises(RuntimeError):
             validate_client_recovery(log, 5, [])
+        # A victim can contribute to an earlier repair before it crashes.
+        self.assertEqual(validate_client_recovery(log, 5, [dict()]), (report, failure))
+        with self.assertRaises(RuntimeError):
+            validate_client_recovery(log, 5, [dict(recovered_waiters=2)])
+        no_crash_log = "HANDOFF_CLIENT_RECOVERY " + json.dumps(report)
+        with self.assertRaises(RuntimeError):
+            validate_client_recovery(no_crash_log, None, [dict()])
 
     def test_ip_mapping_and_partition(self):
         self.assertEqual(len(self.topo.nodes), 8)

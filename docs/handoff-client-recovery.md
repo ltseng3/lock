@@ -1,7 +1,8 @@
 # Handoff client recovery
 
-Status: staged implementation. Client recovery and timeout-based regrant
-are not enabled yet. See the implementation checklist below.
+Status: opt-in implementation, with deterministic unit and runner tests.
+Physical RDMA fault behavior, clock assumptions and performance require
+hardware validation before production use.
 
 ## Scope
 
@@ -96,7 +97,11 @@ under an explicit irreversible-for-this-run policy. Head age identifies
 a stalled chain, not the actual holder. Healthy but expired requests can
 also trigger lock repair. Do not exclude a whole client solely for head age.
 Report false suspicions and false exclusions; distinguish these from actual
-crash injection. Exclusion stops new admission but does not revoke authority
+crash injection. With optional head-age monitoring disabled, recovery still
+checks authority deadlines on the existing retirement scan. Head-only
+recovery cannot guarantee timely exclusion of an idle crashed client that
+has no outstanding operations or transport failures; keep heartbeat enabled
+for the primary crash trials. Exclusion stops new admission but does not revoke authority
 already in flight. Do not confuse peer QP isolation with global resource
 fencing.
 
@@ -127,15 +132,18 @@ retirement evidence may resolve some entries.
 4. Preserve relative FIFO of never-executed survivors, including unprepared
    waiters. Issue fresh attempts in that order before newer arrivals.
    Keep monotonic positions/log slots; never reuse a marker identity.
-   Install a new per-lock generation for rebuilt authority. Old messages
-   cannot start or modify a new attempt. The first survivor receives
-   leader-authorized START, subsequent owners use normal direct HANDOFF.
+   Fresh wire identities and monotonically increasing positions distinguish
+   rebuilt authority; no separate per-lock wire generation is needed.
+   Old messages cannot start or modify a new attempt. The first survivor
+   receives leader-authorized ORDER without a predecessor, subsequent owners
+   use normal direct HANDOFF.
 5. Reopen admission, release obsolete bookkeeping and maintain exact
    reservation/credit counts. Recovery completes only once survivors can
    proceed; the run must also handle a queue that becomes empty.
 
-Prefer a distinct logical identity/FIFO rank and fresh wire RequestId per
-recovery attempt, plus a per-lock generation for control messages if needed.
+The implementation retains logical FIFO rank at the leader and logical
+operation timing at the client, with a fresh wire RequestId per recovery
+attempt. A separate per-lock generation is an alternative, not a requirement.
 Fresh wire IDs keep the existing exact-RequestId marker scheme safe; simply
 reusing a RequestId across generations would allow late marker WRITEs to
 retire the wrong attempt unless slots and marker validation are redesigned.
@@ -197,22 +205,65 @@ survivor accounting and injection teardown separately. Keep existing
 - [x] Reserve heartbeat mailboxes outside receive buffers.
 - [x] Opt-in recoverable client transport primitives (single lane); retain
   fatal defaults and the existing Mu old-leader path.
-- [ ] Connect transport events to Handoff runtime, direct HANDOFF failure
-  handling, admission and stop barrier; validate on hardware.
+- [x] Connect transport events to Handoff runtime, direct HANDOFF failure
+  handling, admission and stop barrier.
+- [ ] Validate physical QP failure/teardown and clock assumptions on hardware.
 - [x] Reusable deterministic client crash supervision, client service-start
   marker and local process test.
-- [ ] Wire client crash supervision and survivor result validation into runner.
+- [x] Wire client crash supervision and survivor result validation into runner.
 - [x] Pure conservative lease arithmetic and boundary tests.
-- [ ] Enforce the activation gate and stale-identity handling; fake-clock
-  boundary and pause tests.
-- [ ] Per-lock recovery, survivor reconciliation, FIFO-preserving rebuild
+- [x] Enforce the activation gate and stale-identity handling; deterministic
+  expiry and delayed-activation tests.
+- [x] Per-lock recovery, survivor reconciliation, FIFO-preserving rebuild
   and stale retirement/activation tests; no new common-path RPC.
 - [ ] Adversarial tests: failure before/after HANDOFF and marker, failed
   waiting/reserved/in-flight requests, repeated signals, partial SENDs,
   delayed old ORDER/NEXT/HANDOFF/ACK, local handoff, shutdown and hot locks.
-- [ ] Monitoring ablations, fixed-lease crash sweeps and reproducible manifests.
+- [x] Generate monitoring ablations, fixed-lease crash sweeps and reproducible manifests.
+- [ ] Run the hardware sweeps; add per-lock first-completion and unaffected-lock
+  progress measurements. Current repair counters describe leader reconciliation,
+  not the first resumed critical section.
 
 Run existing CAS/Mu/Handoff tests throughout. Hardware tests must establish
 QP teardown behavior and progress; unit tests alone are insufficient.
-Each stage is independently reviewable. Do not enable regrant until the
-authority contract and reconciliation are both implemented and validated.
+Each stage is independently reviewable. Enable recovery explicitly and only
+with a justified clock-rate bound and the restricted empty-CS configuration.
+
+## Running the experiments
+
+Generate matched suites from the existing lease-monitor baseline. The clock
+bound is deliberately required rather than guessed. Set CLOCK_ERROR_PPM to
+a justified bound for the test machines; setting it to zero asserts ideal
+clock rates and is not a safe default.
+
+```sh
+python3 experiments/handoff_recovery_sweep.py --family ablation \
+    --clock-error-ppm "$CLOCK_ERROR_PPM" --output /tmp/handoff-ablation
+python3 experiments/handoff_recovery_sweep.py --family monitor \
+    --clock-error-ppm "$CLOCK_ERROR_PPM" --output /tmp/handoff-monitor
+python3 experiments/run.py --topology experiments/topologies/apt8.json \
+    --suite /tmp/handoff-ablation/recovery-crash.json
+```
+
+The primary families keep both lease and activation window at 5000 us.
+The monitor family varies one monitor interval at a time. An optional
+`--family lease` generates a separate fixed-per-trial holding-lease
+sensitivity sweep, leaving activation at 5000 us. It is not needed for the
+initial fixed-lease milestone. Each generated suite is independently
+runnable, with the same workload and seed settings. Use `--family all`
+only if both primary and sensitivity suites are wanted.
+
+Crash variants default to client 5 at 2000 ms after its own service-start
+marker; override with `--victim` and `--delay-ms`. No crash information
+is passed to the lock protocol. No-crash recovery is a distinct baseline.
+For the four-client capacity control, run the no-crash recovery suite
+with a topology that omits the victim client. Crash-trial aggregate
+goodput counts only survivors across the full measurement interval.
+Report the victim's missing counters separately: leader reconciliation
+counts may include work performed by that victim before its crash, so
+only no-crash trials can require exact final counter equality.
+
+Start with a single short trial and inspect the manifest for the confirmed
+exit, exact excluded identity, completed repairs, survivor results and
+errors. Inspect traces for pauses before expanding the sweep. The runner
+does not silently classify missing results as successful recovery.

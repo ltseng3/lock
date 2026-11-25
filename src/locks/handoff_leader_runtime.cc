@@ -124,6 +124,10 @@ void replication_loop(Shared& s, rdma::Transport& net,
             const auto now = Clock::now();
             if (now >= next_retirement_scan) {
                 publish_retirement(state.retire(read_marker));
+                // Even without optional head-age observations, recovery
+                // requires an authority deadline check to avoid stranded
+                // healthy waiters after a lost or expired handoff.
+                if (lease.client_recovery && !lease.scan_us) state.expire_heads(now);
                 if (state.recovering())
                     publish_retirement(state.recover(now, read_marker));
                 // Space complete scans apart even if a scan itself is costly.

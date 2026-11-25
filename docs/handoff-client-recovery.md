@@ -85,6 +85,11 @@ replica failures remain fatal. HANDOFF failure must not prevent retirement
 marker publication by a quiesced sender.
 
 Keep existing asynchronous 8-byte heartbeat mailboxes and head scans.
+The receive-ring allocator originally started at the same 0x40000 address
+as the heartbeat mailboxes. Reserve all 256 cache-line-strided slots before
+starting the receive rings; this changes only local receive-buffer addresses
+and reduces their reserved space by 16 KiB. Re-run monitoring baselines with
+the corrected layout; do not assume previous counters were unaffected.
 Heartbeat suspicion and peer transport failure can initiate exclusion
 under an explicit irreversible-for-this-run policy. Head age identifies
 a stalled chain, not the actual holder. Healthy but expired requests can

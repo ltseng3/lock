@@ -152,7 +152,7 @@ struct Transport::Impl {
     void* mem = nullptr;
     uint16_t lid = 0;
     std::map<NodeId, Connection> connections;
-    size_t recv_next = 0x40000;
+    size_t recv_next = kReceiveOffset;
     size_t scratch_next = 0;
     bool connected = false;
     explicit Impl(Config c) : cfg(std::move(c)) {

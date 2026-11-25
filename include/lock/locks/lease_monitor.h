@@ -40,11 +40,11 @@ struct LeaseScanStats {
     }
 };
 // Disjoint from flags, application data (1000 words), and log.
-constexpr size_t kHeartbeatBase = 0x40000, kHeartbeatStride = 64;
-static_assert(rdma::kDataOffset + 1000 * sizeof(uint64_t) <= kHeartbeatBase);
-static_assert(kHeartbeatBase + 256 * kHeartbeatStride <= rdma::kLogOffset);
+constexpr size_t kHeartbeatBase = rdma::kHeartbeatBase;
+constexpr size_t kHeartbeatStride = rdma::kHeartbeatStride;
 inline size_t heartbeat_offset(NodeId client) {
-    if (!client || client >= 256) throw std::invalid_argument("invalid heartbeat client");
+    if (!client || client >= rdma::kHeartbeatSlots)
+        throw std::invalid_argument("invalid heartbeat client");
     return kHeartbeatBase + client * kHeartbeatStride;
 }
 struct HandoffLeaseConfig {

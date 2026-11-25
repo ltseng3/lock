@@ -10,7 +10,15 @@
 namespace lock::rdma {
 constexpr size_t kFlagOffset = 0x10000;
 constexpr size_t kDataOffset = 0x20000;
+// Reserve a fixed mailbox region before the receive rings. The rings must
+// never overlap remote one-sided heartbeat WRITEs.
+constexpr size_t kHeartbeatBase = 0x40000;
+constexpr size_t kHeartbeatStride = 64;
+constexpr size_t kHeartbeatSlots = 256;
+constexpr size_t kReceiveOffset = kHeartbeatBase + kHeartbeatSlots * kHeartbeatStride;
 constexpr size_t kLogOffset = 0x100000;
+static_assert(kDataOffset + 1000 * sizeof(uint64_t) <= kHeartbeatBase);
+static_assert(kReceiveOffset < kLogOffset);
 constexpr size_t kScratchOffset = 64ULL * 1024 * 1024;
 constexpr size_t kDefaultMemoryBytes = 128ULL * 1024 * 1024;
 

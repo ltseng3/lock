@@ -24,6 +24,7 @@ struct Send {
 };
 std::vector<Write> writes;
 std::vector<Send> sends;
+NodeId fail_send_peer = 0;
 void require(bool condition) {
     if (!condition) throw std::runtime_error("leader batch regression failed");
 }
@@ -65,6 +66,7 @@ void Transport::write_published_words(NodeId peer, std::span<const uint64_t> wor
 }
 void Transport::send_batch(NodeId peer, std::span<const Message> messages,
                            WorkId end, size_t lane) {
+    if (peer == fail_send_peer) throw PeerUnavailable(peer);
     sends.push_back({peer, {messages.begin(), messages.end()}, end, lane});
 }
 } // namespace lock::rdma
@@ -215,6 +217,25 @@ void test_gc_responses(rdma::Transport& net) {
     batch.completed(6, 4); batch.completed(7, 1);
     sends.clear();
 }
+void test_failed_post(rdma::Transport& net) {
+    sends.clear();
+    LeaderResponseBatch batch(net, 1, {6,7}, 1, 2, 8);
+    SpscQueue<Action, 1024> queue;
+    require(queue.try_push({6, message(Kind::Order, 0, 1, make_request_id(6, 1))}));
+    require(queue.try_push({7, message(Kind::Order, 0, 1, make_request_id(7, 1))}));
+    fail_send_peer = 6;
+    require(batch.drain(queue) == 1 && queue.size() == 0);
+    fail_send_peer = 0;
+    require(sends.size() == 1 && sends[0].peer == 7);
+    batch.completed(7, 1);
+    batch.isolate(6); // subsequent transport event is idempotent
+    require(queue.try_push({6, message(Kind::Order, 0, 1, make_request_id(6, 2))}));
+    require(queue.try_push({7, message(Kind::Order, 0, 1, make_request_id(7, 2))}));
+    require(batch.drain(queue) == 1 && sends.back().peer == 7);
+    batch.completed(7, 2);
+    sends.clear();
+}
+
 void test_isolated_responses(rdma::Transport& net) {
     sends.clear();
     LeaderResponseBatch batch(net, 1, {6,7}, 1, 2, 8);
@@ -285,4 +306,5 @@ int main() {
     test_gc_responses(net);
     test_responses(net);
     test_isolated_responses(net);
+    test_failed_post(net);
 }

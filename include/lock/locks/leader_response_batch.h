@@ -93,7 +93,13 @@ public:
                                                p.messages.size() - p.cursor});
                 if (!count) break;
                 const WorkId end = p.progress.posted() + count;
-                net_.send_batch(p.peer, {p.messages.data() + p.cursor, count}, end, lane_);
+                try {
+                    net_.send_batch(p.peer, {p.messages.data() + p.cursor, count}, end, lane_);
+                } catch (const rdma::PeerUnavailable& error) {
+                    if (error.peer() != p.peer) throw;
+                    isolate(p.peer);
+                    break;
+                }
                 p.progress.post(end);
                 p.cursor += count;
                 sent += count;

@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace lock::rdma {
@@ -25,6 +26,17 @@ constexpr size_t kDefaultMemoryBytes = 128ULL * 1024 * 1024;
 struct Peer {
     NodeId id;
     std::string ip;
+};
+// A SEND was not accepted in full on an isolated client connection. A
+// prefix of a linked SEND chain may already have been posted. Never retry it
+// as a whole. The owner also receives a one-shot PeerFailed event on poll.
+class PeerUnavailable : public std::runtime_error {
+public:
+    explicit PeerUnavailable(NodeId peer)
+        : std::runtime_error("client transport unavailable"), peer_(peer) {}
+    NodeId peer() const noexcept { return peer_; }
+private:
+    NodeId peer_;
 };
 enum class CompletionKind { Receive, Send, Write, CompareSwap, Read, PeerFailed };
 struct Completion {
@@ -54,6 +66,9 @@ struct Config {
     // Client-to-client HANDOFF and replica data WRITEs retain lane zero.
     std::vector<NodeId> client_lane_peers;
     size_t communication_batch = 64; // leader receive repost batch, 1..64
+    // Opt-in client failure containment, initially single-lane and mutually
+    // exclusive with Mu's designated old-leader recovery mode.
+    std::vector<NodeId> recoverable_clients;
 };
 
 std::vector<Peer> parse_peers(const std::string& spec);

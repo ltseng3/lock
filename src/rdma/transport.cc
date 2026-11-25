@@ -139,6 +139,8 @@ struct Transport::Impl {
         bool client_lanes = false;
         bool fenced = false;
         bool failed = false;
+        bool recoverable_client = false;
+        bool failure_reported = false;
         std::vector<ExtraQp> extra_qps;
         Bootstrap remote{};
     };
@@ -160,6 +162,20 @@ struct Transport::Impl {
             throw std::invalid_argument("invalid local ID or registered memory size");
         if (cfg.replication_lanes < 1 || cfg.replication_lanes > 8)
             throw std::invalid_argument("replication lane count must be 1..8");
+        if (!cfg.recoverable_clients.empty()) {
+            if (cfg.replication_lanes != 1 || cfg.recoverable_peer)
+                throw std::invalid_argument("client isolation requires one lane and no Mu recovery");
+            std::array<bool, 256> seen{};
+            for (auto peer : cfg.recoverable_clients) {
+                if (!peer || peer >= seen.size() || peer == cfg.self || seen[peer] ||
+                    std::none_of(cfg.peers.begin(), cfg.peers.end(),
+                                 [peer](const Peer& p) { return p.id == peer; }) ||
+                    std::find(cfg.replication_peers.begin(), cfg.replication_peers.end(), peer) !=
+                        cfg.replication_peers.end())
+                    throw std::invalid_argument("invalid recoverable client peer");
+                seen[peer] = true;
+            }
+        }
         scratch_next = cfg.memory_bytes - 16ULL * 1024 * 1024;
         if (!cfg.communication_batch || cfg.communication_batch > 64)
             throw std::invalid_argument("communication batch must be 1..64");
@@ -230,6 +246,9 @@ struct Transport::Impl {
         for (const auto& peer : cfg.peers) {
             if (peer.id == cfg.self) continue;
             auto& conn = connections[peer.id];
+            conn.recoverable_client =
+                std::find(cfg.recoverable_clients.begin(), cfg.recoverable_clients.end(),
+                          peer.id) != cfg.recoverable_clients.end();
             ibv_qp_init_attr attr{};
             const bool repl = std::find(cfg.replication_peers.begin(),
                 cfg.replication_peers.end(), peer.id) != cfg.replication_peers.end();
@@ -335,11 +354,24 @@ struct Transport::Impl {
         if (it == connections.end()) throw std::invalid_argument("unknown RDMA peer");
         return it->second;
     }
+    // A generic verbs posting failure is not evidence of a dead client.
+    // Only accept a failed post when this opted-in QP is already in ERR.
+    bool failed_client_post(Connection& c, ibv_qp* qp) {
+        if (!connected || !c.recoverable_client) return false;
+        if (c.failed) return true;
+        ibv_qp_attr attr{};
+        ibv_qp_init_attr init{};
+        if (ibv_query_qp(qp, &attr, IBV_QP_STATE, &init) ||
+            attr.qp_state != IBV_QPS_ERR) return false;
+        c.failed = true;
+        return true;
+    }
     void post_recv_batch(NodeId peer, std::span<const uint32_t> slots, size_t lane) {
         auto& c = conn(peer);
         if (slots.empty() || slots.size() > 64 ||
             (lane && (!c.client_lanes || lane > c.extra_qps.size())))
             throw std::invalid_argument("invalid receive batch or lane");
+        if (c.recoverable_client && c.failed) return;
         ibv_qp* qp = lane ? c.extra_qps[lane - 1].qp : c.qp;
         auto& receives = lane ? c.extra_qps[lane - 1].receives : c.receives;
         std::array<ibv_sge, 64> sges;
@@ -354,7 +386,11 @@ struct Transport::Impl {
             wr.next = i + 1 < slots.size() ? &wrs[i + 1] : nullptr;
         }
         ibv_recv_wr* bad = nullptr;
-        check(!ibv_post_recv(qp, wrs.data(), &bad), "post receive batch");
+        const int rc = ibv_post_recv(qp, wrs.data(), &bad);
+        if (rc && !failed_client_post(c, qp)) {
+            errno = rc;
+            check(false, "post receive batch");
+        }
     }
     void post_recv(NodeId peer, uint32_t slot, size_t lane = 0) {
         post_recv_batch(peer, std::span<const uint32_t>(&slot, 1), lane);
@@ -477,6 +513,7 @@ void Transport::send(NodeId peer, const Message& msg, WorkId id,
     if (lane && (!c.client_lanes || lane > c.extra_qps.size()))
         throw std::invalid_argument("client communication QP lane not configured");
     ibv_qp* qp = lane ? c.extra_qps[lane - 1].qp : c.qp;
+    if (c.recoverable_client && c.failed) throw PeerUnavailable(peer);
     uint32_t& unsignaled = lane ? c.extra_qps[lane - 1].unsignaled_posted
                                 : c.unsignaled_posted;
     // Each lane owns its send queue; never share its unsignaled WR counter.
@@ -488,7 +525,12 @@ void Transport::send(NodeId peer, const Message& msg, WorkId id,
     wr.sg_list = &sge; wr.num_sge = 1;
     wr.opcode = IBV_WR_SEND;
     wr.send_flags = IBV_SEND_INLINE | (signaled ? IBV_SEND_SIGNALED : 0);
-    check(!ibv_post_send(qp, &wr, &bad), "post SEND");
+    const int rc = ibv_post_send(qp, &wr, &bad);
+    if (rc) {
+        if (x.failed_client_post(c, qp)) throw PeerUnavailable(peer);
+        errno = rc;
+        check(false, "post SEND");
+    }
     unsignaled = signaled ? 0 : unsignaled + 1;
 }
 bool Transport::write(NodeId peer, const void* p, size_t bytes,
@@ -634,6 +676,7 @@ void Transport::send_batch(NodeId peer, std::span<const Message> messages,
         messages.empty() || messages.size() > 64 || !end)
         throw std::invalid_argument("invalid client SEND batch");
     ibv_qp* qp = lane ? c.extra_qps[lane - 1].qp : c.qp;
+    if (c.recoverable_client && c.failed) throw PeerUnavailable(peer);
     std::array<ibv_sge, 64> sges;
     std::array<ibv_send_wr, 64> wrs;
     for (size_t i = 0; i < messages.size(); ++i) {
@@ -649,8 +692,14 @@ void Transport::send_batch(NodeId peer, std::span<const Message> messages,
         wr.next = tail ? nullptr : &wrs[i + 1];
     }
     ibv_send_wr* bad = nullptr;
-    // On partial posting, stop the run rather than retry and duplicate SENDs.
-    check(!ibv_post_send(qp, wrs.data(), &bad), "post client SEND batch");
+    // On partial posting never retry and duplicate SENDs. Only an isolated
+    // client QP may abandon its prefix; all other errors remain fatal.
+    const int rc = ibv_post_send(qp, wrs.data(), &bad);
+    if (rc) {
+        if (x.failed_client_post(c, qp)) throw PeerUnavailable(peer);
+        errno = rc;
+        check(false, "post client SEND batch");
+    }
     (lane ? c.extra_qps[lane - 1].unsignaled_posted : c.unsignaled_posted) = 0;
 }
 void Transport::read_word(NodeId peer, uint64_t* result, size_t offset,
@@ -749,6 +798,29 @@ void Transport::poll_on_cq(std::vector<Completion>& result, int batch,
             }
         }
     }
+    // Client QPs have a single owner in this mode. Do not inspect their
+    // mutable failure state from the replication worker's CQ.
+    const bool client_poll = !x.cfg.recoverable_clients.empty() &&
+        ((group == PollGroup::Communication && lane == 0) ||
+         (group == PollGroup::Default && x.communication_cqs.empty()));
+    auto client_error = [](ibv_wc_status status) {
+        return status == IBV_WC_RETRY_EXC_ERR ||
+               status == IBV_WC_RNR_RETRY_EXC_ERR ||
+               status == IBV_WC_WR_FLUSH_ERR;
+    };
+    if (client_poll) {
+        for (int i = 0; i < n; ++i) {
+            const auto peer = static_cast<NodeId>((wc[i].wr_id >> 48) & 0xff);
+            auto& c = x.conn(peer);
+            if (!c.recoverable_client || wc[i].status == IBV_WC_SUCCESS) continue;
+            // Do not hide local protection/programming errors, even after
+            // a retry failure was observed for this client.
+            if (!client_error(wc[i].status))
+                throw std::runtime_error(std::string("CQ failure: ") +
+                                         ibv_wc_status_str(wc[i].status));
+            c.failed = true;
+        }
+    }
     for (int i = 0; i < n; ++i) {
         auto& w = wc[i];
         NodeId peer = static_cast<NodeId>((w.wr_id >> 48) & 0xff);
@@ -757,6 +829,7 @@ void Transport::poll_on_cq(std::vector<Completion>& result, int batch,
         // recoverable; all other errors remain fatal.
         if (peer == x.cfg.recoverable_peer && peer &&
             (x.conn(peer).fenced || x.conn(peer).failed)) continue;
+        if (client_poll && x.conn(peer).recoverable_client && x.conn(peer).failed) continue;
         if (w.status != IBV_WC_SUCCESS)
             throw std::runtime_error(std::string("CQ failure: ") + ibv_wc_status_str(w.status));
         uint64_t token = w.wr_id & kTokenMask;
@@ -814,6 +887,22 @@ void Transport::poll_on_cq(std::vector<Completion>& result, int batch,
                 }
             }
             if (count) x.post_recv_batch(c.peer, {slots.data(), count}, lane);
+        }
+    }
+    if (client_poll) {
+        for (NodeId peer : x.cfg.recoverable_clients) {
+            auto& c = x.conn(peer);
+            if (!c.failed) continue;
+            // Includes a failure first discovered during receive reposting
+            // or a SEND post since the previous poll.
+            std::erase_if(result, [peer](const Completion& item) { return item.peer == peer; });
+            if (!c.failure_reported) {
+                c.failure_reported = true;
+                Completion failure{};
+                failure.kind = CompletionKind::PeerFailed;
+                failure.peer = peer;
+                result.push_back(failure);
+            }
         }
     }
 }

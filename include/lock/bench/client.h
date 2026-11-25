@@ -86,7 +86,7 @@ private:
     bool recovery_paused_ = false, recovery_started_ = false, recovery_ready_ = false;
     Clock::time_point trace_start_{}, recovery_notice_{}, recovery_ready_time_{}, first_resumed_{},
         last_old_completion_{}, failure_pause_{};
-    static constexpr uint64_t trace_bucket_ns_ = 10000000; // 10 ms
+    static constexpr uint64_t trace_bucket_ns_ = 1000000; // 1 ms diagnostic branch
     std::vector<uint64_t> trace_counts_;
     void begin_mu_recovery();
     void begin_handoff_recovery();
